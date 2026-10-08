@@ -487,7 +487,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	}
 	b.cfg.Logger.Info("hermes acp starting", "cwd", opts.Cwd, "agents_md_present", agentsMDPresent)
 	if opts.SystemPrompt != "" {
-		b.cfg.Logger.Debug("hermes ignoring ExecOptions.SystemPrompt; using cwd-scoped context files", "cwd", opts.Cwd)
+		b.cfg.Logger.Debug("hermes using inline runtime instructions", "cwd", opts.Cwd)
 	}
 
 	env := buildEnv(b.cfg.Env)
@@ -851,10 +851,9 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 		// 4. Send the prompt and wait for PromptResponse.
 		//
-		// Do NOT prepend opts.SystemPrompt here. Hermes ACP loads project/context
-		// files from cwd (AGENTS.md, .agent_context, etc.) itself; duplicating the
-		// full runtime brief in the user prompt makes the request much larger and
-		// has triggered upstream safety filters on otherwise ordinary tasks.
+		// SystemPrompt is normally empty because Hermes loads cwd-scoped context
+		// files itself. Local repositories are the exception: Multica must not
+		// modify a tracked AGENTS.md, so their runtime brief is carried inline.
 		// Flip the gate
 		// just before the request so any history replay flushed during
 		// initialize / session setup stays dropped, but every notification
@@ -870,10 +869,11 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 
 		streamingCurrentTurn.Store(true)
+		turnText := hermesPromptText(opts.SystemPrompt, hermesTurnText(prompt, opts.ResumeExpected, resumeLanded, opts.ResumeContinuityNotice))
 		_, err = c.request(runCtx, "session/prompt", map[string]any{
 			"sessionId": sessionID,
 			"prompt": []map[string]any{
-				{"type": "text", "text": hermesTurnText(prompt, opts.ResumeExpected, resumeLanded, opts.ResumeContinuityNotice)},
+				{"type": "text", "text": turnText},
 			},
 		})
 		if err != nil {
@@ -2587,6 +2587,13 @@ func hermesTurnText(prompt string, resumeExpected, resumeLanded bool, notice str
 		return notice + prompt
 	}
 	return prompt
+}
+
+func hermesPromptText(systemPrompt, prompt string) string {
+	if systemPrompt == "" {
+		return prompt
+	}
+	return systemPrompt + "\n\n---\n\n" + prompt
 }
 
 // buildHermesSessionParams constructs the params map for the ACP `session/new`

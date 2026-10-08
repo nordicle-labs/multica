@@ -33,6 +33,7 @@ import (
 	"github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
+	"github.com/multica-ai/multica/server/pkg/deliverycontract"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/redact"
 	"github.com/multica-ai/multica/server/pkg/skillbundle"
@@ -4077,13 +4078,20 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Capabilities []string `json:"capabilities"`
-		RuntimeID    string   `json:"runtime_id"`
-		DispatchedAt string   `json:"dispatched_at"`
+		Capabilities      []string                    `json:"capabilities"`
+		RuntimeID         string                      `json:"runtime_id"`
+		DispatchedAt      string                      `json:"dispatched_at"`
+		DeliveryPreflight *deliverycontract.Preflight `json:"delivery_preflight,omitempty"`
 	}
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+	if req.DeliveryPreflight != nil {
+		if err := req.DeliveryPreflight.Validate(deliverycontract.CurrentProfile()); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, "delivery preflight failed: "+err.Error())
 			return
 		}
 	}
