@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/deliverycontract"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
@@ -478,6 +479,10 @@ const (
 var errStartClaimRejected = errors.New("task start claim rejected")
 
 func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...string) (bool, error) {
+	return c.StartTaskWithDeliveryPreflight(ctx, task, nil, capabilities...)
+}
+
+func (c *Client) StartTaskWithDeliveryPreflight(ctx context.Context, task Task, preflight *deliverycontract.Preflight, capabilities ...string) (bool, error) {
 	var negotiated bool
 	var decodeResponse responseDecoder = func(r io.Reader) error {
 		data, err := io.ReadAll(io.LimitReader(r, maxStartTaskResponseBytes+1))
@@ -503,7 +508,11 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 	path := fmt.Sprintf("/api/daemon/tasks/%s/start", task.ID)
 	if !task.StartClaimSupported {
 		// Old servers have no safe replay contract. Preserve one attempt.
-		err := c.postJSON(ctx, path, map[string]any{"capabilities": capabilities}, decodeResponse)
+		body := map[string]any{"capabilities": capabilities}
+		if preflight != nil {
+			body["delivery_preflight"] = preflight
+		}
+		err := c.postJSON(ctx, path, body, decodeResponse)
 		return err == nil && negotiated, err
 	}
 	if task.RuntimeID == "" || task.DispatchedAt == "" {
@@ -511,11 +520,15 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 	}
 	ctx, cancel := context.WithTimeout(ctx, startTaskTimeout)
 	defer cancel()
-	err := c.postJSONWithRetry(ctx, path, map[string]any{
+	body := map[string]any{
 		"runtime_id":    task.RuntimeID,
 		"capabilities":  capabilities,
 		"dispatched_at": task.DispatchedAt,
-	}, decodeResponse, startTaskRetrySchedule)
+	}
+	if preflight != nil {
+		body["delivery_preflight"] = preflight
+	}
+	err := c.postJSONWithRetry(ctx, path, body, decodeResponse, startTaskRetrySchedule)
 	var reqErr *requestError
 	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict {
 		return false, fmt.Errorf("%w: %w", errStartClaimRejected, err)

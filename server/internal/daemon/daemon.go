@@ -8393,7 +8393,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != "" {
 		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
 	}
-	taskSupplementNegotiated, err := d.client.StartTask(prepareCtx, task, taskCapabilities...)
+	deliveryPreflight := buildDeliveryPreflight(prepareCtx, env.WorkDir, localAssignment != nil, task.AuthToken != "")
+	taskSupplementNegotiated, err := d.client.StartTaskWithDeliveryPreflight(prepareCtx, task, &deliveryPreflight, taskCapabilities...)
 	if err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
@@ -8431,7 +8432,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
-	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
+	// A local repository is a deliverable, not runtime scratch: keep its tracked
+	// context files byte-identical and carry the brief inline instead.
+	runtimeBrief, err := prepareRuntimeBrief(env, provider, taskCtx)
 	if err != nil {
 		d.logger.Warn("execenv: inject runtime config failed (non-fatal)", "error", err)
 	}
@@ -8719,7 +8722,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// as always included, and a real kiro-cli 2.13.0 ACP smoke confirms it.
 	// Prepending the full runtime brief into the ACP user prompt duplicates that
 	// context and bloats every turn.
-	if providerNeedsInlineSystemPrompt(provider) {
+	if providerNeedsInlineSystemPrompt(provider) || env.LocalDirectory || env.LocalWorktree != nil {
 		execOpts.SystemPrompt = runtimeBrief
 	}
 
