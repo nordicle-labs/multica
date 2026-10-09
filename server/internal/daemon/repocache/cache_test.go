@@ -74,6 +74,10 @@ func TestGitEnvCredentialHelperIsContextScoped(t *testing.T) {
 	if !strings.Contains(joined, "credential.helper") || !strings.Contains(joined, helper) || !strings.Contains(joined, "credential.useHttpPath") {
 		t.Fatalf("credential helper config missing from git environment: %q", joined)
 	}
+	if !strings.Contains(joined, "GIT_CONFIG_KEY_1=credential.helper\nGIT_CONFIG_VALUE_1=\n") ||
+		!strings.Contains(joined, "GIT_CONFIG_KEY_2=credential.helper\nGIT_CONFIG_VALUE_2="+helper) {
+		t.Fatalf("task helper does not reset inherited credential helpers first: %q", joined)
+	}
 	if strings.Contains(strings.Join(gitEnv(), "\n"), helper) {
 		t.Fatal("task credential helper leaked into the general git environment")
 	}

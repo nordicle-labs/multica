@@ -1834,11 +1834,19 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]AgentTaskResponse, 0, len(claimed))
 	mintedGitHubCredentials := make([]githubapp.Credential, 0)
+	responseWritten := false
+	type finalizedClaim struct {
+		task    db.AgentTaskQueue
+		tokenID pgtype.UUID
+	}
+	finalizedClaims := make([]finalizedClaim, 0, len(claimed))
 	defer func() {
 		delivered := make(map[string]struct{})
-		for _, response := range out {
-			for _, credential := range response.GitHubCredentials {
-				delivered[credential.Token] = struct{}{}
+		if responseWritten {
+			for _, response := range out {
+				for _, credential := range response.GitHubCredentials {
+					delivered[credential.Token] = struct{}{}
+				}
 			}
 		}
 		for _, credential := range mintedGitHubCredentials {
@@ -1911,7 +1919,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		// same transaction; a rejected task is settled via FailTask and skipped
 		// while valid tasks in the same batch continue.
 		commentBackedTask := task.TriggerCommentID.Valid || len(task.CoalescedCommentIds) > 0
-		receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID, &resp, db.CreateTaskTokenParams{
+		taskToken := db.CreateTaskTokenParams{
 			ID:          dbid.NewV7(),
 			TokenHash:   auth.HashToken(tokenStr),
 			TaskID:      task.ID,
@@ -1919,7 +1927,8 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			WorkspaceID: parseUUID(resp.WorkspaceID),
 			UserID:      rt.OwnerID,
 			ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-		}, deliveredCommentIDs, commentBackedTask, issueSnapshot, daemonTokens...)
+		}
+		receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID, &resp, taskToken, deliveredCommentIDs, commentBackedTask, issueSnapshot, daemonTokens...)
 		if ferr != nil {
 			slog.Error("batch claim: finalize task claim failed; requeueing claim",
 				"task_id", uuidToString(task.ID), "error", ferr)
@@ -1941,6 +1950,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		resp.RemoteMCPDaemonToken = remoteMCPToken
 		resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
 		out = append(out, resp)
+		finalizedClaims = append(finalizedClaims, finalizedClaim{task: task, tokenID: taskToken.ID})
 	}
 
 	if len(out) > 0 {
@@ -1970,7 +1980,13 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeMeasuredJSON(w, http.StatusOK, response)
+	if _, err := writeMeasuredJSON(w, http.StatusOK, response); err != nil {
+		for _, claim := range finalizedClaims {
+			h.rollbackClaimAfterWriteFailure(claim.task, claim.tokenID, "batch_response_write")
+		}
+		return
+	}
+	responseWritten = true
 }
 
 func claimPollHintDelay(now, fireAt time.Time) time.Duration {
@@ -2103,6 +2119,17 @@ func (h *Handler) finalizeClaimDelivery(
 			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
 		)
 		return nil, failure, nil
+	}
+}
+
+func (h *Handler) rollbackClaimAfterWriteFailure(task db.AgentTaskQueue, tokenID pgtype.UUID, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := h.TaskService.RequeueTaskAfterClaimFailure(ctx, task); err != nil {
+		slog.Error("task claim: failed to requeue after response write failure", "task_id", uuidToString(task.ID), "reason", reason, "error", err)
+	}
+	if err := h.Queries.DeleteTaskTokenByID(ctx, tokenID); err != nil {
+		slog.Error("task claim: failed to revoke token after response write failure", "task_id", uuidToString(task.ID), "reason", reason, "error", err)
 	}
 }
 
@@ -3732,14 +3759,12 @@ func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.Agen
 			continue
 		}
 		seen[repository] = struct{}{}
-		var credential githubapp.Credential
-		var mintErr error
-		for _, installation := range installations {
-			credential, mintErr = broker.Mint(ctx, installation.InstallationID, repository, permissions)
-			if mintErr == nil {
-				break
-			}
+		installation, installErr := githubInstallationForRepository(installations, repository)
+		if installErr != nil {
+			revokeGitHubClaimCredentials(broker, credentials)
+			return nil, installErr
 		}
+		credential, mintErr := broker.Mint(ctx, installation.InstallationID, repository, permissions)
 		if mintErr != nil {
 			revokeGitHubClaimCredentials(broker, credentials)
 			return nil, fmt.Errorf("repository is not authorized by a workspace GitHub App installation: %w", mintErr)
@@ -3747,6 +3772,27 @@ func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.Agen
 		credentials = append(credentials, credential)
 	}
 	return credentials, nil
+}
+
+func githubInstallationForRepository(installations []db.GithubInstallation, repository string) (db.GithubInstallation, error) {
+	parts := strings.Split(repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return db.GithubInstallation{}, errors.New("invalid GitHub repository")
+	}
+	var matched *db.GithubInstallation
+	for i := range installations {
+		if !strings.EqualFold(strings.TrimSpace(installations[i].AccountLogin), parts[0]) {
+			continue
+		}
+		if matched != nil {
+			return db.GithubInstallation{}, errors.New("repository owner has multiple GitHub App installations")
+		}
+		matched = &installations[i]
+	}
+	if matched == nil {
+		return db.GithubInstallation{}, errors.New("repository owner has no GitHub App installation")
+	}
+	return *matched, nil
 }
 
 func revokeGitHubClaimCredentials(broker githubapp.Broker, credentials []githubapp.Credential) {
@@ -3942,7 +3988,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to mint Remote MCP daemon token")
 		return
 	}
-	receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, &resp, db.CreateTaskTokenParams{
+	taskToken := db.CreateTaskTokenParams{
 		ID:          dbid.NewV7(),
 		TokenHash:   auth.HashToken(tokenStr),
 		TaskID:      task.ID,
@@ -3950,7 +3996,8 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID: parseUUID(resp.WorkspaceID),
 		UserID:      runtime.OwnerID,
 		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-	}, deliveredCommentIDs, commentBackedTask, issueSnapshot, daemonTokens...)
+	}
+	receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, &resp, taskToken, deliveredCommentIDs, commentBackedTask, issueSnapshot, daemonTokens...)
 	if ferr != nil {
 		outcome = "error_claim_finalize"
 		slog.Error("task claim: failed to finalize token and comment delivery receipt",
@@ -3981,7 +4028,6 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	resp.RemoteMCPDaemonToken = remoteMCPToken
 	task.DeliveredCommentIds = receipt
 	resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
-	githubCredentialsDelivered = true
 
 	slog.Info("task claimed by runtime", "task_id", uuidToString(task.ID), "runtime_id", runtimeID, "agent_id", uuidToString(task.AgentID), "prior_session", resp.PriorSessionID)
 	if resp.Agent != nil && len(resp.Agent.Skills) > 0 {
@@ -3993,7 +4039,13 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			skillPayloadBytes = len(skillPayload)
 		}
 	}
-	payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": resp})
+	var writeErr error
+	payloadBytes, writeErr = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": resp})
+	if writeErr != nil {
+		h.rollbackClaimAfterWriteFailure(*task, taskToken.ID, "response_write")
+		return
+	}
+	githubCredentialsDelivered = true
 }
 
 type resolveSkillBundlesRequest struct {

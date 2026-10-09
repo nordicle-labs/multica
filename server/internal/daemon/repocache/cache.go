@@ -61,7 +61,11 @@ func gitEnvContext(ctx context.Context) []string {
 
 	config := [][2]string{{"safe.directory", "*"}}
 	if helper, _ := ctx.Value(gitCredentialHelperKey{}).(string); helper != "" {
-		config = append(config, [2]string{"credential.helper", helper}, [2]string{"credential.useHttpPath", "true"})
+		config = append(config,
+			[2]string{"credential.helper", ""},
+			[2]string{"credential.helper", helper},
+			[2]string{"credential.useHttpPath", "true"},
+		)
 	}
 	base = append(base, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_COUNT="+strconv.Itoa(existing+len(config)))
 	for offset, item := range config {
