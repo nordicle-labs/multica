@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/githubapp"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -1831,6 +1833,20 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := make([]AgentTaskResponse, 0, len(claimed))
+	mintedGitHubCredentials := make([]githubapp.Credential, 0)
+	defer func() {
+		delivered := make(map[string]struct{})
+		for _, response := range out {
+			for _, credential := range response.GitHubCredentials {
+				delivered[credential.Token] = struct{}{}
+			}
+		}
+		for _, credential := range mintedGitHubCredentials {
+			if _, ok := delivered[credential.Token]; !ok {
+				revokeGitHubClaimCredentials(githubAppBroker(), []githubapp.Credential{credential})
+			}
+		}
+	}()
 	for i := range claimed {
 		task := claimed[i]
 		rt, ok := runtimeByID[uuidToString(task.RuntimeID)]
@@ -1857,6 +1873,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			// the reclaim path.
 			continue
 		}
+		mintedGitHubCredentials = append(mintedGitHubCredentials, resp.GitHubCredentials...)
 		if !rt.OwnerID.Valid {
 			slog.Error("batch claim: runtime owner missing; cancelling task to avoid unscoped agent credentials",
 				"task_id", uuidToString(task.ID), "runtime_id", uuidToString(task.RuntimeID))
@@ -3632,6 +3649,28 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		}
 	}
 
+	if len(resp.Repos) > 0 {
+		if !requestHasClientCapability(r, protocol.DaemonCapabilityGitHubAppCredentialsV1) {
+			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+				r.Context(), task,
+				"This run requires GitHub App credentials, but the claiming runtime does not support them. Update the Multica app and retry.",
+				taskfailure.ReasonInvalidTaskIdentity,
+				"error_github_credentials_capability", http.StatusUnprocessableEntity, "runtime does not support GitHub App credentials",
+			)
+		}
+		credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, resp.WorkspaceID, resp.Repos)
+		if err != nil {
+			slog.Error("task claim: GitHub App credential broker rejected run", "task_id", uuidToString(task.ID), "error", err)
+			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+				r.Context(), task,
+				"GitHub access could not be authorized for this run. Check the workspace GitHub App installation and retry.",
+				taskfailure.ReasonInvalidTaskIdentity,
+				"error_github_credentials", http.StatusForbidden, "GitHub App authorization failed",
+			)
+		}
+		resp.GitHubCredentials = credentials
+	}
+
 	// Wakeup rules that waited for this run hand it their inputs now, after
 	// every gate passed, and only for a daemon that renders them; otherwise
 	// they keep their inputs and start their own run.
@@ -3660,6 +3699,68 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 
 	return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, nil
+}
+
+func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.AgentRuntime, workspaceID string, repos []RepoData) ([]githubapp.Credential, error) {
+	if !runtime.OwnerID.Valid {
+		return nil, errors.New("runtime owner is required")
+	}
+	member, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+		UserID: runtime.OwnerID, WorkspaceID: parseUUID(workspaceID),
+	})
+	if err != nil {
+		return nil, errors.New("runtime owner is not a workspace member")
+	}
+	permissions, err := githubapp.PermissionsForRole(member.Role)
+	if err != nil {
+		return nil, err
+	}
+	installations, err := h.Queries.ListGitHubInstallationsByWorkspace(ctx, parseUUID(workspaceID))
+	if err != nil || len(installations) == 0 {
+		return nil, errors.New("workspace has no GitHub App installation")
+	}
+	broker := githubAppBroker()
+	credentials := make([]githubapp.Credential, 0, len(repos))
+	seen := make(map[string]struct{}, len(repos))
+	for _, repo := range repos {
+		repository, parseErr := githubapp.ParseRepository(repo.URL)
+		if parseErr != nil {
+			revokeGitHubClaimCredentials(broker, credentials)
+			return nil, parseErr
+		}
+		if _, ok := seen[repository]; ok {
+			continue
+		}
+		seen[repository] = struct{}{}
+		var credential githubapp.Credential
+		var mintErr error
+		for _, installation := range installations {
+			credential, mintErr = broker.Mint(ctx, installation.InstallationID, repository, permissions)
+			if mintErr == nil {
+				break
+			}
+		}
+		if mintErr != nil {
+			revokeGitHubClaimCredentials(broker, credentials)
+			return nil, fmt.Errorf("repository is not authorized by a workspace GitHub App installation: %w", mintErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	return credentials, nil
+}
+
+func revokeGitHubClaimCredentials(broker githubapp.Broker, credentials []githubapp.Credential) {
+	for _, credential := range credentials {
+		_ = broker.Revoke(context.Background(), credential.Token)
+	}
+}
+
+func githubAppBroker() githubapp.Broker {
+	return githubapp.Broker{
+		AppID:      strings.TrimSpace(os.Getenv("GITHUB_APP_ID")),
+		PrivateKey: strings.TrimSpace(os.Getenv("GITHUB_APP_PRIVATE_KEY")),
+		APIBase:    githubAPIBase,
+	}
 }
 
 // worktreeClaimBlockReason returns a user-facing reason when this runtime must
@@ -3782,6 +3883,12 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, failure.status, failure.message)
 		return
 	}
+	githubCredentialsDelivered := false
+	defer func() {
+		if !githubCredentialsDelivered {
+			revokeGitHubClaimCredentials(githubAppBroker(), resp.GitHubCredentials)
+		}
+	}()
 	commentBackedTask := task.TriggerCommentID.Valid || len(task.CoalescedCommentIds) > 0
 	requeueFailedClaim := func(reason string) {
 		if _, err := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); err != nil {
@@ -3874,6 +3981,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	resp.RemoteMCPDaemonToken = remoteMCPToken
 	task.DeliveredCommentIds = receipt
 	resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
+	githubCredentialsDelivered = true
 
 	slog.Info("task claimed by runtime", "task_id", uuidToString(task.ID), "runtime_id", runtimeID, "agent_id", uuidToString(task.AgentID), "prior_session", resp.PriorSessionID)
 	if resp.Agent != nil && len(resp.Agent.Skills) > 0 {

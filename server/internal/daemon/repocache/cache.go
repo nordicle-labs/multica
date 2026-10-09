@@ -31,7 +31,20 @@ import (
 // caches and worktrees, so the ownership check adds no security value
 // and breaks CI environments where the runner UID differs from the
 // directory owner.
+type gitCredentialHelperKey struct{}
+
+// WithGitCredentialHelper limits remote authentication to Git commands using
+// the task's in-memory credential-cache socket. The token itself never enters
+// the environment or a repository config file.
+func WithGitCredentialHelper(ctx context.Context, helper string) context.Context {
+	return context.WithValue(ctx, gitCredentialHelperKey{}, strings.TrimSpace(helper))
+}
+
 func gitEnv() []string {
+	return gitEnvContext(context.Background())
+}
+
+func gitEnvContext(ctx context.Context) []string {
 	base := os.Environ()
 
 	// Find the existing GIT_CONFIG_COUNT so we append at the next index
@@ -46,13 +59,16 @@ func gitEnv() []string {
 		}
 	}
 
-	idx := strconv.Itoa(existing)
-	return append(base,
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_CONFIG_COUNT="+strconv.Itoa(existing+1),
-		"GIT_CONFIG_KEY_"+idx+"=safe.directory",
-		"GIT_CONFIG_VALUE_"+idx+"=*",
-	)
+	config := [][2]string{{"safe.directory", "*"}}
+	if helper, _ := ctx.Value(gitCredentialHelperKey{}).(string); helper != "" {
+		config = append(config, [2]string{"credential.helper", helper}, [2]string{"credential.useHttpPath", "true"})
+	}
+	base = append(base, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_COUNT="+strconv.Itoa(existing+len(config)))
+	for offset, item := range config {
+		idx := strconv.Itoa(existing + offset)
+		base = append(base, "GIT_CONFIG_KEY_"+idx+"="+item[0], "GIT_CONFIG_VALUE_"+idx+"="+item[1])
+	}
+	return base
 }
 
 var agentGitExcludePatterns = []string{
@@ -72,11 +88,15 @@ var agentGitExcludePatterns = []string{
 const repoCacheGitTimeout = 10 * time.Minute
 
 func newGitCommand(args ...string) *exec.Cmd {
+	return newGitCommandContext(context.Background(), args...)
+}
+
+func newGitCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.Command("git", args...)
 	// A daemon can outlive the checkout it was launched from. Run Git from the
 	// filesystem root instead of inheriting a cwd that may have been deleted.
 	cmd.Dir = filepath.VolumeName(os.TempDir()) + string(os.PathSeparator)
-	cmd.Env = gitEnv()
+	cmd.Env = gitEnvContext(ctx)
 	return cmd
 }
 
@@ -96,7 +116,7 @@ func runGitCombinedOutputWithTimeoutContext(parent context.Context, timeout time
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := newGitCommand(args...)
+	cmd := newGitCommandContext(parent, args...)
 	out, err := processtree.CombinedOutput(ctx, cmd, 5*time.Second)
 	if ctx.Err() == context.DeadlineExceeded {
 		return out, fmt.Errorf("git command timed out after %s: %w", timeout, ctx.Err())
@@ -120,7 +140,7 @@ func runGitOutputWithTimeoutContext(parent context.Context, timeout time.Duratio
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := newGitCommand(args...)
+	cmd := newGitCommandContext(parent, args...)
 	out, err := processtree.Output(ctx, cmd, 5*time.Second)
 	if ctx.Err() == context.DeadlineExceeded {
 		return out, fmt.Errorf("git command timed out after %s: %w", timeout, ctx.Err())
@@ -144,7 +164,7 @@ func runGitWithTimeoutContext(parent context.Context, timeout time.Duration, arg
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := newGitCommand(args...)
+	cmd := newGitCommandContext(parent, args...)
 	err := processtree.Run(ctx, cmd, 5*time.Second)
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("git command timed out after %s: %w", timeout, ctx.Err())

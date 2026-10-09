@@ -67,6 +67,18 @@ func TestGitEnv(t *testing.T) {
 	}
 }
 
+func TestGitEnvCredentialHelperIsContextScoped(t *testing.T) {
+	const helper = "cache --socket=/tmp/task-only.sock"
+	env := gitEnvContext(WithGitCredentialHelper(context.Background(), helper))
+	joined := strings.Join(env, "\n")
+	if !strings.Contains(joined, "credential.helper") || !strings.Contains(joined, helper) || !strings.Contains(joined, "credential.useHttpPath") {
+		t.Fatalf("credential helper config missing from git environment: %q", joined)
+	}
+	if strings.Contains(strings.Join(gitEnv(), "\n"), helper) {
+		t.Fatal("task credential helper leaked into the general git environment")
+	}
+}
+
 func TestGitEnvPreservesExistingConfig(t *testing.T) {
 	// GIT_CONFIG_COUNT env vars are process-wide; cannot use t.Setenv in
 	// parallel tests, so run sequentially.
