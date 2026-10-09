@@ -3793,6 +3793,31 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		params.ExpectedRevision = pgtype.Int8{Int64: *req.ExpectedRevision, Valid: true}
 	}
 
+	// An explicit change-of-direction marker opens the durable impact gate before
+	// the issue mutation. That ordering is fail-closed: concurrent issue-scoped
+	// enqueues observe pending (the SQL queue fence locks this same row), and a
+	// later update failure leaves the review pending rather than starting work on
+	// an unaudited direction. Text identifies the event; authenticated workspace
+	// ownership supplies the authority.
+	if startsDecisionImpactReview(prevIssue, req) {
+		actorType, _ := h.resolveActor(r, userID, workspaceID)
+		member, memberOK := ctxMember(r.Context())
+		if actorType != "member" || !memberOK || member.Role != "owner" {
+			writeError(w, http.StatusForbidden, "only a workspace owner can authorize a decision impact review")
+			return
+		}
+		gatedIssue, gateErr := h.beginDecisionImpactReview(r.Context(), prevIssue, member.UserID)
+		if gateErr != nil {
+			slog.Warn("begin decision impact review failed", append(logger.RequestAttrs(r), "error", gateErr, "issue_id", id, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to begin decision impact review")
+			return
+		}
+		prevIssue = gatedIssue
+		if req.ExpectedRevision != nil {
+			params.ExpectedRevision = pgtype.Int8{Int64: gatedIssue.Revision, Valid: true}
+		}
+	}
+
 	// COALESCE fields — only set when explicitly provided
 	if req.Title != nil {
 		params.Title = pgtype.Text{String: *req.Title, Valid: true}

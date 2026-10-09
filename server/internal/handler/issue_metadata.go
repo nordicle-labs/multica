@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/multica-ai/multica/server/internal/decisionimpact"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -24,7 +25,8 @@ import (
 //
 //   - keys match `^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$` (handler)
 //   - at most 50 keys per issue (handler)
-//   - values are primitive: string / number / bool (handler)
+//   - values are primitive: string / number / bool (handler), except the
+//     reserved owner-only decision_impact_review audit object
 //   - JSONB column is an object and ≤ 8KB (DB CHECK; defense in depth)
 //
 // All mutations are single-key atomic. UpdateIssue does NOT touch metadata —
@@ -168,9 +170,11 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := validateIssueMetadataValue(req.Value); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	if key != decisionImpactMetadataKey {
+		if err := validateIssueMetadataValue(req.Value); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	issue, ok := h.loadIssueForUser(w, r, issueID)
@@ -180,6 +184,18 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 	userID, ok := requireUserID(w, r)
 	if !ok {
 		return
+	}
+	if key == decisionImpactMetadataKey {
+		actorType, _ := h.resolveActor(r, userID, uuidToString(issue.WorkspaceID))
+		member, memberOK := ctxMember(r.Context())
+		if actorType != "member" || !memberOK || member.Role != "owner" {
+			writeError(w, http.StatusForbidden, "only a workspace owner can update a decision impact review")
+			return
+		}
+		if err := decisionimpact.ValidateReview(req.Value, uuidToString(member.UserID)); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	// Enforce the key-count cap in the handler. The DB only guards size,
@@ -264,6 +280,10 @@ func (h *Handler) DeleteIssueMetadataKey(w http.ResponseWriter, r *http.Request)
 	}
 	userID, ok := requireUserID(w, r)
 	if !ok {
+		return
+	}
+	if key == decisionImpactMetadataKey {
+		writeError(w, http.StatusForbidden, "decision impact reviews cannot be deleted")
 		return
 	}
 
