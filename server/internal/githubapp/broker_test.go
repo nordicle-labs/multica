@@ -46,7 +46,7 @@ func TestMintScopesTokenToOneRepositoryAndPermissions(t *testing.T) {
 			t.Fatal(err)
 		}
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"token":"secret-installation-token"}`))
+		_, _ = w.Write([]byte(`{"token":"secret-installation-token","repositories":[{"full_name":"owner/repo"}]}`))
 	}))
 	defer server.Close()
 
@@ -65,6 +65,28 @@ func TestMintScopesTokenToOneRepositoryAndPermissions(t *testing.T) {
 	gotPermissions := got["permissions"].(map[string]any)
 	if gotPermissions["contents"] != "read" || gotPermissions["pull_requests"] != "read" {
 		t.Fatalf("permissions = %#v", gotPermissions)
+	}
+}
+
+func TestMintRejectsTokenScopedToDifferentOwner(t *testing.T) {
+	var revoked bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			revoked = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"token":"wrong-scope","repositories":[{"full_name":"other/repo"}]}`))
+	}))
+	defer server.Close()
+	permissions, _ := PermissionsForRole("member")
+	broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client()}
+	if _, err := broker.Mint(context.Background(), 42, "owner/repo", permissions); err == nil {
+		t.Fatal("Mint accepted a token scoped to another owner")
+	}
+	if !revoked {
+		t.Fatal("Mint did not revoke the mismatched token")
 	}
 }
 

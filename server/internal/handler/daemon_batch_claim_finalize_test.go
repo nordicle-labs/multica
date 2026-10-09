@@ -3,10 +3,62 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+type claimWriteFailure struct {
+	header http.Header
+}
+
+func (w *claimWriteFailure) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (*claimWriteFailure) WriteHeader(int)           {}
+func (*claimWriteFailure) Write([]byte) (int, error) { return 0, errors.New("connection closed") }
+
+func assertClaimWriteFailureRolledBack(t *testing.T, taskID string) {
+	t.Helper()
+	var status string
+	var tokenCount int
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status)
+	dbfx.QueryRow(t, `SELECT count(*) FROM task_token WHERE task_id = $1`, taskID).Scan(&tokenCount)
+	if status != "queued" || tokenCount != 0 {
+		t.Fatalf("failed response left status=%q tokens=%d, want queued/0", status, tokenCount)
+	}
+}
+
+func TestClaimTaskByRuntime_WriteFailureRollsBackFinalization(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Claim write failure runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Claim write failure agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "claim-write-failure")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(&claimWriteFailure{}, req)
+	assertClaimWriteFailureRolledBack(t, taskID)
+}
+
+func TestClaimTasksByRuntime_WriteFailureRollsBackFinalization(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Batch write failure runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Batch write failure agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	testHandler.ClaimTasksByRuntime(&claimWriteFailure{}, batchClaimRequest(testWorkspaceID, []string{runtimeID}, 1, ""))
+	assertClaimWriteFailureRolledBack(t, taskID)
+}
 
 type batchClaimReceiptResponse struct {
 	Tasks []struct {

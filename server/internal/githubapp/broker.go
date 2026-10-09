@@ -94,13 +94,20 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 		return Credential{}, fmt.Errorf("create installation token: github status %d", resp.StatusCode)
 	}
 	var out struct {
-		Token string `json:"token"`
+		Token        string `json:"token"`
+		Repositories []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, responseLimit)).Decode(&out); err != nil {
 		return Credential{}, errors.New("create installation token: malformed response")
 	}
 	if out.Token == "" {
 		return Credential{}, errors.New("create installation token: empty token")
+	}
+	if len(out.Repositories) != 1 || !strings.EqualFold(out.Repositories[0].FullName, repository) {
+		_ = b.Revoke(context.Background(), out.Token)
+		return Credential{}, errors.New("create installation token: repository scope mismatch")
 	}
 	return Credential{Repository: repository, Token: out.Token}, nil
 }

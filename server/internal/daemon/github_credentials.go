@@ -38,9 +38,13 @@ func startGitHubCredentialSession(credentials []GitHubCredential) (*githubCreden
 	}
 	for _, credential := range credentials {
 		if credential.Token == "" || credential.Repository == "" {
+			if credential.Token != "" {
+				session.tokens = append(session.tokens, credential.Token)
+			}
 			session.close(context.Background())
 			return nil, fmt.Errorf("invalid GitHub App credential")
 		}
+		session.tokens = append(session.tokens, credential.Token)
 		input := credentialInput(credential.Repository, credential.Token)
 		cmd := exec.Command("git", "credential-cache", "--socket", filepath.Join(dir, "socket"), "store")
 		cmd.Stdin = strings.NewReader(input)
@@ -48,7 +52,6 @@ func startGitHubCredentialSession(credentials []GitHubCredential) (*githubCreden
 			session.close(context.Background())
 			return nil, fmt.Errorf("store GitHub App credential: %s", strings.TrimSpace(string(out)))
 		}
-		session.tokens = append(session.tokens, credential.Token)
 	}
 	return session, nil
 }
@@ -64,11 +67,13 @@ func (s *githubCredentialSession) apply(task *Task) {
 	if task.Agent.CustomEnv == nil {
 		task.Agent.CustomEnv = map[string]string{}
 	}
-	task.Agent.CustomEnv["GIT_CONFIG_COUNT"] = "2"
+	task.Agent.CustomEnv["GIT_CONFIG_COUNT"] = "3"
 	task.Agent.CustomEnv["GIT_CONFIG_KEY_0"] = "credential.helper"
-	task.Agent.CustomEnv["GIT_CONFIG_VALUE_0"] = s.helper
-	task.Agent.CustomEnv["GIT_CONFIG_KEY_1"] = "credential.useHttpPath"
-	task.Agent.CustomEnv["GIT_CONFIG_VALUE_1"] = "true"
+	task.Agent.CustomEnv["GIT_CONFIG_VALUE_0"] = ""
+	task.Agent.CustomEnv["GIT_CONFIG_KEY_1"] = "credential.helper"
+	task.Agent.CustomEnv["GIT_CONFIG_VALUE_1"] = s.helper
+	task.Agent.CustomEnv["GIT_CONFIG_KEY_2"] = "credential.useHttpPath"
+	task.Agent.CustomEnv["GIT_CONFIG_VALUE_2"] = "true"
 	task.GitCredentialHelper = s.helper
 	task.GitHubCredentials = nil
 }
