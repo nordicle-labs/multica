@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -203,7 +205,7 @@ func daemonHTTPClientCapabilities() string {
 }
 
 func daemonCommonCapabilities() []string {
-	return []string{
+	capabilities := []string{
 		protocol.DaemonCapabilitySkillBundlesV1,
 		protocol.DaemonCapabilityCoalescedCommentsV1,
 		protocol.DaemonCapabilityExecutionManifestV1,
@@ -217,6 +219,31 @@ func daemonCommonCapabilities() []string {
 		protocol.DaemonCapabilityJoinedWakeupsV1,
 		protocol.DaemonCapabilityGitHubAppCredentialsV1,
 	}
+	if gitSupportsCredentialIsolation() {
+		capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	}
+	return capabilities
+}
+
+var gitCredentialIsolationSupport = sync.OnceValue(func() bool {
+	out, err := exec.Command("git", "version").Output()
+	return err == nil && gitVersionAtLeast(string(out), 2, 31)
+})
+
+func gitSupportsCredentialIsolation() bool { return gitCredentialIsolationSupport() }
+
+func gitVersionAtLeast(version string, wantMajor, wantMinor int) bool {
+	fields := strings.Fields(version)
+	if len(fields) < 3 {
+		return false
+	}
+	parts := strings.Split(fields[2], ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	return majorErr == nil && minorErr == nil && (major > wantMajor || major == wantMajor && minor >= wantMinor)
 }
 
 // SetToken sets the auth token for authenticated requests.
@@ -236,7 +263,23 @@ func (c *Client) ClaimTask(ctx context.Context, runtimeID string) (*Task, error)
 	if err := c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/tasks/claim", runtimeID), map[string]any{}, &resp); err != nil {
 		return nil, err
 	}
+	if err := c.ackGitHubCredentials(ctx, resp.Task); err != nil {
+		return nil, err
+	}
 	return resp.Task, nil
+}
+
+func (c *Client) ackGitHubCredentials(ctx context.Context, task *Task) error {
+	if task == nil || task.GitHubCredentialAck == "" {
+		return nil
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/claim-ack", url.PathEscape(task.RuntimeID), url.PathEscape(task.ID))
+	if err := c.postJSON(ctx, path, map[string]string{"ack": task.GitHubCredentialAck}, nil); err != nil {
+		task.GitHubCredentials = nil
+		return fmt.Errorf("acknowledge GitHub App credentials: %w", err)
+	}
+	task.GitHubCredentialAck = ""
+	return nil
 }
 
 func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, taskID, contributionID string) (http.Header, error) {
@@ -311,6 +354,21 @@ func (c *Client) claimTasksWithHints(ctx context.Context, daemonID string, runti
 		"max_tasks":   maxTasks,
 	}, &resp); err != nil {
 		return claimTasksResult{}, err
+	}
+	return c.ackClaimedTasks(reqCtx, resp)
+}
+
+func (c *Client) ackClaimedTasks(ctx context.Context, resp claimTasksResult) (claimTasksResult, error) {
+	acked := resp.Tasks[:0]
+	for _, task := range resp.Tasks {
+		if err := c.ackGitHubCredentials(ctx, task); err != nil {
+			if len(acked) == 0 {
+				return claimTasksResult{}, err
+			}
+			resp.Tasks = acked
+			return resp, nil
+		}
+		acked = append(acked, task)
 	}
 	return resp, nil
 }

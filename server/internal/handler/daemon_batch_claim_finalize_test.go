@@ -6,7 +6,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 type claimWriteFailure struct {
@@ -397,5 +402,175 @@ func TestClaimTasksByRuntime_RepairsStaleCommentPlan(t *testing.T) {
 	}
 	if rebuilt < 1 {
 		t.Fatalf("expected the surviving comment rebuilt into a new trigger task, found %d", rebuilt)
+	}
+}
+
+func setupGitHubClaimRevocation(t *testing.T, issueID string) (*atomic.Int32, <-chan string) {
+	t.Helper()
+	projectID := dbfx.Project(t, "GitHub claim rollback project")
+	dbfx.Exec(t, `UPDATE issue SET project_id = $1 WHERE id = $2`, projectID, issueID)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `UPDATE issue SET project_id = NULL WHERE id = $1`, issueID)
+	})
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID,
+		"resource_type": "github_repo", "resource_ref": `{"url":"https://github.com/test-owner/test-repo"}`,
+		"position": 0,
+	})
+	dbfx.Insert(t, "github_installation", testutil.Cols{
+		"workspace_id": testWorkspaceID, "installation_id": 943001,
+		"account_login": "test-owner", "account_type": "Organization",
+	})
+
+	pemBytes, _ := generateTestRSAKeyPEM(t)
+	t.Setenv("GITHUB_APP_ID", "943")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
+	minted := &atomic.Int32{}
+	revoked := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/943001/access_tokens":
+			minted.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"github-test-token","repositories":[{"full_name":"test-owner/test-repo"}]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token":
+			revoked <- r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	oldBase := githubAPIBase
+	githubAPIBase = srv.URL
+	t.Cleanup(func() { githubAPIBase = oldBase })
+	return minted, revoked
+}
+
+func assertPendingClaimRevoked(t *testing.T, taskID, ack string, revoked <-chan string) {
+	t.Helper()
+	if ack == "" {
+		t.Fatal("claim response omitted GitHub credential acknowledgement")
+	}
+	select {
+	case auth := <-revoked:
+		if auth != "token github-test-token" {
+			t.Fatalf("revoke authorization = %q", auth)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GitHub installation token was not revoked after claim acknowledgement timeout")
+	}
+	assertClaimWriteFailureRolledBack(t, taskID)
+}
+
+func TestClaimTaskByRuntime_MissingAckRevokesGitHubCredential(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	oldTimeout := githubClaimAckTimeout
+	githubClaimAckTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { githubClaimAckTimeout = oldTimeout })
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Single GitHub ack runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Single GitHub ack agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	_, revoked := setupGitHubClaimRevocation(t, issueID)
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "single-github-ack")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	w := httptest.NewRecorder()
+	testHandler.ClaimTaskByRuntime(w, req)
+	var response struct {
+		Task struct {
+			GitHubCredentialAck string `json:"github_credential_ack"`
+		} `json:"task"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	assertPendingClaimRevoked(t, taskID, response.Task.GitHubCredentialAck, revoked)
+}
+
+func TestClaimTasksByRuntime_MissingAckRevokesGitHubCredential(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	oldTimeout := githubClaimAckTimeout
+	githubClaimAckTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { githubClaimAckTimeout = oldTimeout })
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Batch GitHub ack runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Batch GitHub ack agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	_, revoked := setupGitHubClaimRevocation(t, issueID)
+	w := httptest.NewRecorder()
+	testHandler.ClaimTasksByRuntime(w, batchClaimRequest(testWorkspaceID, []string{runtimeID}, 1, protocol.DaemonCapabilityGitHubAppCredentialsV2))
+	var response struct {
+		Tasks []struct {
+			GitHubCredentialAck string `json:"github_credential_ack"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || len(response.Tasks) != 1 {
+		t.Fatalf("decode batch response: tasks=%d err=%v body=%s", len(response.Tasks), err, w.Body.String())
+	}
+	assertPendingClaimRevoked(t, taskID, response.Tasks[0].GitHubCredentialAck, revoked)
+}
+
+func TestAcknowledgeTaskClaim_CommitsGitHubCredentialDelivery(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "GitHub ack runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "GitHub ack agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	_, revoked := setupGitHubClaimRevocation(t, issueID)
+	claimReq := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "github-ack")
+	claimReq = withURLParam(claimReq, "runtimeId", runtimeID)
+	claimReq.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	claim := httptest.NewRecorder()
+	testHandler.ClaimTaskByRuntime(claim, claimReq)
+	var response struct {
+		Task struct {
+			GitHubCredentialAck string `json:"github_credential_ack"`
+		} `json:"task"`
+	}
+	if err := json.Unmarshal(claim.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	ackReq := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/claim-ack", map[string]string{"ack": response.Task.GitHubCredentialAck}, testWorkspaceID, "github-ack")
+	ackReq = withURLParams(ackReq, "runtimeId", runtimeID, "taskId", taskID)
+	ack := httptest.NewRecorder()
+	testHandler.AcknowledgeTaskClaim(ack, ackReq)
+	if ack.Code != http.StatusNoContent {
+		t.Fatalf("ack status = %d, want 204: %s", ack.Code, ack.Body.String())
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil || status != "dispatched" {
+		t.Fatalf("task status after ack = %q, err=%v", status, err)
+	}
+	select {
+	case token := <-revoked:
+		t.Fatalf("acknowledged credential was revoked: %q", token)
+	default:
+	}
+}
+
+func TestClaimTaskByRuntime_LegacyGitCapabilityFailsBeforeMint(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Legacy Git runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Legacy Git agent")
+	seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	minted, _ := setupGitHubClaimRevocation(t, issueID)
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "legacy-git")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV1)
+	w := httptest.NewRecorder()
+	testHandler.ClaimTaskByRuntime(w, req)
+	if minted.Load() != 0 {
+		t.Fatalf("legacy Git capability minted %d GitHub tokens, want 0", minted.Load())
 	}
 }

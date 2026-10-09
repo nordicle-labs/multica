@@ -64,6 +64,10 @@ const (
 	// DaemonCapabilityGitHubAppCredentialsV1 advertises task-scoped GitHub App
 	// credentials stored only in an in-memory Git credential helper.
 	DaemonCapabilityGitHubAppCredentialsV1 = "github-app-credentials-v1"
+	// DaemonCapabilityGitHubAppCredentialsV2 adds two fail-closed guarantees:
+	// Git is new enough to isolate credential helpers via GIT_CONFIG_COUNT, and
+	// the daemon acknowledges receipt before a minted credential is committed.
+	DaemonCapabilityGitHubAppCredentialsV2 = "github-app-credentials-v2"
 	// DaemonCapabilityTaskSupplementV1 advertises that this provider run can accept
 	// an additional text instruction without cancelling or starting a task.
 	// It is persisted when this exact task enters running; absence always means
