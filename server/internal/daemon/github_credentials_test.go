@@ -2,16 +2,26 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestGitHubCredentialSessionKeepsTokenOutOfEnvironmentAndDisk(t *testing.T) {
+	versionOut, err := exec.Command("git", "version").Output()
+	if err != nil || !gitVersionAtLeast(string(versionOut), 2, 31) {
+		t.Skip("credential isolation requires Git >= 2.31")
+	}
+
 	var revoked bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		revoked = true
@@ -59,6 +69,64 @@ func TestGitHubCredentialSessionKeepsTokenOutOfEnvironmentAndDisk(t *testing.T) 
 	session.close(context.Background())
 	if !revoked {
 		t.Fatal("installation token was not revoked")
+	}
+}
+
+func TestHandleTaskAcknowledgesCredentialAfterSetupAndRevokesOnLocalFailure(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	record := func(call string) {
+		mu.Lock()
+		calls = append(calls, call)
+		mu.Unlock()
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/claim-ack"):
+			record("ack")
+		case r.Method == http.MethodDelete:
+			record("revoke")
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_, _ = w.Write([]byte(`{"status":"running"}`))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	oldURL := githubInstallationTokenURL
+	githubInstallationTokenURL = srv.URL
+	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
+
+	d := &Daemon{
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"runtime-1": {ID: "runtime-1", Provider: "claude"}},
+		activeEnvRoots:     make(map[string]int),
+		cancelPollInterval: time.Hour,
+		cfg:                Config{WorkspacesRoot: t.TempDir()},
+	}
+	d.runner = taskRunnerFunc(func(_ context.Context, task Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
+		record("run")
+		if task.GitHubCredentials != nil || task.GitCredentialHelper == "" {
+			t.Fatal("runner received credentials before helper setup")
+		}
+		return TaskResult{}, errors.New("local launch failed")
+	})
+
+	d.handleTask(context.Background(), Task{
+		ID:                  "task-1",
+		RuntimeID:           "runtime-1",
+		Agent:               &AgentData{Name: "test-agent"},
+		GitHubCredentials:   []GitHubCredential{{Repository: "owner/repo", Token: "ghs_test_secret"}},
+		GitHubCredentialAck: "ack-1",
+	}, 0)
+
+	mu.Lock()
+	got := append([]string(nil), calls...)
+	mu.Unlock()
+	if strings.Join(got, ",") != "ack,run,revoke" {
+		t.Fatalf("credential lifecycle calls = %v, want [ack run revoke]", got)
 	}
 }
 
