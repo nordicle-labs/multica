@@ -12,19 +12,23 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-func TestGitVersionAtLeastForCredentialIsolation(t *testing.T) {
+func TestGitCredentialIsolationSupportByOSAndVersion(t *testing.T) {
 	for _, tc := range []struct {
+		goos    string
 		version string
 		want    bool
 	}{
-		{"git version 2.15.0", false},
-		{"git version 2.30.9", false},
-		{"git version 2.31.0", true},
-		{"git version 2.55.1", true},
-		{"not git", false},
+		{"linux", "git version 2.15.0", false},
+		{"linux", "git version 2.31.0", true},
+		{"darwin", "git version 2.30.9", false},
+		{"darwin", "git version 2.55.1", true},
+		{"windows", "git version 2.30.9", false},
+		{"windows", "git version 2.31.0", false},
+		{"windows", "git version 2.55.1", false},
+		{"linux", "not git", false},
 	} {
-		if got := gitVersionAtLeast(tc.version, 2, 31); got != tc.want {
-			t.Errorf("gitVersionAtLeast(%q) = %v, want %v", tc.version, got, tc.want)
+		if got := gitSupportsCredentialIsolationFor(tc.goos, tc.version); got != tc.want {
+			t.Errorf("gitSupportsCredentialIsolationFor(%q, %q) = %v, want %v", tc.goos, tc.version, got, tc.want)
 		}
 	}
 }
