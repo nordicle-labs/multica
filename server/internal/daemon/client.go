@@ -263,9 +263,6 @@ func (c *Client) ClaimTask(ctx context.Context, runtimeID string) (*Task, error)
 	if err := c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/tasks/claim", runtimeID), map[string]any{}, &resp); err != nil {
 		return nil, err
 	}
-	if err := c.ackGitHubCredentials(ctx, resp.Task); err != nil {
-		return nil, err
-	}
 	return resp.Task, nil
 }
 
@@ -354,21 +351,6 @@ func (c *Client) claimTasksWithHints(ctx context.Context, daemonID string, runti
 		"max_tasks":   maxTasks,
 	}, &resp); err != nil {
 		return claimTasksResult{}, err
-	}
-	return c.ackClaimedTasks(reqCtx, resp)
-}
-
-func (c *Client) ackClaimedTasks(ctx context.Context, resp claimTasksResult) (claimTasksResult, error) {
-	acked := resp.Tasks[:0]
-	for _, task := range resp.Tasks {
-		if err := c.ackGitHubCredentials(ctx, task); err != nil {
-			if len(acked) == 0 {
-				return claimTasksResult{}, err
-			}
-			resp.Tasks = acked
-			return resp, nil
-		}
-		acked = append(acked, task)
 	}
 	return resp, nil
 }

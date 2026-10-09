@@ -5768,6 +5768,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			d.mu.Unlock()
 		}()
 		defer credentialSession.close(context.Background())
+		if ackErr := d.client.ackGitHubCredentials(ctx, &task); ackErr != nil {
+			d.logger.Error("acknowledge GitHub App credentials after helper setup", "task", task.ID, "error", ackErr)
+			return
+		}
 	}
 
 	// Task-scoped logger. The task id goes in whole: it is the key every

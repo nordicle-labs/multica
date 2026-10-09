@@ -29,7 +29,7 @@ func TestGitVersionAtLeastForCredentialIsolation(t *testing.T) {
 	}
 }
 
-func TestClient_ClaimTasksAcknowledgesGitHubCredentials(t *testing.T) {
+func TestClient_ClaimTasksDefersGitHubCredentialAcknowledgement(t *testing.T) {
 	var acked bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -51,8 +51,8 @@ func TestClient_ClaimTasksAcknowledgesGitHubCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !acked || len(result.Tasks) != 1 || result.Tasks[0].GitHubCredentialAck != "" {
-		t.Fatalf("acknowledgement not completed: acked=%v result=%+v", acked, result)
+	if acked || len(result.Tasks) != 1 || result.Tasks[0].GitHubCredentialAck != "ack-1" {
+		t.Fatalf("credentials acknowledged before local setup: acked=%v result=%+v", acked, result)
 	}
 }
 
