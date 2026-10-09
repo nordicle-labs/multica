@@ -52,6 +52,9 @@ type Preflight struct {
 	CLIAvailable       bool       `json:"cli_available"`
 	Authenticated      bool       `json:"authenticated"`
 	Toolsets           []string   `json:"toolsets"`
+	CanonicalBranch    string     `json:"canonical_branch,omitempty"`
+	RunBaseSHA         string     `json:"run_base_sha,omitempty"`
+	CanonicalRefSHA    string     `json:"canonical_ref_sha,omitempty"`
 }
 
 func (p Preflight) Validate(profile CapabilityProfile) error {
@@ -85,6 +88,11 @@ func (p Preflight) Validate(profile CapabilityProfile) error {
 	if p.RepositoryRequired {
 		if !p.Repository.Git || !p.Repository.Worktree || strings.TrimSpace(p.Repository.Branch) == "" || !validSHA(p.Repository.CommitSHA) {
 			return errors.New("git repository, branch, commit SHA, and worktree are required")
+		}
+	}
+	if p.CanonicalBranch != "" {
+		if p.Repository.Branch != p.CanonicalBranch || !validSHA(p.RunBaseSHA) || !validSHA(p.CanonicalRefSHA) {
+			return errors.New("canonical branch, run base SHA, and expected ref SHA must match the prepared repository")
 		}
 	}
 	return nil

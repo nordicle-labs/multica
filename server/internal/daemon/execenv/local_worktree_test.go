@@ -1599,47 +1599,65 @@ func TestFinalizeRefusesToRecordADeliveryThatResetPastItsBaseline(t *testing.T) 
 	}
 }
 
-// The same guard from the other side: whatever the worktree delivered has to BE
-// the task's branch. A run that ended somewhere else — a detached checkout, a
-// different branch — delivered a commit this record has no business describing,
-// and the branch it names would not carry it.
-func TestFinalizeRefusesToRecordADeliveryFromOffTheBranch(t *testing.T) {
+func TestFinalizeReconcilesDeliveryFromAnotherBranch(t *testing.T) {
 	t.Parallel()
 	repo := newTestRepo(t)
-	head := gitRun(t, repo, "rev-parse", "HEAD")
 
 	wt := prepareTurn(t, repo, "MUL-6881", turnOneTask)
+	gitRun(t, wt.Path, "checkout", "-b", "agent-created")
 	writeFile(t, filepath.Join(wt.WorkDir, "agent.txt"), "turn one\n")
 	gitRun(t, wt.Path, "add", "-A")
 	gitRun(t, wt.Path, "commit", "-m", "turn one")
-	delivered := gitRun(t, repo, "rev-parse", "agent/j/mul-6881")
-	// The run wanders off its own branch before it ends.
-	gitRun(t, wt.Path, "checkout", "--quiet", "--detach", head)
+	head := gitRun(t, wt.Path, "rev-parse", "HEAD")
 
 	outcome, err := wt.Finalize(worktreeTestLogger())
-	if err == nil {
-		t.Fatal("Finalize recorded a delivery that is not the branch's tip")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "did not deliver onto its own branch") {
-		t.Errorf("error does not explain the mismatch: %v", err)
+	if outcome.Branch != wt.Branch || outcome.HeadSHA != head {
+		t.Fatalf("outcome = %+v, want branch %q at %s", outcome, wt.Branch, head)
+	}
+	if got := gitRun(t, repo, "rev-parse", wt.Branch); got != head {
+		t.Fatalf("canonical branch = %s, want %s", got, head)
+	}
+}
+
+func TestFinalizeRefusesReconciliationWhenCanonicalRefDiverged(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	wt := prepareTurn(t, repo, "MUL-6881", turnOneTask)
+	gitRun(t, wt.Path, "checkout", "-b", "agent-created")
+	writeFile(t, filepath.Join(wt.WorkDir, "agent.txt"), "turn one\n")
+	gitRun(t, wt.Path, "add", "-A")
+	gitRun(t, wt.Path, "commit", "-m", "turn one")
+	gitRun(t, repo, "update-ref", "refs/heads/"+wt.Branch, "HEAD")
+
+	outcome, err := wt.Finalize(worktreeTestLogger())
+	if err == nil || !strings.Contains(err.Error(), "canonical ref moved") {
+		t.Fatalf("Finalize error = %v, want canonical ref divergence", err)
 	}
 	if outcome.PreservedPath != wt.Path {
-		t.Errorf("PreservedPath = %q, want the worktree at %q", outcome.PreservedPath, wt.Path)
+		t.Fatalf("PreservedPath = %q, want %q", outcome.PreservedPath, wt.Path)
 	}
-	// The branch keeps what it had; nothing was recorded against the stray tip.
-	if got := gitRun(t, repo, "rev-parse", "agent/j/mul-6881"); got != delivered {
-		t.Errorf("branch moved to %s, want %s", got, delivered)
+	_ = removeLocalWorktreeDir(repo, wt.Path, worktreeTestLogger())
+}
+
+func TestFinalizeRefusesReconciliationOutsideRunLineage(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	wt := prepareTurn(t, repo, "MUL-6881", turnOneTask)
+	gitRun(t, wt.Path, "checkout", "--orphan", "unrelated")
+	gitRun(t, wt.Path, "rm", "-rf", ".")
+	writeFile(t, filepath.Join(wt.WorkDir, "unrelated.txt"), "unrelated\n")
+	gitRun(t, wt.Path, "add", "-A")
+	gitRun(t, wt.Path, "commit", "-m", "unrelated")
+
+	outcome, err := wt.Finalize(worktreeTestLogger())
+	if err == nil || !strings.Contains(err.Error(), "does not descend") {
+		t.Fatalf("Finalize error = %v, want lineage rejection", err)
 	}
-	ref, err := readUserStateRef(repo, "agent/j/mul-6881")
-	if err != nil {
-		t.Fatalf("readUserStateRef: %v", err)
-	}
-	record, err := readBranchRecord(repo, ref)
-	if err != nil {
-		t.Fatalf("readBranchRecord: %v", err)
-	}
-	if record.checkpoint == head {
-		t.Error("the stray HEAD was recorded as this branch's checkpoint")
+	if outcome.PreservedPath != wt.Path {
+		t.Fatalf("PreservedPath = %q, want %q", outcome.PreservedPath, wt.Path)
 	}
 	_ = removeLocalWorktreeDir(repo, wt.Path, worktreeTestLogger())
 }

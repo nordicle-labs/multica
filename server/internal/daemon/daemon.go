@@ -5756,18 +5756,11 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 	if credentialSession != nil {
 		credentialSession.apply(&task)
-		d.mu.Lock()
-		if d.gitCredentialHelpers == nil {
-			d.gitCredentialHelpers = make(map[string]string)
-		}
-		d.gitCredentialHelpers[task.ID] = credentialSession.helper
-		d.mu.Unlock()
 		defer func() {
-			d.mu.Lock()
-			delete(d.gitCredentialHelpers, task.ID)
-			d.mu.Unlock()
+			if revokeErr := credentialSession.close(context.Background()); revokeErr != nil {
+				d.logger.Error("github credential revocation not confirmed", "task", task.ID, "phase", "revoke", "error", revokeErr)
+			}
 		}()
-		defer credentialSession.close(context.Background())
 		if ackErr := d.client.ackGitHubCredentials(ctx, &task); ackErr != nil {
 			d.logger.Error("acknowledge GitHub App credentials after helper setup", "task", task.ID, "error", ackErr)
 			return
@@ -5906,6 +5899,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// run errors stay discarded: on a cancelled run they are expected
 		// noise (context canceled, killed process), and persisting them would
 		// stamp a bogus reason on every ordinary mid-run cancel.
+		d.recoverTaskArtifact(task, result, "cancel", taskLog)
 		ack := TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}
 		var preserved *worktreePreservedError
 		if errors.As(err, &preserved) {
@@ -5919,7 +5913,18 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	default:
 	}
 
+	if err == nil && credentialSession != nil && result.BranchName != "" && result.CommitSHA != "" {
+		remoteSHA, publishErr := credentialSession.publish(ctx, result.DurableWorkDir, result.BranchName, result.CommitSHA)
+		if publishErr != nil {
+			err = fmt.Errorf("host-side GitHub publication failed (phase=publish canonical_branch=%s head_sha=%s remote_sha=%s runtime_id=%s): %w",
+				result.BranchName, result.CommitSHA, remoteSHA, task.RuntimeID, publishErr)
+		} else {
+			taskLog.Info("host-side GitHub publication verified", "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "remote_sha", remoteSHA)
+		}
+	}
+
 	if err != nil {
+		d.recoverTaskArtifact(task, result, "finalize", taskLog)
 		taskLog.Error("task failed", "error", err)
 		// runTask may have reached worktree finalization before returning the
 		// error. Preserve any delivery metadata that defer attached to the named
@@ -5961,6 +5966,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// completed/failed rows the complete/fail callback is the
 		// authoritative channel and a stale run's late ack must not touch
 		// them.
+		d.recoverTaskArtifact(task, result, "cancel", taskLog)
 		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
@@ -5997,6 +6003,18 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			}
 		}
 	}
+}
+
+func (d *Daemon) recoverTaskArtifact(task Task, result TaskResult, phase string, taskLog *slog.Logger) {
+	if result.CommitSHA == "" || result.DurableWorkDir == "" {
+		return
+	}
+	recovery, err := execenv.CreateRecoveryArtifact(result.DurableWorkDir, filepath.Join(d.cfg.WorkspacesRoot, "recovery"), task.ID, result.CommitSHA, taskLog)
+	if err != nil {
+		taskLog.Error("task recovery artifact failed", "phase", phase, "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "runtime_id", task.RuntimeID, "error", err)
+		return
+	}
+	taskLog.Error("task artifact preserved for recovery", "phase", phase, "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "recovery_ref", recovery.Ref, "bundle_verified", recovery.BundleVerified, "runtime_id", task.RuntimeID)
 }
 
 // worktreePreservedError marks a task error that must survive the cancel path:
@@ -8293,6 +8311,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			outcome, finalizeErr := env.LocalWorktree.Finalize(taskLog)
 			if outcome.Branch != "" {
 				taskResult.BranchName = outcome.Branch
+				taskResult.CommitSHA = outcome.HeadSHA
 			}
 			if finalizeErr == nil {
 				// The configured local_directory becomes authoritative only after
@@ -8427,7 +8446,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != "" {
 		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
 	}
-	deliveryPreflight := buildDeliveryPreflight(prepareCtx, env.WorkDir, localAssignment != nil, task.AuthToken != "")
+	deliveryPreflight := buildDeliveryPreflight(prepareCtx, env.WorkDir, localAssignment != nil, task.AuthToken != "", env.LocalWorktree)
 	taskSupplementNegotiated, err := d.client.StartTaskWithDeliveryPreflight(prepareCtx, task, &deliveryPreflight, taskCapabilities...)
 	if err != nil {
 		stopPrepareLease()
@@ -8580,6 +8599,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		agentCustomEnv = task.Agent.CustomEnv
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+	if env.LocalWorktree != nil {
+		// Set after custom_env layering so the provider can read, but not replace,
+		// the canonical delivery name acknowledged by StartTask above.
+		agentEnv["MULTICA_TASK_BRANCH"] = env.LocalWorktree.Branch
+	}
 	if provider == "reasonix" {
 		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.Profile, task.RuntimeID, task.AgentID)
 		if err != nil {

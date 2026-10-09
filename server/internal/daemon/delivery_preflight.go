@@ -17,7 +17,7 @@ func prepareRuntimeBrief(env *execenv.Environment, provider string, task execenv
 	return execenv.InjectRuntimeConfig(env.WorkDir, provider, task)
 }
 
-func buildDeliveryPreflight(ctx context.Context, workDir string, repositoryRequired, authenticated bool) deliverycontract.Preflight {
+func buildDeliveryPreflight(ctx context.Context, workDir string, repositoryRequired, authenticated bool, worktree *execenv.LocalWorktree) deliverycontract.Preflight {
 	profile := deliverycontract.CurrentProfile()
 	hash, _ := profile.Hash()
 	report := deliverycontract.Preflight{
@@ -46,6 +46,12 @@ func buildDeliveryPreflight(ctx context.Context, workDir string, repositoryRequi
 	report.Repository.Worktree = report.Repository.Git
 	report.Repository.Branch = gitPreflight(ctx, workDir, "branch", "--show-current")
 	report.Repository.CommitSHA = gitPreflight(ctx, workDir, "rev-parse", "HEAD")
+	if worktree != nil {
+		report.Repository.Branch = worktree.Branch
+		report.CanonicalBranch = worktree.Branch
+		report.RunBaseSHA = worktree.BaseCommit
+		report.CanonicalRefSHA = worktree.CanonicalRefExpected
+	}
 	return report
 }
 

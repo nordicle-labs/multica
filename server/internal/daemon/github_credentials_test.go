@@ -16,12 +16,7 @@ import (
 	"time"
 )
 
-func TestGitHubCredentialSessionKeepsTokenOutOfEnvironmentAndDisk(t *testing.T) {
-	versionOut, err := exec.Command("git", "version").Output()
-	if err != nil || !gitVersionAtLeast(string(versionOut), 2, 31) {
-		t.Skip("credential isolation requires Git >= 2.31")
-	}
-
+func TestGitHubCredentialSessionKeepsTokenOutOfProviderAndRevokes(t *testing.T) {
 	var revoked bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		revoked = true
@@ -37,50 +32,28 @@ func TestGitHubCredentialSessionKeepsTokenOutOfEnvironmentAndDisk(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	task := Task{Agent: &AgentData{}, GitHubCredentials: []GitHubCredential{{Repository: "owner/repo", Token: token}}}
+	task := Task{Agent: &AgentData{CustomEnv: map[string]string{"GITHUB_TOKEN": "ambient"}}, GitHubCredentials: []GitHubCredential{{Repository: "owner/repo", Token: token}}}
 	session.apply(&task)
-	if task.GitHubCredentials != nil {
-		t.Fatal("raw GitHub token remained on the task after credential-helper setup")
+	if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
+		t.Fatal("GitHub credential reached provider task state")
 	}
 	for key, value := range task.Agent.CustomEnv {
 		if strings.Contains(key, token) || strings.Contains(value, token) || key == "GITHUB_TOKEN" {
 			t.Fatalf("token leaked through environment %q", key)
 		}
 	}
-
-	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[credential]\n	helper = !f() { echo username=personal; echo password=personal-token; }; f\n"), 0o600); err != nil {
+	if err := session.close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("git", "credential", "fill")
-	cmd.Env = append(cmd.Environ(), "HOME="+home, "GIT_CONFIG_NOSYSTEM=1")
-	for key, value := range task.Agent.CustomEnv {
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
-	cmd.Stdin = strings.NewReader("protocol=https\nhost=github.com\npath=owner/repo.git\n\n")
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(out), "password="+token) {
-		t.Fatalf("Git credential helper did not override the inherited personal helper: %s", out)
-	}
-
-	session.close(context.Background())
 	if !revoked {
 		t.Fatal("installation token was not revoked")
 	}
 }
 
-func TestHandleTaskAcknowledgesGitHubCredentialAfterSetupAndRevokesOnLocalFailure(t *testing.T) {
+func TestHandleTaskAcknowledgesGitHubCredentialAndRevokesOnLocalFailure(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
-	record := func(call string) {
-		mu.Lock()
-		calls = append(calls, call)
-		mu.Unlock()
-	}
-
+	record := func(call string) { mu.Lock(); calls = append(calls, call); mu.Unlock() }
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/claim-ack"):
@@ -97,30 +70,15 @@ func TestHandleTaskAcknowledgesGitHubCredentialAfterSetupAndRevokesOnLocalFailur
 	githubInstallationTokenURL = srv.URL
 	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
 
-	d := &Daemon{
-		client:             NewClient(srv.URL),
-		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
-		workspaces:         make(map[string]*workspaceState),
-		runtimeIndex:       map[string]Runtime{"runtime-1": {ID: "runtime-1", Provider: "claude"}},
-		activeEnvRoots:     make(map[string]int),
-		cancelPollInterval: time.Hour,
-		cfg:                Config{WorkspacesRoot: t.TempDir()},
-	}
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.New(slog.NewTextHandler(io.Discard, nil)), workspaces: make(map[string]*workspaceState), runtimeIndex: map[string]Runtime{"runtime-1": {ID: "runtime-1", Provider: "claude"}}, activeEnvRoots: make(map[string]int), cancelPollInterval: time.Hour, cfg: Config{WorkspacesRoot: t.TempDir()}}
 	d.runner = taskRunnerFunc(func(_ context.Context, task Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
 		record("run")
-		if task.GitHubCredentials != nil || task.GitCredentialHelper == "" {
-			t.Fatal("runner received credentials before helper setup")
+		if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
+			t.Fatal("runner received GitHub credentials")
 		}
 		return TaskResult{}, errors.New("local launch failed")
 	})
-
-	d.handleTask(context.Background(), Task{
-		ID:                  "task-1",
-		RuntimeID:           "runtime-1",
-		Agent:               &AgentData{Name: "test-agent"},
-		GitHubCredentials:   []GitHubCredential{{Repository: "owner/repo", Token: "ghs_test_secret"}},
-		GitHubCredentialAck: "ack-1",
-	}, 0)
+	d.handleTask(context.Background(), Task{ID: "task-1", RuntimeID: "runtime-1", Agent: &AgentData{Name: "test-agent"}, GitHubCredentials: []GitHubCredential{{Repository: "owner/repo", Token: "ghs_test_secret"}}, GitHubCredentialAck: "ack-1"}, 0)
 
 	mu.Lock()
 	got := append([]string(nil), calls...)
@@ -130,7 +88,7 @@ func TestHandleTaskAcknowledgesGitHubCredentialAfterSetupAndRevokesOnLocalFailur
 	}
 }
 
-func TestGitHubCredentialSessionRevokesTokenWhenHelperSetupFails(t *testing.T) {
+func TestGitHubCredentialSessionRevokesTokenWhenCredentialIsInvalid(t *testing.T) {
 	var methods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		methods = append(methods, r.Method)
@@ -140,12 +98,45 @@ func TestGitHubCredentialSessionRevokesTokenWhenHelperSetupFails(t *testing.T) {
 	oldURL := githubInstallationTokenURL
 	githubInstallationTokenURL = server.URL
 	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
-	t.Setenv("PATH", t.TempDir())
-
-	if _, err := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "ghs_must_revoke"}}); err == nil {
-		t.Fatal("credential session succeeded without git")
+	if _, err := startGitHubCredentialSession([]GitHubCredential{{Token: "ghs_must_revoke"}}); err == nil {
+		t.Fatal("credential session succeeded with invalid repository")
 	}
 	if len(methods) != 1 || methods[0] != http.MethodDelete {
 		t.Fatalf("revocation methods = %v, want [DELETE]", methods)
+	}
+}
+
+func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T) {
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	work := filepath.Join(t.TempDir(), "work")
+	for _, cmd := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
+		if out, err := exec.Command("git", cmd...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", cmd, out, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"-C", work, "add", "file.txt"}, {"-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "test"}} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, out, err)
+		}
+	}
+	shaBytes, err := exec.Command("git", "-C", work, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.TrimSpace(string(shaBytes))
+	oldRemote := githubRepositoryRemote
+	githubRepositoryRemote = func(string) string { return remote }
+	t.Cleanup(func() { githubRepositoryRemote = oldRemote })
+
+	session, err := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "secret-never-logged"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteSHA, err := session.publish(context.Background(), work, "canonical", sha)
+	if err != nil || remoteSHA != sha {
+		t.Fatalf("publish = %q, %v; want %s", remoteSHA, err, sha)
 	}
 }
