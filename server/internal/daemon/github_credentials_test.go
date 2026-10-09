@@ -72,7 +72,7 @@ func TestGitHubCredentialSessionKeepsTokenOutOfEnvironmentAndDisk(t *testing.T) 
 	}
 }
 
-func TestHandleTaskAcknowledgesCredentialAfterSetupAndRevokesOnLocalFailure(t *testing.T) {
+func TestHandleTaskAcknowledgesGitHubCredentialAfterSetupAndRevokesOnLocalFailure(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
 	record := func(call string) {

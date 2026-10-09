@@ -227,10 +227,14 @@ func daemonCommonCapabilities() []string {
 
 var gitCredentialIsolationSupport = sync.OnceValue(func() bool {
 	out, err := exec.Command("git", "version").Output()
-	return err == nil && gitVersionAtLeast(string(out), 2, 31)
+	return err == nil && gitSupportsCredentialIsolationFor(runtime.GOOS, string(out))
 })
 
 func gitSupportsCredentialIsolation() bool { return gitCredentialIsolationSupport() }
+
+func gitSupportsCredentialIsolationFor(goos, version string) bool {
+	return goos != "windows" && gitVersionAtLeast(version, 2, 31)
+}
 
 func gitVersionAtLeast(version string, wantMajor, wantMinor int) bool {
 	fields := strings.Fields(version)
