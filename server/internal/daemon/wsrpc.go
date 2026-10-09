@@ -349,6 +349,9 @@ func (d *Daemon) claimTasksWSFirst(ctx context.Context, daemonID string, runtime
 			"max_tasks":   maxTasks,
 		}, &resp)
 		if err == nil {
+			resp, err = d.client.ackClaimedTasks(ctx, resp)
+		}
+		if err == nil {
 			resp.ClaimedOverWS = true
 			return resp, nil
 		}

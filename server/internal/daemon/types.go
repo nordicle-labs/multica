@@ -107,6 +107,7 @@ type Task struct {
 	ProjectDescription            string                 `json:"project_description,omitempty"` // durable project-level context injected into the brief
 	ProjectResources              []ProjectResourceData  `json:"project_resources,omitempty"`   // project-scoped resources to expose to the agent
 	GitHubCredentials             []GitHubCredential     `json:"github_credentials,omitempty"`
+	GitHubCredentialAck           string                 `json:"github_credential_ack,omitempty"`
 	GitCredentialHelper           string                 `json:"-"`
 	IsLeaderTask                  bool                   `json:"is_leader_task,omitempty"`                   // true when executing in the squad-leader coordinator role
 	LeaderRoleResolved            bool                   `json:"leader_role_resolved,omitempty"`             // server capability: IsLeaderTask/SquadID authoritatively answer "is this a leader run". Absent on servers predating it — those before #4951 never sent is_leader_task at all, later ones send it without this guarantee — so taskIsSquadLeader falls back to the briefing marker for both (MUL-5811)

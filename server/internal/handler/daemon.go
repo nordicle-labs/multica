@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -1834,19 +1835,20 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]AgentTaskResponse, 0, len(claimed))
 	mintedGitHubCredentials := make([]githubapp.Credential, 0)
-	responseWritten := false
 	type finalizedClaim struct {
 		task    db.AgentTaskQueue
 		tokenID pgtype.UUID
+		ack     string
 	}
 	finalizedClaims := make([]finalizedClaim, 0, len(claimed))
 	defer func() {
 		delivered := make(map[string]struct{})
-		if responseWritten {
-			for _, response := range out {
-				for _, credential := range response.GitHubCredentials {
-					delivered[credential.Token] = struct{}{}
-				}
+		for _, response := range out {
+			if response.GitHubCredentialAck == "" {
+				continue
+			}
+			for _, credential := range response.GitHubCredentials {
+				delivered[credential.Token] = struct{}{}
 			}
 		}
 		for _, credential := range mintedGitHubCredentials {
@@ -1949,8 +1951,9 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		resp.AuthToken = tokenStr
 		resp.RemoteMCPDaemonToken = remoteMCPToken
 		resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
+		resp.GitHubCredentialAck = h.beginPendingGitHubClaim(task, taskToken.ID, resp.GitHubCredentials)
 		out = append(out, resp)
-		finalizedClaims = append(finalizedClaims, finalizedClaim{task: task, tokenID: taskToken.ID})
+		finalizedClaims = append(finalizedClaims, finalizedClaim{task: task, tokenID: taskToken.ID, ack: resp.GitHubCredentialAck})
 	}
 
 	if len(out) > 0 {
@@ -1982,11 +1985,14 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := writeMeasuredJSON(w, http.StatusOK, response); err != nil {
 		for _, claim := range finalizedClaims {
-			h.rollbackClaimAfterWriteFailure(claim.task, claim.tokenID, "batch_response_write")
+			if claim.ack != "" {
+				h.failPendingGitHubClaim(claim.ack, "batch_response_write")
+			} else {
+				h.rollbackClaimAfterWriteFailure(claim.task, claim.tokenID, "batch_response_write")
+			}
 		}
 		return
 	}
-	responseWritten = true
 }
 
 func claimPollHintDelay(now, fireAt time.Time) time.Duration {
@@ -2131,6 +2137,91 @@ func (h *Handler) rollbackClaimAfterWriteFailure(task db.AgentTaskQueue, tokenID
 	if err := h.Queries.DeleteTaskTokenByID(ctx, tokenID); err != nil {
 		slog.Error("task claim: failed to revoke token after response write failure", "task_id", uuidToString(task.ID), "reason", reason, "error", err)
 	}
+}
+
+var githubClaimAckTimeout = 30 * time.Second
+
+type pendingGitHubClaim struct {
+	task        db.AgentTaskQueue
+	tokenID     pgtype.UUID
+	credentials []githubapp.Credential
+	timer       *time.Timer
+}
+
+type pendingGitHubClaimState struct {
+	sync.Mutex
+	claims map[string]*pendingGitHubClaim
+}
+
+func (h *Handler) beginPendingGitHubClaim(task db.AgentTaskQueue, tokenID pgtype.UUID, credentials []githubapp.Credential) string {
+	if len(credentials) == 0 {
+		return ""
+	}
+	ack := randomID()
+	pending := &pendingGitHubClaim{task: task, tokenID: tokenID, credentials: credentials}
+	state := h.pendingGitHubClaims
+	if state == nil {
+		return ""
+	}
+	state.Lock()
+	state.claims[ack] = pending
+	pending.timer = time.AfterFunc(githubClaimAckTimeout, func() { h.failPendingGitHubClaim(ack, "claim_ack_timeout") })
+	state.Unlock()
+	return ack
+}
+
+func (h *Handler) takePendingGitHubClaim(ack string) *pendingGitHubClaim {
+	state := h.pendingGitHubClaims
+	if state == nil {
+		return nil
+	}
+	state.Lock()
+	defer state.Unlock()
+	pending := state.claims[ack]
+	delete(state.claims, ack)
+	if pending != nil && pending.timer != nil {
+		pending.timer.Stop()
+	}
+	return pending
+}
+
+func (h *Handler) failPendingGitHubClaim(ack, reason string) {
+	pending := h.takePendingGitHubClaim(ack)
+	if pending == nil {
+		return
+	}
+	h.rollbackClaimAfterWriteFailure(pending.task, pending.tokenID, reason)
+	revokeGitHubClaimCredentials(githubAppBroker(), pending.credentials)
+}
+
+// AcknowledgeTaskClaim commits delivery only after the daemon decoded the
+// response. Missing acknowledgements expire and revoke credentials server-side.
+func (h *Handler) AcknowledgeTaskClaim(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	if _, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID); !ok {
+		return
+	}
+	var body struct {
+		Ack string `json:"ack"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Ack == "" {
+		writeError(w, http.StatusBadRequest, "ack is required")
+		return
+	}
+	state := h.pendingGitHubClaims
+	if state == nil {
+		writeError(w, http.StatusConflict, "claim acknowledgement expired")
+		return
+	}
+	state.Lock()
+	pending := state.claims[body.Ack]
+	valid := pending != nil && uuidToString(pending.task.ID) == chi.URLParam(r, "taskId") && uuidToString(pending.task.RuntimeID) == runtimeID
+	state.Unlock()
+	if !valid || h.takePendingGitHubClaim(body.Ack) == nil {
+		writeError(w, http.StatusConflict, "claim acknowledgement expired")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // claimBuildFailure captures a pre-response failure from
@@ -3677,10 +3768,10 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 
 	if len(resp.Repos) > 0 {
-		if !requestHasClientCapability(r, protocol.DaemonCapabilityGitHubAppCredentialsV1) {
+		if !requestHasClientCapability(r, protocol.DaemonCapabilityGitHubAppCredentialsV2) {
 			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
 				r.Context(), task,
-				"This run requires GitHub App credentials, but the claiming runtime does not support them. Update the Multica app and retry.",
+				"This run requires GitHub App credentials, but the claiming runtime cannot isolate them safely. Update Git to 2.31 or newer and retry.",
 				taskfailure.ReasonInvalidTaskIdentity,
 				"error_github_credentials_capability", http.StatusUnprocessableEntity, "runtime does not support GitHub App credentials",
 			)
@@ -3929,9 +4020,9 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, failure.status, failure.message)
 		return
 	}
-	githubCredentialsDelivered := false
+	githubCredentialsPending := false
 	defer func() {
-		if !githubCredentialsDelivered {
+		if !githubCredentialsPending {
 			revokeGitHubClaimCredentials(githubAppBroker(), resp.GitHubCredentials)
 		}
 	}()
@@ -4028,6 +4119,8 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	resp.RemoteMCPDaemonToken = remoteMCPToken
 	task.DeliveredCommentIds = receipt
 	resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
+	resp.GitHubCredentialAck = h.beginPendingGitHubClaim(*task, taskToken.ID, resp.GitHubCredentials)
+	githubCredentialsPending = resp.GitHubCredentialAck != ""
 
 	slog.Info("task claimed by runtime", "task_id", uuidToString(task.ID), "runtime_id", runtimeID, "agent_id", uuidToString(task.AgentID), "prior_session", resp.PriorSessionID)
 	if resp.Agent != nil && len(resp.Agent.Skills) > 0 {
@@ -4042,10 +4135,13 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	var writeErr error
 	payloadBytes, writeErr = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": resp})
 	if writeErr != nil {
-		h.rollbackClaimAfterWriteFailure(*task, taskToken.ID, "response_write")
+		if resp.GitHubCredentialAck != "" {
+			h.failPendingGitHubClaim(resp.GitHubCredentialAck, "response_write")
+		} else {
+			h.rollbackClaimAfterWriteFailure(*task, taskToken.ID, "response_write")
+		}
 		return
 	}
-	githubCredentialsDelivered = true
 }
 
 type resolveSkillBundlesRequest struct {
