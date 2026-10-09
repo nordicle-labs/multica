@@ -661,7 +661,8 @@ type Daemon struct {
 	// them to drain before tearing the daemon down. Without this the bg
 	// goroutine can race against t.TempDir cleanup, leaving a partially
 	// deleted bare clone and an unrelated `not empty` cleanup failure.
-	bgSyncs sync.WaitGroup
+	bgSyncs              sync.WaitGroup
+	gitCredentialHelpers map[string]string // task id -> credential-cache helper; guarded by mu
 
 	runner             taskRunner    // executes agent tasks; set to d.runTask by New(), overridable in tests
 	cancelPollInterval time.Duration // how often handleTask polls for server-side cancellation; overridable in tests
@@ -5743,6 +5744,31 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		return
 	}
 	provider := rt.Provider
+	credentialSession, credentialErr := startGitHubCredentialSession(task.GitHubCredentials)
+	if credentialErr != nil {
+		d.logger.Error("prepare GitHub App credentials", "task", task.ID, "error", credentialErr)
+		_ = d.reportTerminalTask(ctx, terminalTaskReport{
+			kind: terminalTaskReportFail, taskID: task.ID,
+			errorMessage:  "failed to prepare GitHub App credentials",
+			failureReason: taskfailure.ReasonInvalidTaskIdentity.String(),
+		})
+		return
+	}
+	if credentialSession != nil {
+		credentialSession.apply(&task)
+		d.mu.Lock()
+		if d.gitCredentialHelpers == nil {
+			d.gitCredentialHelpers = make(map[string]string)
+		}
+		d.gitCredentialHelpers[task.ID] = credentialSession.helper
+		d.mu.Unlock()
+		defer func() {
+			d.mu.Lock()
+			delete(d.gitCredentialHelpers, task.ID)
+			d.mu.Unlock()
+		}()
+		defer credentialSession.close(context.Background())
+	}
 
 	// Task-scoped logger. The task id goes in whole: it is the key every
 	// other surface prints (task JSON, env-root ownership manifest, server
@@ -7698,6 +7724,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// `multica repo checkout` would reject project-only URLs that aren't also
 	// bound at the workspace level.
 	d.registerTaskRepos(task.WorkspaceID, task.ID, task.Repos)
+	if task.GitCredentialHelper != "" {
+		repoCtx := repocache.WithGitCredentialHelper(prepareCtx, task.GitCredentialHelper)
+		d.syncWorkspaceReposContext(repoCtx, task.WorkspaceID, task.Repos)
+	}
 	defer d.clearTaskRepoRefs(task.WorkspaceID, task.ID)
 
 	entry, ok := d.agents()[provider]
