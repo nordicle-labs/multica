@@ -3826,7 +3826,7 @@ func (s *TaskService) FinalizeTaskClaim(
 				return fmt.Errorf("delete expired daemon tokens: %w", err)
 			}
 			if _, err := qtx.CreateDaemonToken(ctx, daemonTokens[0]); err != nil {
-				return fmt.Errorf("create remote MCP daemon token: %w", err)
+				return fmt.Errorf("create claim daemon token: %w", err)
 			}
 		}
 		if len(issueSnapshot) > 0 {

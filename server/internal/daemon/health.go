@@ -462,6 +462,13 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 			http.Error(w, "repo checkout task context does not match the active task", http.StatusForbidden)
 			return
 		}
+		repoCtx := r.Context()
+		d.mu.Lock()
+		helper := d.gitCredentialHelpers[activeTask.TaskID]
+		d.mu.Unlock()
+		if helper != "" {
+			repoCtx = repocache.WithGitCredentialHelper(repoCtx, helper)
+		}
 		authorizedWorkDir, authErr := authorizeRepoCheckoutWorkDir(activeTask.WorkDir, req.WorkDir)
 		if authErr != nil {
 			// The reason goes to both the agent and daemon.log: a refusal that
@@ -490,7 +497,7 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 			return
 		}
 
-		if err := d.ensureRepoReady(r.Context(), req.WorkspaceID, req.URL); err != nil {
+		if err := d.ensureRepoReady(repoCtx, req.WorkspaceID, req.URL); err != nil {
 			if r.Context().Err() != nil {
 				d.logger.Debug("repo checkout readiness cancelled", "url", req.URL, "error", err)
 				return
@@ -528,7 +535,7 @@ func (d *Daemon) repoCheckoutHandler() http.HandlerFunc {
 		if cache, ok := d.repoCache.(interface {
 			CreateWorktreeContext(context.Context, repocache.WorktreeParams) (*repocache.WorktreeResult, error)
 		}); ok {
-			result, err = cache.CreateWorktreeContext(r.Context(), params)
+			result, err = cache.CreateWorktreeContext(repoCtx, params)
 		} else {
 			result, err = d.repoCache.CreateWorktree(params)
 		}

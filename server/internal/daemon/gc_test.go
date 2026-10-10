@@ -2447,6 +2447,54 @@ func gitRefExists(t *testing.T, repoPath, ref string) bool {
 	return true
 }
 
+func TestReconcileRecoveryManifestWithoutClaimTokenCreatesLocalRecovery(t *testing.T) {
+	repo := createGCGitRepo(t)
+	base := runGitForGC(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "recovered.txt"), []byte("recovered\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitForGC(t, repo, "add", "recovered.txt")
+	runGitForGC(t, repo, "commit", "-m", "recover me")
+	head := runGitForGC(t, repo, "rev-parse", "HEAD")
+
+	requests := 0
+	d := newGCTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		http.Error(w, "claim token required", http.StatusUnauthorized)
+	}))
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	manifest := execenv.RecoveryManifest{
+		TaskID: "restart-task", RuntimeID: "runtime-1", GitRoot: repo,
+		CanonicalBranch: "main", BaseSHA: base, ExpectedRefSHA: base, HeadSHA: head,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, manifest)
+	if err == nil || !strings.Contains(err.Error(), "claim token") {
+		t.Fatalf("reconcile error = %v, want missing claim token", err)
+	}
+	if requests != 0 {
+		t.Fatalf("credential requests = %d, want zero without a claim token", requests)
+	}
+	if got := runGitForGC(t, repo, "rev-parse", "refs/multica/recovery/restart-task"); got != head {
+		t.Fatalf("recovery ref = %s, want %s", got, head)
+	}
+	bundle := filepath.Join(recoveryRoot, manifest.TaskID, "recovery.bundle")
+	runGitForGC(t, repo, "bundle", "verify", bundle)
+	if _, err := os.Stat(filepath.Join(recoveryRoot, manifest.TaskID, "manifest.json")); err != nil {
+		t.Fatalf("recovery manifest must remain for bounded retry: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(recoveryRoot, manifest.TaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("recovery state files = %d, want fixed manifest and bundle", len(entries))
+	}
+}
+
 // TestShouldCleanTaskDir_ChatHardDeletedFreshMtime locks acceptance #3:
 // when a user hard-deletes a chat session, the workdir must be reclaimed
 // on the next GC cycle (≤ GCInterval), not deferred to GCOrphanTTL. A

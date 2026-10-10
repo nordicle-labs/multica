@@ -162,6 +162,13 @@ type LocalWorktree struct {
 	// turn replayed and still be recorded as having delivered it, which is how
 	// the user's edits went missing from the turn after (MUL-6881 review).
 	BaseCommit string
+	// CanonicalRefExpected is the exact canonical branch tip immediately before
+	// provider launch. It guards an atomic reconciliation if the provider exits
+	// on another branch.
+	CanonicalRefExpected string
+	// OriginURL pins repository identity during reconciliation. Empty is valid
+	// for a repository without an origin.
+	OriginURL string
 	// DirtyBaseCaptured records that the user had uncommitted tracked edits
 	// which were replayed into the worktree.
 	DirtyBaseCaptured bool
@@ -271,6 +278,8 @@ type LocalWorktreeOutcome struct {
 	// no changes at all (a read-only run) — in that case the branch is deleted
 	// so it never shows up in the user's `git branch` as an empty artifact.
 	Branch string
+	// HeadSHA is the immutable commit delivered by Branch.
+	HeadSHA string
 	// AutoCommitted is true when the agent left uncommitted changes that
 	// Finalize committed so they would survive the worktree's removal.
 	AutoCommitted bool
@@ -390,6 +399,7 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		WorkDir:       filepath.Join(worktreePath, rel),
 		Branch:        actualBranch,
 		BaseCommit:    plan.base,
+		OriginURL:     gitConfigValue(gitRoot, "remote.origin.url"),
 		Continued:     plan.continues,
 		createdBranch: createdBranch,
 		userState:     userState,
@@ -480,6 +490,8 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 				"branch", wt.Branch, "error", err)
 		}
 	}
+
+	wt.CanonicalRefExpected = wt.BaseCommit
 
 	// Note on keeping sidecars out of the delivered branch: we deliberately do
 	// NOT write .git/info/exclude here. A linked worktree reads info/exclude
@@ -609,13 +621,30 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		outcome.AutoCommitted = committed
 	}
 
+	// Resolve and reconcile the actual HEAD before any delivery record is
+	// written. The provider may have created another branch, but the canonical
+	// branch selected by Prepare remains the only published name.
+	tip, err := runGitTrimmed(w.Path, "rev-parse", "--verify", "HEAD")
+	if err == nil {
+		outcome.HeadSHA = tip
+		if _, symbolicErr := runGitTrimmed(w.Path, "symbolic-ref", "--quiet", "HEAD"); symbolicErr != nil {
+			outcome.Branch = ""
+			outcome.PreservedPath = w.Path
+			return outcome, fmt.Errorf("refusing to reconcile canonical branch %s from detached HEAD; the task worktree is preserved at %s", w.Branch, w.Path)
+		}
+		if reconcileErr := w.reconcileCanonicalRef(tip); reconcileErr != nil {
+			outcome.Branch = ""
+			outcome.PreservedPath = w.Path
+			return outcome, fmt.Errorf("refusing to reconcile canonical branch %s: %w; the task worktree is preserved at %s", w.Branch, reconcileErr, w.Path)
+		}
+	}
+
 	// A branch still sitting exactly on its base commit means the task changed
 	// nothing — the read-only case. Delete it so the user's branch list only
 	// ever grows for tasks that actually produced work. Only ever the branch
 	// this task created: a continued branch sits on its base precisely because
 	// this turn added nothing to what earlier turns delivered, and deleting it
 	// would take their work with it.
-	tip, err := runGitTrimmed(w.Path, "rev-parse", "--verify", "HEAD")
 	producedWork := err != nil || tip != w.BaseCommit
 	dropped := !producedWork && w.createdBranch
 
@@ -702,6 +731,40 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		)
 	}
 	return outcome, nil
+}
+
+// reconcileCanonicalRef atomically returns work committed on another branch to
+// the name selected by Prepare. Any concurrent movement fails closed.
+func (w *LocalWorktree) reconcileCanonicalRef(head string) error {
+	if head == "" {
+		return errors.New("HEAD is unresolved")
+	}
+	if got := gitConfigValue(w.GitRoot, "remote.origin.url"); got != w.OriginURL {
+		return fmt.Errorf("repository origin changed from %q to %q", w.OriginURL, got)
+	}
+	if _, err := runGit(w.Path, "merge-base", "--is-ancestor", w.BaseCommit, head); err != nil {
+		return fmt.Errorf("HEAD %s no longer contains run base %s (does not descend from it)", head, w.BaseCommit)
+	}
+	ref := "refs/heads/" + w.Branch
+	current, err := runGitTrimmed(w.GitRoot, "rev-parse", "--verify", ref)
+	if err != nil {
+		return errors.New("canonical ref is missing")
+	}
+	if current == head {
+		return nil
+	}
+	if current != w.CanonicalRefExpected {
+		return fmt.Errorf("canonical ref moved from expected %s to %s", w.CanonicalRefExpected, current)
+	}
+	if out, err := runGit(w.GitRoot, "update-ref", ref, head, w.CanonicalRefExpected); err != nil {
+		return fmt.Errorf("compare-and-swap update-ref: %s: %w", strings.TrimSpace(out), err)
+	}
+	return nil
+}
+
+func gitConfigValue(dir, key string) string {
+	value, _ := runGitTrimmed(dir, "config", "--get", key)
+	return value
 }
 
 // Discard tears a worktree down without delivering anything: unregister it,
