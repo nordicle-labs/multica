@@ -3950,9 +3950,17 @@ func publicationRepository(repos []RepoData, requested string) (RepoData, error)
 // AcquireTaskGitHubCredentials mints publication-only credentials after the
 // daemon has finalized the task's canonical commit. Nothing is minted at claim.
 func (h *Handler) AcquireTaskGitHubCredentials(w http.ResponseWriter, r *http.Request) {
+	if middleware.DaemonAuthPathFromContext(r.Context()) != middleware.DaemonAuthPathDaemonToken || strings.TrimSpace(middleware.DaemonIDFromContext(r.Context())) == "" {
+		writeError(w, http.StatusForbidden, "daemon authentication is required")
+		return
+	}
 	runtimeID := chi.URLParam(r, "runtimeId")
 	runtime, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID)
 	if !ok {
+		return
+	}
+	if !runtime.DaemonID.Valid || strings.TrimSpace(runtime.DaemonID.String) != middleware.DaemonIDFromContext(r.Context()) {
+		writeError(w, http.StatusForbidden, "runtime is not assigned to this daemon")
 		return
 	}
 	taskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "taskId")
