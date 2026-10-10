@@ -103,7 +103,7 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 		if session == nil {
 			return fmt.Errorf("task %s recovery publication returned no credential", manifest.TaskID)
 		}
-		_, publishErr := session.publish(ctx, manifest.GitRoot, manifest.CanonicalBranch, manifest.HeadSHA)
+		_, _, publishErr := session.finalizePublication(ctx, manifest.GitRoot, manifest.CanonicalBranch, manifest.HeadSHA)
 		closeErr := session.close(context.Background())
 		if publishErr != nil {
 			return fmt.Errorf("publish recovered task %s: %w", manifest.TaskID, publishErr)

@@ -3,21 +3,32 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 var githubInstallationTokenURL = "https://api.github.com/installation/token"
+var githubAPIBaseURL = "https://api.github.com"
 var githubRepositoryRemote = func(repository string) string { return "https://github.com/" + repository + ".git" }
 
 type githubCredentialSession struct {
 	credentials []GitHubCredential
+}
+
+type githubPullRequest struct {
+	Number  int
+	URL     string
+	HeadSHA string
 }
 
 func startGitHubCredentialSession(credentials []GitHubCredential) (*githubCredentialSession, error) {
@@ -94,6 +105,119 @@ func (s *githubCredentialSession) publish(ctx context.Context, workDir, branch, 
 		return remoteSHA, fmt.Errorf("host publication remote SHA mismatch: got %s, want %s", remoteSHA, sha)
 	}
 	return fields[0], nil
+}
+
+func (s *githubCredentialSession) finalizePublication(ctx context.Context, workDir, branch, sha string) (string, githubPullRequest, error) {
+	remoteSHA, err := s.publish(ctx, workDir, branch, sha)
+	if err != nil {
+		return remoteSHA, githubPullRequest{}, err
+	}
+	pullRequest, err := s.ensurePullRequest(ctx, branch, sha)
+	return remoteSHA, pullRequest, err
+}
+
+func (s *githubCredentialSession) ensurePullRequest(ctx context.Context, branch, sha string) (githubPullRequest, error) {
+	if s == nil || len(s.credentials) != 1 {
+		return githubPullRequest{}, errors.New("host pull request requires exactly one repository credential")
+	}
+	credential := s.credentials[0]
+	parts := strings.Split(credential.Repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || branch == "" || sha == "" {
+		return githubPullRequest{}, errors.New("host pull request requires repository, canonical branch, and SHA")
+	}
+	repoPath := "/repos/" + url.PathEscape(parts[0]) + "/" + url.PathEscape(parts[1]) + "/pulls"
+	query := url.Values{"state": {"open"}, "head": {parts[0] + ":" + branch}, "base": {"main"}, "per_page": {"1"}}
+	var open []struct {
+		Number int `json:"number"`
+	}
+	if err := githubAPI(ctx, credential.Token, http.MethodGet, repoPath+"?"+query.Encode(), nil, &open); err != nil {
+		return githubPullRequest{}, err
+	}
+	number := 0
+	if len(open) > 0 {
+		number = open[0].Number
+	} else {
+		var created struct {
+			Number int `json:"number"`
+		}
+		body := map[string]string{
+			"head":  branch,
+			"base":  "main",
+			"title": boundedGitHubText("Deliver "+branch, 256),
+			"body":  boundedGitHubText("Automated host-side delivery of `"+branch+"` at `"+sha+"`.", 1024),
+		}
+		if err := githubAPI(ctx, credential.Token, http.MethodPost, repoPath, body, &created); err != nil {
+			return githubPullRequest{}, err
+		}
+		number = created.Number
+	}
+	if number <= 0 {
+		return githubPullRequest{}, errors.New("GitHub pull request response omitted number")
+	}
+	var verified struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+		Head    struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	}
+	if err := githubAPI(ctx, credential.Token, http.MethodGet, repoPath+"/"+strconv.Itoa(number), nil, &verified); err != nil {
+		return githubPullRequest{}, err
+	}
+	if verified.Head.Ref != branch || verified.Base.Ref != "main" || verified.Head.SHA != sha {
+		return githubPullRequest{}, fmt.Errorf("GitHub pull request mismatch: head=%s sha=%s base=%s, want head=%s sha=%s base=main", verified.Head.Ref, verified.Head.SHA, verified.Base.Ref, branch, sha)
+	}
+	return githubPullRequest{Number: verified.Number, URL: verified.HTMLURL, HeadSHA: verified.Head.SHA}, nil
+}
+
+func githubAPI(ctx context.Context, token, method, path string, input, output any) error {
+	var body io.Reader
+	if input != nil {
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(githubAPIBaseURL, "/")+path, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if input != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("GitHub pull request API failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		return errors.New("GitHub App installation lacks Pull requests permission")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GitHub pull request API returned status %d", resp.StatusCode)
+	}
+	if output == nil {
+		return nil
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(output); err != nil {
+		return fmt.Errorf("decode GitHub pull request response: %w", err)
+	}
+	return nil
+}
+
+func boundedGitHubText(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }
 
 func (s *githubCredentialSession) close(ctx context.Context) error {

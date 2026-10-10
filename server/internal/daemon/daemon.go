@@ -5900,6 +5900,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 				result.BranchName, result.CommitSHA, task.RuntimeID, acquireErr)
 		} else {
 			credentialSession, err = startGitHubCredentialSession(credentials)
+			if err == nil && credentialSession == nil {
+				err = errors.New("host-side GitHub publication returned no credential")
+			}
 		}
 	}
 	if credentialSession != nil {
@@ -5910,7 +5913,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		}()
 	}
 	if err == nil && credentialSession != nil {
-		remoteSHA, publishErr := credentialSession.publish(ctx, result.DurableWorkDir, result.BranchName, result.CommitSHA)
+		remoteSHA, pullRequest, publishErr := credentialSession.finalizePublication(ctx, result.DurableWorkDir, result.BranchName, result.CommitSHA)
 		revokeErr := credentialSession.close(context.Background())
 		credentialSession = nil
 		if publishErr != nil {
@@ -5920,7 +5923,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			err = fmt.Errorf("host-side GitHub publication failed (phase=revoke canonical_branch=%s head_sha=%s remote_sha=%s runtime_id=%s): %w",
 				result.BranchName, result.CommitSHA, remoteSHA, task.RuntimeID, revokeErr)
 		} else {
-			taskLog.Info("host-side GitHub publication verified", "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "remote_sha", remoteSHA)
+			taskLog.Info("host-side GitHub publication verified", "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "remote_sha", remoteSHA, "pull_request", pullRequest.Number, "pull_request_url", pullRequest.URL)
 		}
 	}
 	if err == nil {

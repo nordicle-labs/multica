@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -140,5 +141,139 @@ func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T)
 	remoteSHA, err := session.publish(context.Background(), work, "canonical", sha)
 	if err != nil || remoteSHA != sha {
 		t.Fatalf("publish = %q, %v; want %s", remoteSHA, err, sha)
+	}
+}
+
+func TestGitHubCredentialSessionCreatesAndVerifiesPullRequest(t *testing.T) {
+	const branch = "agent/engineering-developer/herm-959"
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	work := filepath.Join(t.TempDir(), "work")
+	for _, cmd := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
+		if out, err := exec.Command("git", cmd...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", cmd, out, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"-C", work, "add", "file.txt"}, {"-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "test"}} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, out, err)
+		}
+	}
+	shaBytes, err := exec.Command("git", "-C", work, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.TrimSpace(string(shaBytes))
+	oldRemote := githubRepositoryRemote
+	githubRepositoryRemote = func(string) string { return remote }
+	t.Cleanup(func() { githubRepositoryRemote = oldRemote })
+
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.RequestURI())
+		if got := r.Header.Get("Authorization"); got != "Bearer installation-secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["head"] != branch || body["base"] != "main" || body["title"] == "" || body["body"] == "" {
+				t.Fatalf("create body = %#v", body)
+			}
+			_, _ = w.Write([]byte(`{"number":42}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/42":
+			_, _ = w.Write([]byte(`{"number":42,"html_url":"https://github.com/owner/repo/pull/42","head":{"ref":"` + branch + `","sha":"` + sha + `"},"base":{"ref":"main"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	oldAPI := githubAPIBaseURL
+	githubAPIBaseURL = server.URL
+	t.Cleanup(func() { githubAPIBaseURL = oldAPI })
+
+	session, err := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "installation-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteSHA, pr, err := session.finalizePublication(context.Background(), work, branch, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remoteSHA != sha || pr.Number != 42 || pr.HeadSHA != sha {
+		t.Fatalf("remote SHA = %q, pull request = %+v", remoteSHA, pr)
+	}
+	if len(requests) != 3 {
+		t.Fatalf("requests = %v", requests)
+	}
+}
+
+func TestGitHubCredentialSessionReusesOpenPullRequest(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/repos/owner/repo/pulls" {
+			_, _ = w.Write([]byte(`[{"number":7}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"number":7,"head":{"ref":"canonical","sha":"` + sha + `"},"base":{"ref":"main"}}`))
+	}))
+	t.Cleanup(server.Close)
+	oldAPI := githubAPIBaseURL
+	githubAPIBaseURL = server.URL
+	t.Cleanup(func() { githubAPIBaseURL = oldAPI })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "installation-secret"}})
+	pr, err := session.ensurePullRequest(context.Background(), "canonical", sha)
+	if err != nil || pr.Number != 7 {
+		t.Fatalf("pull request = %+v, %v", pr, err)
+	}
+	if strings.Join(methods, ",") != "GET,GET" {
+		t.Fatalf("methods = %v, want no POST", methods)
+	}
+}
+
+func TestGitHubCredentialSessionRejectsWrongPullRequestSHA(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/repos/owner/repo/pulls" {
+			_, _ = w.Write([]byte(`[{"number":7}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"number":7,"head":{"ref":"canonical","sha":"wrong"},"base":{"ref":"main"}}`))
+	}))
+	t.Cleanup(server.Close)
+	oldAPI := githubAPIBaseURL
+	githubAPIBaseURL = server.URL
+	t.Cleanup(func() { githubAPIBaseURL = oldAPI })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "installation-secret"}})
+	if _, err := session.ensurePullRequest(context.Background(), "canonical", strings.Repeat("a", 40)); err == nil || !strings.Contains(err.Error(), "pull request mismatch") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestGitHubCredentialSessionReportsMissingPullRequestPermission(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(server.Close)
+	oldAPI := githubAPIBaseURL
+	githubAPIBaseURL = server.URL
+	t.Cleanup(func() { githubAPIBaseURL = oldAPI })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "installation-secret"}})
+	if _, err := session.ensurePullRequest(context.Background(), "canonical", strings.Repeat("a", 40)); err == nil || !strings.Contains(err.Error(), "lacks Pull requests permission") {
+		t.Fatalf("error = %v", err)
 	}
 }
