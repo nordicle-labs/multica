@@ -8,8 +8,13 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/githubapp"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -453,6 +458,7 @@ func TestClaimTaskByRuntime_DefersGitHubCredentialMintUntilAfterFinalize(t *test
 	}
 	ctx := context.Background()
 	runtimeID := createClaimReclaimRuntime(t, ctx, "Deferred GitHub runtime")
+	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id = 'deferred-github' WHERE id = $1`, runtimeID)
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Deferred GitHub agent")
 	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
 	minted, _ := setupGitHubClaimRevocation(t, issueID)
@@ -488,6 +494,7 @@ func TestAcquireTaskGitHubCredentialsMintsOnlyRequestedProjectRepository(t *test
 	}
 	ctx := context.Background()
 	runtimeID := createClaimReclaimRuntime(t, ctx, "Exact GitHub repository runtime")
+	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id = 'exact-github' WHERE id = $1`, runtimeID)
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Exact GitHub repository agent")
 	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
 	minted, _ := setupGitHubClaimRevocation(t, issueID)
@@ -519,6 +526,71 @@ func TestAcquireTaskGitHubCredentialsMintsOnlyRequestedProjectRepository(t *test
 	testHandler.AcquireTaskGitHubCredentials(denied, unauthorized)
 	if denied.Code != http.StatusForbidden || minted.Load() != 1 {
 		t.Fatalf("unauthorized status=%d minted=%d, want 403 and no additional mint", denied.Code, minted.Load())
+	}
+}
+
+func TestAcquireTaskGitHubCredentialsRequiresExactDaemonAuthentication(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	const exactDaemonID = "github-credential-daemon"
+	runtimeID := dbfx.Runtime(t, "GitHub credential auth runtime", testutil.Cols{"daemon_id": exactDaemonID})
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "GitHub credential auth agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
+	minted, _ := setupGitHubClaimRevocation(t, issueID)
+
+	router := chi.NewRouter()
+	router.Use(middleware.DaemonAuth(testHandler.Queries, nil, nil, nil))
+	router.Post("/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/github-credentials", testHandler.AcquireTaskGitHubCredentials)
+	path := "/api/daemon/runtimes/" + runtimeID + "/tasks/" + taskID + "/github-credentials"
+
+	daemonToken := func(daemonID string) string {
+		t.Helper()
+		raw := "mdt_" + daemonID
+		dbfx.Exec(t, `INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, expires_at) VALUES ($1, $2, $3, now() + interval '1 day')`, auth.HashToken(raw), testWorkspaceID, daemonID)
+		return raw
+	}
+	pat := "mul_github_credential_member"
+	dbfx.Insert(t, "personal_access_token", testutil.Cols{
+		"user_id": testUserID, "name": "GitHub credential member", "token_hash": auth.HashToken(pat),
+		"token_prefix": pat[:8], "expires_at": nil,
+	})
+	memberJWT, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": testUserID,
+		"exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString(auth.JWTSecret())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{name: "sibling daemon", token: daemonToken("github-credential-sibling"), want: http.StatusForbidden},
+		{name: "member PAT", token: pat, want: http.StatusForbidden},
+		{name: "member JWT", token: memberJWT, want: http.StatusForbidden},
+		{name: "exact daemon", token: daemonToken(exactDaemonID), want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d, want %d: %s", w.Code, tc.want, w.Body.String())
+			}
+			wantMinted := int32(0)
+			if tc.want == http.StatusOK {
+				wantMinted = 1
+			}
+			if minted.Load() != wantMinted {
+				t.Fatalf("minted=%d, want %d", minted.Load(), wantMinted)
+			}
+		})
 	}
 }
 
