@@ -1,9 +1,10 @@
 # HERM-957 database canary
 
-- Executed at: `2026-10-10T13:05:07Z`
+- Executed at: `2026-10-10T14:58:28Z`
 - Runtime: `7976d4c7-c5a6-490e-9823-b48cddc7aaa2`
-- Host daemon: `f874a5b97762884ac6416a2fff4e92e79f18f5f1`
-- Base SHA: `621617421d39c38cdfa58689372df5e4733f286a`
+- Host daemon: `v0.6.1-22-g134ce4b19`
+- Base SHA: `daa0350bd06ea2af6a0bed806c90b08d66295461`
+- Worker: `/workspace`, branch `agent/engineering-developer/herm-957`, clean at base SHA.
 
 ## Results
 
