@@ -102,6 +102,51 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 	}
 }
 
+func TestAcquireGitHubCredentialsUsesClaimDaemonToken(t *testing.T) {
+	const claimToken = "mdt_claim_secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+claimToken {
+			t.Fatalf("Authorization = %q, want claim daemon token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credentials":[]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(server.URL)
+	client.SetToken("mul_global_must_not_be_used")
+	_, err := client.AcquireGitHubCredentials(context.Background(), Task{
+		ID: "task-1", RuntimeID: "runtime-1", RemoteMCPDaemonToken: claimToken,
+	}, "owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcquireGitHubCredentialsNeverFallsBackToGlobalToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("Authorization = %q, want no global-token fallback", got)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(server.URL)
+	client.SetToken("mul_global_must_not_be_used")
+	if _, err := client.AcquireGitHubCredentials(context.Background(), Task{ID: "recovery-task", RuntimeID: "runtime-1"}, "owner/repo"); err == nil {
+		t.Fatal("AcquireGitHubCredentials succeeded without a claim daemon token")
+	}
+}
+
+func TestClaimDaemonTokenStaysOutOfAgentPrompt(t *testing.T) {
+	const claimToken = "mdt_claim_secret"
+	prompt := buildPromptBody(Task{IssueID: "issue-1", RemoteMCPDaemonToken: claimToken}, "codex")
+	if strings.Contains(prompt, claimToken) {
+		t.Fatal("claim daemon token leaked into agent prompt")
+	}
+}
+
 func TestGitHubCredentialSessionRevokesTokenWhenCredentialIsInvalid(t *testing.T) {
 	var methods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

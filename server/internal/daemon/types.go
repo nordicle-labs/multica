@@ -79,8 +79,8 @@ type Task struct {
 	WorkspaceSlug        string                 `json:"workspace_slug,omitempty"`
 	IssueIdentifier      string                 `json:"issue_identifier,omitempty"`
 	RemoteMCPConnections []remotemcp.Connection `json:"remote_mcp_connections,omitempty"`
-	// RemoteMCPDaemonToken stays inside the daemon and authenticates the local
-	// broker's credential-resolution calls. It must never enter agent env/config.
+	// RemoteMCPDaemonToken stays inside the daemon and authenticates host-side
+	// task operations. It must never enter agent env/config.
 	RemoteMCPDaemonToken string `json:"remote_mcp_daemon_token,omitempty"`
 	// PluginHookTools are this workspace's agent-trigger plugin hooks, which
 	// the local MCP server presents to the agent as tools. Resolved by the

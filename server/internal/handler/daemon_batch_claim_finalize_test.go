@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -469,7 +470,8 @@ func TestClaimTaskByRuntime_DefersGitHubCredentialMintUntilAfterFinalize(t *test
 	testHandler.ClaimTaskByRuntime(w, req)
 	var response struct {
 		Task struct {
-			GitHubCredentials []githubapp.Credential `json:"github_credentials"`
+			GitHubCredentials    []githubapp.Credential `json:"github_credentials"`
+			RemoteMCPDaemonToken string                 `json:"remote_mcp_daemon_token"`
 		} `json:"task"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
@@ -478,11 +480,17 @@ func TestClaimTaskByRuntime_DefersGitHubCredentialMintUntilAfterFinalize(t *test
 	if minted.Load() != 0 || len(response.Task.GitHubCredentials) != 0 {
 		t.Fatalf("claim minted=%d credentials=%d, want zero", minted.Load(), len(response.Task.GitHubCredentials))
 	}
+	if !strings.HasPrefix(response.Task.RemoteMCPDaemonToken, "mdt_") {
+		t.Fatalf("claim daemon token = %q, want host-side token without Remote MCP", response.Task.RemoteMCPDaemonToken)
+	}
 	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
-	acquireReq := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", nil, testWorkspaceID, "deferred-github")
-	acquireReq = withURLParams(acquireReq, "runtimeId", runtimeID, "taskId", taskID)
+	router := chi.NewRouter()
+	router.Use(middleware.DaemonAuth(testHandler.Queries, nil, nil, nil))
+	router.Post("/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/github-credentials", testHandler.AcquireTaskGitHubCredentials)
+	acquireReq := httptest.NewRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", nil)
+	acquireReq.Header.Set("Authorization", "Bearer "+response.Task.RemoteMCPDaemonToken)
 	acquire := httptest.NewRecorder()
-	testHandler.AcquireTaskGitHubCredentials(acquire, acquireReq)
+	router.ServeHTTP(acquire, acquireReq)
 	if acquire.Code != http.StatusOK || minted.Load() != 1 {
 		t.Fatalf("acquire status=%d minted=%d body=%s", acquire.Code, minted.Load(), acquire.Body.String())
 	}

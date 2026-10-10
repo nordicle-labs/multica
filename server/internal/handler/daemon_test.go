@@ -121,6 +121,20 @@ func TestRemoteMCPDaemonTokenForClaim(t *testing.T) {
 	}
 }
 
+func TestRemoteMCPDaemonTokenForClaimWithoutRemoteMCP(t *testing.T) {
+	runtime := db.AgentRuntime{
+		WorkspaceID: parseUUID(testWorkspaceID),
+		DaemonID:    strToText("daemon-github-finalizer"),
+	}
+	raw, params, err := remoteMCPDaemonTokenForClaim(AgentTaskResponse{}, runtime)
+	if err != nil {
+		t.Fatalf("remoteMCPDaemonTokenForClaim: %v", err)
+	}
+	if !strings.HasPrefix(raw, "mdt_") || len(params) != 1 || params[0].TokenHash != auth.HashToken(raw) {
+		t.Fatalf("claim daemon token = %q, params = %+v", raw, params)
+	}
+}
+
 func TestListDaemonWorkspaces_UserScopedAndConditional(t *testing.T) {
 	w := testutil.Call(t, testHandler.ListDaemonWorkspaces, newRequest(http.MethodGet, "/api/daemon/workspaces", nil)).Want(http.StatusOK)
 

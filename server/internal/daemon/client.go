@@ -292,7 +292,7 @@ func (c *Client) AcquireGitHubCredentials(ctx context.Context, task Task, reposi
 	}
 	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-credentials",
 		url.PathEscape(task.RuntimeID), url.PathEscape(task.ID))
-	if err := c.postJSON(ctx, path, map[string]string{"repository": repository}, &response); err != nil {
+	if err := c.postJSONWithToken(ctx, path, task.RemoteMCPDaemonToken, map[string]string{"repository": repository}, &response); err != nil {
 		return nil, fmt.Errorf("acquire GitHub App publication credentials: %w", err)
 	}
 	return response.Credentials, nil

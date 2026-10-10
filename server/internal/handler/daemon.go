@@ -2348,19 +2348,16 @@ func (h *Handler) rejectClaimOnWorkspaceMismatch(ctx context.Context, task *db.A
 }
 
 // remoteMCPDaemonTokenForClaim prepares the short-lived credential the daemon
-// uses to resolve write-only Remote MCP secrets for this task. The raw token is
-// returned only in the claim response; its hash is committed atomically with
-// the task-scoped agent token by FinalizeTaskClaim.
-func remoteMCPDaemonTokenForClaim(resp AgentTaskResponse, runtime db.AgentRuntime) (string, []db.CreateDaemonTokenParams, error) {
-	if len(resp.RemoteMCPConnections) == 0 {
-		return "", nil, nil
-	}
+// uses for host-side task operations, including Remote MCP and deferred GitHub
+// publication. The raw token is returned only in the claim response; its hash
+// is committed atomically with the task-scoped agent token by FinalizeTaskClaim.
+func remoteMCPDaemonTokenForClaim(_ AgentTaskResponse, runtime db.AgentRuntime) (string, []db.CreateDaemonTokenParams, error) {
 	if !runtime.DaemonID.Valid || strings.TrimSpace(runtime.DaemonID.String) == "" {
-		return "", nil, errors.New("runtime daemon_id is required for Remote MCP")
+		return "", nil, nil
 	}
 	raw, err := auth.GenerateDaemonToken()
 	if err != nil {
-		return "", nil, fmt.Errorf("generate Remote MCP daemon token: %w", err)
+		return "", nil, fmt.Errorf("generate claim daemon token: %w", err)
 	}
 	return raw, []db.CreateDaemonTokenParams{{
 		TokenHash:   auth.HashToken(raw),
