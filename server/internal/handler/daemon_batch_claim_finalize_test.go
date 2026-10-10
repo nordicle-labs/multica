@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -534,6 +536,59 @@ func TestAcquireTaskGitHubCredentialsMintsOnlyRequestedProjectRepository(t *test
 	testHandler.AcquireTaskGitHubCredentials(denied, unauthorized)
 	if denied.Code != http.StatusForbidden || minted.Load() != 1 {
 		t.Fatalf("unauthorized status=%d minted=%d, want 403 and no additional mint", denied.Code, minted.Load())
+	}
+}
+
+func TestAcquireTaskGitHubCredentialsRevokesMintWhenResponseWriteFails(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "GitHub credential write failure runtime")
+	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id = 'github-write-failure' WHERE id = $1`, runtimeID)
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "GitHub credential write failure agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
+	minted, revoked := setupGitHubClaimRevocation(t, issueID)
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", nil, testWorkspaceID, "github-write-failure")
+	req = withURLParams(req, "runtimeId", runtimeID, "taskId", taskID)
+
+	testHandler.AcquireTaskGitHubCredentials(&claimWriteFailure{}, req)
+	if minted.Load() != 1 {
+		t.Fatalf("minted=%d, want 1", minted.Load())
+	}
+	select {
+	case authorization := <-revoked:
+		if authorization != "token github-test-token" {
+			t.Fatalf("revocation authorization=%q", authorization)
+		}
+	default:
+		t.Fatal("minted credential was not revoked")
+	}
+}
+
+func TestRevokeGitHubClaimCredentialsAttemptsAllAndLogsNoTokens(t *testing.T) {
+	var deleted atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deleted.Add(1)
+		if r.Header.Get("Authorization") == "token secret-first" {
+			http.Error(w, "no", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	credentials := []githubapp.Credential{{Token: "secret-first"}, {Token: "secret-second"}}
+	revokeErr := revokeGitHubClaimCredentials(githubapp.Broker{APIBase: srv.URL}, credentials)
+	if revokeErr == nil || deleted.Load() != 2 {
+		t.Fatalf("revoke error=%v deletes=%d, want error and 2", revokeErr, deleted.Load())
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	logGitHubCredentialDeliveryFailure(logger, "runtime", parseUUID("00000000-0000-0000-0000-000000000001"), revokeErr)
+	if got := logs.String(); strings.Contains(got, "secret-first") || strings.Contains(got, "secret-second") {
+		t.Fatalf("credential leaked in log: %s", got)
 	}
 }
 

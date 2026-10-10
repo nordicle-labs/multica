@@ -3991,7 +3991,10 @@ func (h *Handler) AcquireTaskGitHubCredentials(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusForbidden, "GitHub App authorization failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"credentials": credentials})
+	if err := writeJSONAndFlush(w, http.StatusOK, map[string]any{"credentials": credentials}); err != nil {
+		revokeErr := revokeGitHubClaimCredentials(githubAppBroker(), credentials)
+		logGitHubCredentialDeliveryFailure(slog.Default(), runtimeID, taskID, revokeErr)
+	}
 }
 
 func githubInstallationForRepository(installations []db.GithubInstallation, repository string) (db.GithubInstallation, error) {
@@ -4015,10 +4018,22 @@ func githubInstallationForRepository(installations []db.GithubInstallation, repo
 	return *matched, nil
 }
 
-func revokeGitHubClaimCredentials(broker githubapp.Broker, credentials []githubapp.Credential) {
+func revokeGitHubClaimCredentials(broker githubapp.Broker, credentials []githubapp.Credential) error {
+	var errs []error
 	for _, credential := range credentials {
-		_ = broker.Revoke(context.Background(), credential.Token)
+		if err := broker.Revoke(context.Background(), credential.Token); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
+}
+
+func logGitHubCredentialDeliveryFailure(logger *slog.Logger, runtimeID string, taskID pgtype.UUID, revokeErr error) {
+	logger.Error("github credential response delivery failed",
+		"runtime_id", runtimeID,
+		"task_id", uuidToString(taskID),
+		"revocation_failed", revokeErr != nil,
+	)
 }
 
 func githubAppBroker() githubapp.Broker {

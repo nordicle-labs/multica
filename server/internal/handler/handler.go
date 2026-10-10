@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -560,6 +561,25 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
+}
+
+func writeJSONAndFlush(w http.ResponseWriter, status int, v any) error {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	n, err := w.Write(body)
+	if err != nil {
+		return err
+	}
+	if n != len(body) {
+		return io.ErrShortWrite
+	}
+	return http.NewResponseController(w).Flush()
 }
 
 // writeMeasuredJSON behaves like writeJSON but returns the encoded body size so
