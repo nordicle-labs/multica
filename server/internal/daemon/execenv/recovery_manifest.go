@@ -38,6 +38,10 @@ func recoveryTaskDir(root, taskID string) (string, error) {
 
 // WriteRecoveryManifest atomically creates or updates a task journal.
 func WriteRecoveryManifest(root string, manifest RecoveryManifest) error {
+	return writeRecoveryManifest(root, manifest, func(file *os.File) error { return file.Sync() })
+}
+
+func writeRecoveryManifest(root string, manifest RecoveryManifest, syncFile func(*os.File) error) error {
 	dir, err := recoveryTaskDir(root, manifest.TaskID)
 	if err != nil {
 		return err
@@ -64,6 +68,9 @@ func WriteRecoveryManifest(root string, manifest RecoveryManifest) error {
 	if err := tmp.Chmod(0o600); err == nil {
 		_, err = tmp.Write(append(data, '\n'))
 	}
+	if err == nil {
+		err = syncFile(tmp)
+	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
@@ -72,6 +79,17 @@ func WriteRecoveryManifest(root string, manifest RecoveryManifest) error {
 	}
 	if err := os.Rename(name, filepath.Join(dir, recoveryManifestName)); err != nil {
 		return fmt.Errorf("publish recovery manifest: %w", err)
+	}
+	dirHandle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open recovery manifest directory: %w", err)
+	}
+	if err = syncFile(dirHandle); err != nil {
+		_ = dirHandle.Close()
+		return fmt.Errorf("sync recovery manifest directory: %w", err)
+	}
+	if err := dirHandle.Close(); err != nil {
+		return fmt.Errorf("close recovery manifest directory: %w", err)
 	}
 	return nil
 }

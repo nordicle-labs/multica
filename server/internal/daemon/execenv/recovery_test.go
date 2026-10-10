@@ -2,6 +2,7 @@ package execenv
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,5 +68,43 @@ func TestResumeRecoveryManifestsBeforeGC(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "restart-task", recoveryManifestName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("manifest still present after resume: %v", err)
+	}
+}
+
+func TestWriteRecoveryManifestSyncsFileAndDirectory(t *testing.T) {
+	repo := newTestRepo(t)
+	sha := gitRun(t, repo, "rev-parse", "HEAD")
+	manifest := RecoveryManifest{TaskID: "durable-task", GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha}
+	syncs := 0
+	if err := writeRecoveryManifest(t.TempDir(), manifest, func(*os.File) error {
+		syncs++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 2 {
+		t.Fatalf("sync calls = %d, want temporary file and containing directory", syncs)
+	}
+}
+
+func TestWriteRecoveryManifestFailsClosedOnSyncError(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(fmt.Sprintf("sync_%d", failAt), func(t *testing.T) {
+			repo := newTestRepo(t)
+			sha := gitRun(t, repo, "rev-parse", "HEAD")
+			manifest := RecoveryManifest{TaskID: "sync-failure", GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha}
+			want := errors.New("sync failed")
+			calls := 0
+			err := writeRecoveryManifest(t.TempDir(), manifest, func(*os.File) error {
+				calls++
+				if calls == failAt {
+					return want
+				}
+				return nil
+			})
+			if !errors.Is(err, want) {
+				t.Fatalf("writeRecoveryManifest error = %v, want sync failure", err)
+			}
+		})
 	}
 }

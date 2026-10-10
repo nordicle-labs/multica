@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/githubapp"
 )
 
 var githubInstallationTokenURL = "https://api.github.com/installation/token"
@@ -29,6 +31,27 @@ type githubPullRequest struct {
 	Number  int
 	URL     string
 	HeadSHA string
+}
+
+type githubAPIError struct {
+	status int
+	body   string
+}
+
+func (e *githubAPIError) Error() string {
+	return fmt.Sprintf("GitHub pull request API returned status %d", e.status)
+}
+
+func githubRepositoryForWorkDir(workDir string) (string, error) {
+	out, err := exec.Command("git", "-C", workDir, "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve repository origin: %w", err)
+	}
+	repository, err := githubapp.ParseRepository(strings.TrimSpace(string(out)))
+	if err != nil {
+		return "", fmt.Errorf("resolve repository origin: %w", err)
+	}
+	return repository, nil
 }
 
 func startGitHubCredentialSession(credentials []GitHubCredential) (*githubCredentialSession, error) {
@@ -74,6 +97,13 @@ func (s *githubCredentialSession) publish(ctx context.Context, workDir, branch, 
 		return "", errors.New("host publication requires workdir, canonical branch, and SHA")
 	}
 	credential := s.credentials[0]
+	repository, err := githubRepositoryForWorkDir(workDir)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(repository, credential.Repository) {
+		return "", fmt.Errorf("GitHub App credential repository mismatch: origin is %s, credential is for %s", repository, credential.Repository)
+	}
 	taskDir, err := os.MkdirTemp("", "multica-git-publish-")
 	if err != nil {
 		return "", fmt.Errorf("prepare host publication: %w", err)
@@ -127,16 +157,23 @@ func (s *githubCredentialSession) ensurePullRequest(ctx context.Context, branch,
 	}
 	repoPath := "/repos/" + url.PathEscape(parts[0]) + "/" + url.PathEscape(parts[1]) + "/pulls"
 	query := url.Values{"state": {"open"}, "head": {parts[0] + ":" + branch}, "base": {"main"}, "per_page": {"1"}}
-	var open []struct {
-		Number int `json:"number"`
+	findOpen := func() (int, error) {
+		var open []struct {
+			Number int `json:"number"`
+		}
+		if err := githubAPI(ctx, credential.Token, http.MethodGet, repoPath+"?"+query.Encode(), nil, &open); err != nil {
+			return 0, err
+		}
+		if len(open) == 0 {
+			return 0, nil
+		}
+		return open[0].Number, nil
 	}
-	if err := githubAPI(ctx, credential.Token, http.MethodGet, repoPath+"?"+query.Encode(), nil, &open); err != nil {
+	number, err := findOpen()
+	if err != nil {
 		return githubPullRequest{}, err
 	}
-	number := 0
-	if len(open) > 0 {
-		number = open[0].Number
-	} else {
+	if number == 0 {
 		var created struct {
 			Number int `json:"number"`
 		}
@@ -147,9 +184,20 @@ func (s *githubCredentialSession) ensurePullRequest(ctx context.Context, branch,
 			"body":  boundedGitHubText("Automated host-side delivery of `"+branch+"` at `"+sha+"`.", 1024),
 		}
 		if err := githubAPI(ctx, credential.Token, http.MethodPost, repoPath, body, &created); err != nil {
-			return githubPullRequest{}, err
+			var apiErr *githubAPIError
+			if !errors.As(err, &apiErr) || apiErr.status != http.StatusUnprocessableEntity || !strings.Contains(strings.ToLower(apiErr.body), "pull request already exists") {
+				return githubPullRequest{}, err
+			}
+			number, err = findOpen()
+			if err != nil {
+				return githubPullRequest{}, err
+			}
+			if number == 0 {
+				return githubPullRequest{}, errors.New("concurrent GitHub pull request was not found after creation conflict")
+			}
+		} else {
+			number = created.Number
 		}
-		number = created.Number
 	}
 	if number <= 0 {
 		return githubPullRequest{}, errors.New("GitHub pull request response omitted number")
@@ -202,7 +250,8 @@ func githubAPI(ctx context.Context, token, method, path string, input, output an
 		return errors.New("GitHub App installation lacks Pull requests permission")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("GitHub pull request API returned status %d", resp.StatusCode)
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return &githubAPIError{status: resp.StatusCode, body: string(data)}
 	}
 	if output == nil {
 		return nil

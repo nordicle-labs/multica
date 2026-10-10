@@ -626,12 +626,17 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 	// branch selected by Prepare remains the only published name.
 	tip, err := runGitTrimmed(w.Path, "rev-parse", "--verify", "HEAD")
 	if err == nil {
+		outcome.HeadSHA = tip
+		if _, symbolicErr := runGitTrimmed(w.Path, "symbolic-ref", "--quiet", "HEAD"); symbolicErr != nil {
+			outcome.Branch = ""
+			outcome.PreservedPath = w.Path
+			return outcome, fmt.Errorf("refusing to reconcile canonical branch %s from detached HEAD; the task worktree is preserved at %s", w.Branch, w.Path)
+		}
 		if reconcileErr := w.reconcileCanonicalRef(tip); reconcileErr != nil {
 			outcome.Branch = ""
 			outcome.PreservedPath = w.Path
 			return outcome, fmt.Errorf("refusing to reconcile canonical branch %s: %w; the task worktree is preserved at %s", w.Branch, reconcileErr, w.Path)
 		}
-		outcome.HeadSHA = tip
 	}
 
 	// A branch still sitting exactly on its base commit means the task changed

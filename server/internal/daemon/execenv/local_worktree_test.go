@@ -1639,6 +1639,32 @@ func TestFinalizeRefusesReconciliationWhenCanonicalRefDiverged(t *testing.T) {
 	if outcome.PreservedPath != wt.Path {
 		t.Fatalf("PreservedPath = %q, want %q", outcome.PreservedPath, wt.Path)
 	}
+	if outcome.HeadSHA == "" {
+		t.Fatal("Finalize did not preserve HEAD before failed canonical ref reconciliation")
+	}
+	_ = removeLocalWorktreeDir(repo, wt.Path, worktreeTestLogger())
+}
+
+func TestFinalizeRefusesDetachedHEADBeforeReconciliation(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	wt := prepareTurn(t, repo, "MUL-6881", turnOneTask)
+	gitRun(t, wt.Path, "checkout", "--detach")
+	writeFile(t, filepath.Join(wt.WorkDir, "agent.txt"), "turn one\n")
+	gitRun(t, wt.Path, "add", "-A")
+	gitRun(t, wt.Path, "commit", "-m", "turn one")
+	head := gitRun(t, wt.Path, "rev-parse", "HEAD")
+
+	outcome, err := wt.Finalize(worktreeTestLogger())
+	if err == nil || !strings.Contains(err.Error(), "detached HEAD") {
+		t.Fatalf("Finalize error = %v, want detached HEAD rejection", err)
+	}
+	if outcome.HeadSHA != head || outcome.PreservedPath != wt.Path {
+		t.Fatalf("outcome = %+v, want head %s preserved at %s", outcome, head, wt.Path)
+	}
+	if got := gitRun(t, repo, "rev-parse", wt.Branch); got == head {
+		t.Fatal("detached HEAD was reconciled onto the canonical branch")
+	}
 	_ = removeLocalWorktreeDir(repo, wt.Path, worktreeTestLogger())
 }
 

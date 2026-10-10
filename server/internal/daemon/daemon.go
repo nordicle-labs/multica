@@ -5894,7 +5894,11 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 
 	var credentialSession *githubCredentialSession
 	if err == nil && len(task.Repos) > 0 && result.BranchName != "" && result.CommitSHA != "" {
-		credentials, acquireErr := d.client.AcquireGitHubCredentials(ctx, task)
+		repository, acquireErr := githubRepositoryForWorkDir(result.DurableWorkDir)
+		var credentials []GitHubCredential
+		if acquireErr == nil {
+			credentials, acquireErr = d.client.AcquireGitHubCredentials(ctx, task, repository)
+		}
 		if acquireErr != nil {
 			err = fmt.Errorf("host-side GitHub publication failed (phase=acquire canonical_branch=%s head_sha=%s runtime_id=%s): %w",
 				result.BranchName, result.CommitSHA, task.RuntimeID, acquireErr)

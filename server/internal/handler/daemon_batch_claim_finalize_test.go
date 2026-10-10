@@ -482,6 +482,46 @@ func TestClaimTaskByRuntime_DefersGitHubCredentialMintUntilAfterFinalize(t *test
 	}
 }
 
+func TestAcquireTaskGitHubCredentialsMintsOnlyRequestedProjectRepository(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Exact GitHub repository runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Exact GitHub repository agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	minted, _ := setupGitHubClaimRevocation(t, issueID)
+	var projectID string
+	dbfx.QueryRow(t, `SELECT project_id FROM issue WHERE id = $1`, issueID).Scan(&projectID)
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID,
+		"resource_type": "github_repo", "resource_ref": `{"url":"https://github.com/test-owner/other-repo"}`,
+		"position": 1,
+	})
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
+
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", map[string]string{"repository": "git@github.com:test-owner/test-repo.git"}, testWorkspaceID, "exact-github")
+	req = withURLParams(req, "runtimeId", runtimeID, "taskId", taskID)
+	w := httptest.NewRecorder()
+	testHandler.AcquireTaskGitHubCredentials(w, req)
+	var response struct {
+		Credentials []githubapp.Credential `json:"credentials"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK || minted.Load() != 1 || len(response.Credentials) != 1 || response.Credentials[0].Repository != "test-owner/test-repo" {
+		t.Fatalf("status=%d minted=%d credentials=%+v body=%s", w.Code, minted.Load(), response.Credentials, w.Body.String())
+	}
+	unauthorized := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", map[string]string{"repository": "evil-owner/unlisted"}, testWorkspaceID, "exact-github")
+	unauthorized = withURLParams(unauthorized, "runtimeId", runtimeID, "taskId", taskID)
+	denied := httptest.NewRecorder()
+	testHandler.AcquireTaskGitHubCredentials(denied, unauthorized)
+	if denied.Code != http.StatusForbidden || minted.Load() != 1 {
+		t.Fatalf("unauthorized status=%d minted=%d, want 403 and no additional mint", denied.Code, minted.Load())
+	}
+}
+
 func TestClaimTaskByRuntime_LegacyGitCapabilityFailsBeforeMint(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
