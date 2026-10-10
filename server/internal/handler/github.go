@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
@@ -677,31 +677,12 @@ func fetchInstallationAccount(ctx context.Context, installationID int64) (login,
 // `now` is injected for deterministic tests; production callers pass
 // time.Now().
 func signGitHubAppJWT(now time.Time) (string, error) {
-	appID := strings.TrimSpace(os.Getenv("GITHUB_APP_ID"))
-	pemKey := strings.TrimSpace(os.Getenv("GITHUB_APP_PRIVATE_KEY"))
-	if appID == "" || pemKey == "" {
+	broker := githubAppBroker()
+	if broker.AppID == "" || broker.PrivateKey == "" {
 		return "", nil
 	}
-	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(pemKey))
-	if err != nil {
-		return "", fmt.Errorf("parse GITHUB_APP_PRIVATE_KEY: %w", err)
-	}
-	// GitHub allows JWTs valid for up to 10 minutes. We back-date `iat`
-	// by 60 seconds to absorb modest clock skew between us and GitHub
-	// (otherwise an "iat in the future" verdict from GitHub fails the
-	// request) and cap `exp` at 9 minutes ahead to stay inside the cap
-	// even with the same skew applied.
-	claims := jwt.MapClaims{
-		"iat": now.Add(-60 * time.Second).Unix(),
-		"exp": now.Add(9 * time.Minute).Unix(),
-		"iss": appID,
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	signed, err := token.SignedString(key)
-	if err != nil {
-		return "", fmt.Errorf("sign App JWT: %w", err)
-	}
-	return signed, nil
+	broker.Now = func() time.Time { return now }
+	return broker.SignJWT()
 }
 
 // ── Listing / disconnect ────────────────────────────────────────────────────
