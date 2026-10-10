@@ -92,7 +92,11 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 			return err
 		}
 	} else {
-		credentials, err := d.client.AcquireGitHubCredentials(ctx, Task{ID: manifest.TaskID, RuntimeID: manifest.RuntimeID})
+		repository, err := githubRepositoryForWorkDir(manifest.GitRoot)
+		if err != nil {
+			return fmt.Errorf("resolve recovery repository for task %s: %w", manifest.TaskID, err)
+		}
+		credentials, err := d.client.AcquireGitHubCredentials(ctx, Task{ID: manifest.TaskID, RuntimeID: manifest.RuntimeID}, repository)
 		if err != nil {
 			return fmt.Errorf("acquire recovery publication credential for task %s: %w", manifest.TaskID, err)
 		}

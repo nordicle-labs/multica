@@ -58,6 +58,10 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/github-credentials"):
 			record("acquire")
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["repository"] != "owner/repo" {
+				t.Fatalf("credential request = %#v, %v", body, err)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"credentials":[]}`))
 			return
@@ -74,12 +78,19 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
 
 	d := &Daemon{client: NewClient(srv.URL), logger: slog.New(slog.NewTextHandler(io.Discard, nil)), workspaces: make(map[string]*workspaceState), runtimeIndex: map[string]Runtime{"runtime-1": {ID: "runtime-1", Provider: "claude"}}, activeEnvRoots: make(map[string]int), cancelPollInterval: time.Hour, cfg: Config{WorkspacesRoot: t.TempDir()}}
+	work := t.TempDir()
+	if out, err := exec.Command("git", "init", work).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %s: %v", out, err)
+	}
+	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %s: %v", out, err)
+	}
 	d.runner = taskRunnerFunc(func(_ context.Context, task Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
 		record("run")
 		if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
 			t.Fatal("runner received GitHub credentials")
 		}
-		return TaskResult{BranchName: "canonical", CommitSHA: strings.Repeat("a", 40), DurableWorkDir: t.TempDir()}, nil
+		return TaskResult{BranchName: "canonical", CommitSHA: strings.Repeat("a", 40), DurableWorkDir: work}, nil
 	})
 	d.handleTask(context.Background(), Task{ID: "task-1", RuntimeID: "runtime-1", Agent: &AgentData{Name: "test-agent"}, Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}}, 0)
 
@@ -117,6 +128,9 @@ func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T)
 			t.Fatalf("git %v: %s: %v", cmd, out, err)
 		}
 	}
+	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %s: %v", out, err)
+	}
 	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("content\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +158,23 @@ func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T)
 	}
 }
 
+func TestGitHubCredentialSessionRejectsCredentialForDifferentOrigin(t *testing.T) {
+	work := filepath.Join(t.TempDir(), "work")
+	if out, err := exec.Command("git", "init", work).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %s: %v", out, err)
+	}
+	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "git@github.com:owner/source.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %s: %v", out, err)
+	}
+	session, err := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/other", Token: "secret-never-logged"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.publish(context.Background(), work, "canonical", strings.Repeat("a", 40)); err == nil || !strings.Contains(err.Error(), "repository mismatch") {
+		t.Fatalf("publish error = %v, want repository mismatch", err)
+	}
+}
+
 func TestGitHubCredentialSessionCreatesAndVerifiesPullRequest(t *testing.T) {
 	const branch = "agent/engineering-developer/herm-959"
 	remote := filepath.Join(t.TempDir(), "remote.git")
@@ -152,6 +183,9 @@ func TestGitHubCredentialSessionCreatesAndVerifiesPullRequest(t *testing.T) {
 		if out, err := exec.Command("git", cmd...).CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %s: %v", cmd, out, err)
 		}
+	}
+	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %s: %v", out, err)
 	}
 	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("content\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -275,5 +309,65 @@ func TestGitHubCredentialSessionReportsMissingPullRequestPermission(t *testing.T
 	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "installation-secret"}})
 	if _, err := session.ensurePullRequest(context.Background(), "canonical", strings.Repeat("a", 40)); err == nil || !strings.Contains(err.Error(), "lacks Pull requests permission") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestGitHubCredentialSessionRecoversConcurrentPullRequestCreation(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	listCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			listCalls++
+			if listCalls == 1 {
+				_, _ = w.Write([]byte(`[]`))
+			} else {
+				_, _ = w.Write([]byte(`[{"number":9}]`))
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"message":"A pull request already exists for owner:canonical."}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/9":
+			_, _ = w.Write([]byte(`{"number":9,"head":{"ref":"canonical","sha":"` + sha + `"},"base":{"ref":"main"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	oldAPI := githubAPIBaseURL
+	githubAPIBaseURL = server.URL
+	t.Cleanup(func() { githubAPIBaseURL = oldAPI })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "installation-secret"}})
+	pr, err := session.ensurePullRequest(context.Background(), "canonical", sha)
+	if err != nil || pr.Number != 9 || listCalls != 2 {
+		t.Fatalf("pull request = %+v, list calls = %d, error = %v", pr, listCalls, err)
+	}
+}
+
+func TestGitHubCredentialSessionRejectsUnrelatedValidationError(t *testing.T) {
+	listCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			listCalls++
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"message":"base branch is invalid"}]}`))
+	}))
+	t.Cleanup(server.Close)
+	oldAPI := githubAPIBaseURL
+	githubAPIBaseURL = server.URL
+	t.Cleanup(func() { githubAPIBaseURL = oldAPI })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "installation-secret"}})
+	if _, err := session.ensurePullRequest(context.Background(), "canonical", strings.Repeat("a", 40)); err == nil || !strings.Contains(err.Error(), "status 422") {
+		t.Fatalf("error = %v, want fail-closed 422", err)
+	}
+	if listCalls != 1 {
+		t.Fatalf("list calls = %d, want no conflict retry", listCalls)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -3922,6 +3923,30 @@ func (h *Handler) taskPublicationProject(ctx context.Context, task db.AgentTaskQ
 	return h.resolveClaimProjectContext(ctx, projectID, workspaceID)
 }
 
+func publicationRepository(repos []RepoData, requested string) (RepoData, error) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		if len(repos) != 1 {
+			return RepoData{}, errors.New("repository is required for multi-repository task project")
+		}
+		return repos[0], nil
+	}
+	if !strings.Contains(requested, "://") && !strings.HasPrefix(requested, "git@") {
+		requested = "https://github.com/" + requested
+	}
+	repository, err := githubapp.ParseRepository(requested)
+	if err != nil {
+		return RepoData{}, err
+	}
+	for _, repo := range repos {
+		candidate, parseErr := githubapp.ParseRepository(repo.URL)
+		if parseErr == nil && strings.EqualFold(candidate, repository) {
+			return repo, nil
+		}
+	}
+	return RepoData{}, errors.New("requested repository does not belong to task project")
+}
+
 // AcquireTaskGitHubCredentials mints publication-only credentials after the
 // daemon has finalized the task's canonical commit. Nothing is minted at claim.
 func (h *Handler) AcquireTaskGitHubCredentials(w http.ResponseWriter, r *http.Request) {
@@ -3944,7 +3969,19 @@ func (h *Handler) AcquireTaskGitHubCredentials(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, "failed to resolve task repositories")
 		return
 	}
-	credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, uuidToString(runtime.WorkspaceID), project.Repos)
+	var request struct {
+		Repository string `json:"repository"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "repository is required")
+		return
+	}
+	repository, err := publicationRepository(project.Repos, request.Repository)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "repository is not authorized for this task")
+		return
+	}
+	credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, uuidToString(runtime.WorkspaceID), []RepoData{repository})
 	if err != nil {
 		writeError(w, http.StatusForbidden, "GitHub App authorization failed")
 		return
