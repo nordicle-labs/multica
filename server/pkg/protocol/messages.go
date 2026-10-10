@@ -61,6 +61,16 @@ const (
 	// along the inputs of wakeup rules that waited for this run; for any other
 	// daemon those rules keep their inputs and start a run of their own.
 	DaemonCapabilityJoinedWakeupsV1 = "joined-wakeups-v1"
+	// DaemonCapabilityGitHubAppCredentialsV1 advertises task-scoped GitHub App
+	// credentials stored only in an in-memory Git credential helper.
+	DaemonCapabilityGitHubAppCredentialsV1 = "github-app-credentials-v1"
+	// DaemonCapabilityGitHubAppCredentialsV2 adds two fail-closed guarantees:
+	// Git is new enough to isolate credential helpers via GIT_CONFIG_COUNT, and
+	// the daemon acknowledges receipt before a minted credential is committed.
+	DaemonCapabilityGitHubAppCredentialsV2 = "github-app-credentials-v2"
+	// DaemonCapabilityGitHubAppCredentialsV3 mints repository credentials only
+	// after the provider has exited and the host finalized its canonical ref.
+	DaemonCapabilityGitHubAppCredentialsV3 = "github-app-credentials-v3"
 	// DaemonCapabilityTaskSupplementV1 advertises that this provider run can accept
 	// an additional text instruction without cancelling or starting a task.
 	// It is persisted when this exact task enters running; absence always means

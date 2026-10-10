@@ -102,10 +102,13 @@ type Task struct {
 	Agent                         *AgentData             `json:"agent,omitempty"`
 	ConnectedApps                 []ConnectedAppData     `json:"connected_apps,omitempty"` // per-run app capabilities mounted through runtime MCP overlays
 	Repos                         []RepoData             `json:"repos,omitempty"`
-	ProjectID                     string                 `json:"project_id,omitempty"`                       // active project for this task, when present
-	ProjectTitle                  string                 `json:"project_title,omitempty"`                    // human-readable project title for context injection
-	ProjectDescription            string                 `json:"project_description,omitempty"`              // durable project-level context injected into the brief
-	ProjectResources              []ProjectResourceData  `json:"project_resources,omitempty"`                // project-scoped resources to expose to the agent
+	ProjectID                     string                 `json:"project_id,omitempty"`          // active project for this task, when present
+	ProjectTitle                  string                 `json:"project_title,omitempty"`       // human-readable project title for context injection
+	ProjectDescription            string                 `json:"project_description,omitempty"` // durable project-level context injected into the brief
+	ProjectResources              []ProjectResourceData  `json:"project_resources,omitempty"`   // project-scoped resources to expose to the agent
+	GitHubCredentials             []GitHubCredential     `json:"github_credentials,omitempty"`
+	GitHubCredentialAck           string                 `json:"github_credential_ack,omitempty"`
+	GitCredentialHelper           string                 `json:"-"`
 	IsLeaderTask                  bool                   `json:"is_leader_task,omitempty"`                   // true when executing in the squad-leader coordinator role
 	LeaderRoleResolved            bool                   `json:"leader_role_resolved,omitempty"`             // server capability: IsLeaderTask/SquadID authoritatively answer "is this a leader run". Absent on servers predating it — those before #4951 never sent is_leader_task at all, later ones send it without this guarantee — so taskIsSquadLeader falls back to the briefing marker for both (MUL-5811)
 	PriorSessionID                string                 `json:"prior_session_id,omitempty"`                 // Claude session ID from a previous task on this issue
@@ -178,6 +181,11 @@ type Task struct {
 	// Empty or non-task-scoped values are fatal for writable agent tasks; the
 	// daemon must not fall back to its own token. See MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
+}
+
+type GitHubCredential struct {
+	Repository string `json:"repository"`
+	Token      string `json:"token"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon
@@ -293,6 +301,7 @@ type TaskResult struct {
 	Status     string `json:"status"`
 	Comment    string `json:"comment"`
 	BranchName string `json:"branch_name,omitempty"`
+	CommitSHA  string `json:"-"`
 	EnvType    string `json:"env_type,omitempty"`
 	SessionID  string `json:"session_id,omitempty"` // Claude session ID for future resumption
 	WorkDir    string `json:"work_dir,omitempty"`   // working directory used during execution
