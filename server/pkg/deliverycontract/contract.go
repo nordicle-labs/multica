@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-const CurrentVersion = "delivery-v2"
+const (
+	ProfileVersionV1 = "delivery-v1"
+	CurrentVersion   = ProfileVersionV1
+)
 
 var requiredToolsets = []string{"code_execution", "file", "terminal"}
 var requiredServices = []string{"postgres", "pgvector"}
@@ -23,11 +26,19 @@ type CapabilityProfile struct {
 }
 
 func CurrentProfile() CapabilityProfile {
+	profile, _ := NegotiateProfile(CurrentVersion)
+	return profile
+}
+
+func NegotiateProfile(version string) (CapabilityProfile, error) {
+	if version != ProfileVersionV1 {
+		return CapabilityProfile{}, fmt.Errorf("unsupported capability profile version %q", version)
+	}
 	return CapabilityProfile{
-		Version:          CurrentVersion,
+		Version:          version,
 		RequiredToolsets: append([]string(nil), requiredToolsets...),
 		RequiredServices: append([]string(nil), requiredServices...),
-	}
+	}, nil
 }
 
 func (p CapabilityProfile) Hash() (string, error) {
@@ -35,7 +46,16 @@ func (p CapabilityProfile) Hash() (string, error) {
 	slices.Sort(toolsets)
 	services := append([]string(nil), p.RequiredServices...)
 	slices.Sort(services)
-	data, err := json.Marshal(CapabilityProfile{Version: p.Version, RequiredToolsets: toolsets, RequiredServices: services})
+	var value any = CapabilityProfile{Version: p.Version, RequiredToolsets: toolsets, RequiredServices: services}
+	if p.Version == ProfileVersionV1 {
+		// Keep the certified v1 wire hash stable. RequiredServices is an additive
+		// field: legacy servers ignore it; updated servers still validate it.
+		value = struct {
+			Version          string   `json:"version"`
+			RequiredToolsets []string `json:"required_toolsets"`
+		}{Version: p.Version, RequiredToolsets: toolsets}
+	}
+	data, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}

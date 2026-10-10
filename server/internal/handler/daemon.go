@@ -4433,7 +4433,11 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.DeliveryPreflight != nil {
-		if err := req.DeliveryPreflight.Validate(deliverycontract.CurrentProfile()); err != nil {
+		profile, err := deliverycontract.NegotiateProfile(req.DeliveryPreflight.ProfileVersion)
+		if err == nil {
+			err = req.DeliveryPreflight.Validate(profile)
+		}
+		if err != nil {
 			writeError(w, http.StatusUnprocessableEntity, "delivery preflight failed: "+err.Error())
 			return
 		}

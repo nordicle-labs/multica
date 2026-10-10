@@ -25,6 +25,39 @@ func validPreflight(t *testing.T) Preflight {
 	}
 }
 
+func TestNegotiateProfileAcceptsServerV1(t *testing.T) {
+	profile, err := NegotiateProfile(ProfileVersionV1)
+	if err != nil {
+		t.Fatalf("negotiate v1: %v", err)
+	}
+	if profile.Version != ProfileVersionV1 {
+		t.Fatalf("profile version = %q", profile.Version)
+	}
+	if CurrentProfile().Version != ProfileVersionV1 {
+		t.Fatalf("emitted profile version = %q", CurrentProfile().Version)
+	}
+
+	// Services are an additive v1 extension: the legacy server hash remains
+	// stable while updated servers can still require the probes.
+	hash, err := profile.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const legacyHash = "d0b6878dcce8b3123baa43ea864882cbea4d80d27a6e9da29674172390b3be61"
+	if hash != legacyHash {
+		t.Fatalf("v1 profile hash = %q, want legacy hash %q", hash, legacyHash)
+	}
+	if len(profile.RequiredServices) == 0 {
+		t.Fatal("v1 compatibility removed service preflight requirements")
+	}
+}
+
+func TestNegotiateProfileRejectsUnknownVersion(t *testing.T) {
+	if _, err := NegotiateProfile("delivery-v999"); err == nil || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("unknown profile error = %v", err)
+	}
+}
+
 func TestPreflightValidatesVersionedCapabilitiesAndRepository(t *testing.T) {
 	profile := CurrentProfile()
 	report := validPreflight(t)
