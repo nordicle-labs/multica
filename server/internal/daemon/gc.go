@@ -26,6 +26,12 @@ const reposDirName = ".repos"
 // gcLoop periodically scans local workspace directories and applies the
 // configured retention policies.
 func (d *Daemon) gcLoop(ctx context.Context) {
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	if resumed, err := d.reconcileRecoveryManifests(ctx, recoveryRoot); err != nil {
+		d.logger.Warn("gc: recovery manifest resume incomplete", "resumed", resumed, "error", err)
+	} else if resumed > 0 {
+		d.logger.Info("gc: recovery manifests resumed before startup collection", "resumed", resumed)
+	}
 	if !d.cfg.GCEnabled {
 		d.logger.Info("gc: disabled")
 		return
@@ -59,6 +65,54 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 			d.runGC(ctx)
 		}
 	}
+}
+
+func (d *Daemon) reconcileRecoveryManifests(ctx context.Context, recoveryRoot string) (int, error) {
+	manifests, reconcileErr := execenv.LoadRecoveryManifests(recoveryRoot)
+	resumed := 0
+	for _, manifest := range manifests {
+		if manifest.HeadSHA == "" {
+			continue
+		}
+		if err := d.reconcileRecoveryManifest(ctx, recoveryRoot, manifest); err != nil {
+			reconcileErr = errors.Join(reconcileErr, err)
+			continue
+		}
+		resumed++
+	}
+	return resumed, reconcileErr
+}
+
+func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot string, manifest execenv.RecoveryManifest) error {
+	if err := execenv.VerifyRecoveryManifest(manifest); err != nil {
+		return err
+	}
+	if manifest.RuntimeID == "" {
+		if _, err := execenv.CreateRecoveryArtifact(manifest.GitRoot, recoveryRoot, manifest.TaskID, manifest.HeadSHA, d.logger); err != nil {
+			return err
+		}
+	} else {
+		credentials, err := d.client.AcquireGitHubCredentials(ctx, Task{ID: manifest.TaskID, RuntimeID: manifest.RuntimeID})
+		if err != nil {
+			return fmt.Errorf("acquire recovery publication credential for task %s: %w", manifest.TaskID, err)
+		}
+		session, err := startGitHubCredentialSession(credentials)
+		if err != nil {
+			return err
+		}
+		if session == nil {
+			return fmt.Errorf("task %s recovery publication returned no credential", manifest.TaskID)
+		}
+		_, _, publishErr := session.finalizePublication(ctx, manifest.GitRoot, manifest.CanonicalBranch, manifest.HeadSHA)
+		closeErr := session.close(context.Background())
+		if publishErr != nil {
+			return fmt.Errorf("publish recovered task %s: %w", manifest.TaskID, publishErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("revoke recovered task %s credential: %w", manifest.TaskID, closeErr)
+		}
+	}
+	return execenv.RemoveRecoveryManifest(recoveryRoot, manifest.TaskID)
 }
 
 // gcStats accumulates byte counts and per-pattern hit counts for one GC cycle.
