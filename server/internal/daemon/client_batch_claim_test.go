@@ -12,6 +12,54 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
+func TestGitCredentialIsolationSupportByOSAndVersion(t *testing.T) {
+	for _, tc := range []struct {
+		goos    string
+		version string
+		want    bool
+	}{
+		{"linux", "git version 2.15.0", false},
+		{"linux", "git version 2.31.0", true},
+		{"darwin", "git version 2.30.9", false},
+		{"darwin", "git version 2.55.1", true},
+		{"windows", "git version 2.30.9", false},
+		{"windows", "git version 2.31.0", false},
+		{"windows", "git version 2.55.1", false},
+		{"linux", "not git", false},
+	} {
+		if got := gitSupportsCredentialIsolationFor(tc.goos, tc.version); got != tc.want {
+			t.Errorf("gitSupportsCredentialIsolationFor(%q, %q) = %v, want %v", tc.goos, tc.version, got, tc.want)
+		}
+	}
+}
+
+func TestClient_ClaimTasksDefersGitHubCredentialAcknowledgement(t *testing.T) {
+	var acked bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/daemon/tasks/claim":
+			_, _ = w.Write([]byte(`{"tasks":[{"id":"task-1","runtime_id":"runtime-1","github_credentials":[{"repository":"owner/repo","token":"secret"}],"github_credential_ack":"ack-1"}]}`))
+		case "/api/daemon/runtimes/runtime-1/tasks/task-1/claim-ack":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			acked = body["ack"] == "ack-1"
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	result, err := client.claimTasksWithHints(context.Background(), "daemon-1", []string{"runtime-1"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acked || len(result.Tasks) != 1 || result.Tasks[0].GitHubCredentialAck != "ack-1" {
+		t.Fatalf("credentials acknowledged before local setup: acked=%v result=%+v", acked, result)
+	}
+}
+
 // TestClient_ClaimTasks_PostsRuntimeSetAndParsesTasks verifies the machine-level
 // batch claim (MUL-4257): the client POSTs to /api/daemon/tasks/claim with the full
 // runtime_id set + max_tasks, and parses the {"tasks":[...]} envelope, keeping

@@ -9,12 +9,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/deliverycontract"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
@@ -202,7 +205,7 @@ func daemonHTTPClientCapabilities() string {
 }
 
 func daemonCommonCapabilities() []string {
-	return []string{
+	capabilities := []string{
 		protocol.DaemonCapabilitySkillBundlesV1,
 		protocol.DaemonCapabilityCoalescedCommentsV1,
 		protocol.DaemonCapabilityExecutionManifestV1,
@@ -214,7 +217,38 @@ func daemonCommonCapabilities() []string {
 		protocol.DaemonCapabilityPlatformSkillV1,
 		protocol.DaemonCapabilityCheckoutKeepsWorkV1,
 		protocol.DaemonCapabilityJoinedWakeupsV1,
+		protocol.DaemonCapabilityGitHubAppCredentialsV1,
 	}
+	if gitSupportsCredentialIsolation() {
+		capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	}
+	capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	return capabilities
+}
+
+var gitCredentialIsolationSupport = sync.OnceValue(func() bool {
+	out, err := exec.Command("git", "version").Output()
+	return err == nil && gitSupportsCredentialIsolationFor(runtime.GOOS, string(out))
+})
+
+func gitSupportsCredentialIsolation() bool { return gitCredentialIsolationSupport() }
+
+func gitSupportsCredentialIsolationFor(goos, version string) bool {
+	return goos != "windows" && gitVersionAtLeast(version, 2, 31)
+}
+
+func gitVersionAtLeast(version string, wantMajor, wantMinor int) bool {
+	fields := strings.Fields(version)
+	if len(fields) < 3 {
+		return false
+	}
+	parts := strings.Split(fields[2], ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	return majorErr == nil && minorErr == nil && (major > wantMajor || major == wantMajor && minor >= wantMinor)
 }
 
 // SetToken sets the auth token for authenticated requests.
@@ -235,6 +269,33 @@ func (c *Client) ClaimTask(ctx context.Context, runtimeID string) (*Task, error)
 		return nil, err
 	}
 	return resp.Task, nil
+}
+
+func (c *Client) ackGitHubCredentials(ctx context.Context, task *Task) error {
+	if task == nil || task.GitHubCredentialAck == "" {
+		return nil
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/claim-ack", url.PathEscape(task.RuntimeID), url.PathEscape(task.ID))
+	if err := c.postJSON(ctx, path, map[string]string{"ack": task.GitHubCredentialAck}, nil); err != nil {
+		task.GitHubCredentials = nil
+		return fmt.Errorf("acknowledge GitHub App credentials: %w", err)
+	}
+	task.GitHubCredentialAck = ""
+	return nil
+}
+
+// AcquireGitHubCredentials asks the server to mint the short-lived publication
+// token after provider execution and host-side worktree finalization.
+func (c *Client) AcquireGitHubCredentials(ctx context.Context, task Task, repository string) ([]GitHubCredential, error) {
+	var response struct {
+		Credentials []GitHubCredential `json:"credentials"`
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-credentials",
+		url.PathEscape(task.RuntimeID), url.PathEscape(task.ID))
+	if err := c.postJSONWithToken(ctx, path, task.RemoteMCPDaemonToken, map[string]string{"repository": repository}, &response); err != nil {
+		return nil, fmt.Errorf("acquire GitHub App publication credentials: %w", err)
+	}
+	return response.Credentials, nil
 }
 
 func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, taskID, contributionID string) (http.Header, error) {
@@ -478,6 +539,10 @@ const (
 var errStartClaimRejected = errors.New("task start claim rejected")
 
 func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...string) (bool, error) {
+	return c.StartTaskWithDeliveryPreflight(ctx, task, nil, capabilities...)
+}
+
+func (c *Client) StartTaskWithDeliveryPreflight(ctx context.Context, task Task, preflight *deliverycontract.Preflight, capabilities ...string) (bool, error) {
 	var negotiated bool
 	var decodeResponse responseDecoder = func(r io.Reader) error {
 		data, err := io.ReadAll(io.LimitReader(r, maxStartTaskResponseBytes+1))
@@ -503,7 +568,11 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 	path := fmt.Sprintf("/api/daemon/tasks/%s/start", task.ID)
 	if !task.StartClaimSupported {
 		// Old servers have no safe replay contract. Preserve one attempt.
-		err := c.postJSON(ctx, path, map[string]any{"capabilities": capabilities}, decodeResponse)
+		body := map[string]any{"capabilities": capabilities}
+		if preflight != nil {
+			body["delivery_preflight"] = preflight
+		}
+		err := c.postJSON(ctx, path, body, decodeResponse)
 		return err == nil && negotiated, err
 	}
 	if task.RuntimeID == "" || task.DispatchedAt == "" {
@@ -511,11 +580,15 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 	}
 	ctx, cancel := context.WithTimeout(ctx, startTaskTimeout)
 	defer cancel()
-	err := c.postJSONWithRetry(ctx, path, map[string]any{
+	body := map[string]any{
 		"runtime_id":    task.RuntimeID,
 		"capabilities":  capabilities,
 		"dispatched_at": task.DispatchedAt,
-	}, decodeResponse, startTaskRetrySchedule)
+	}
+	if preflight != nil {
+		body["delivery_preflight"] = preflight
+	}
+	err := c.postJSONWithRetry(ctx, path, body, decodeResponse, startTaskRetrySchedule)
 	var reqErr *requestError
 	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict {
 		return false, fmt.Errorf("%w: %w", errStartClaimRejected, err)
