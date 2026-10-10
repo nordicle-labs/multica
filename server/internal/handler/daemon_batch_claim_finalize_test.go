@@ -3,10 +3,72 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/githubapp"
+	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+type claimWriteFailure struct {
+	header http.Header
+}
+
+func (w *claimWriteFailure) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (*claimWriteFailure) WriteHeader(int)           {}
+func (*claimWriteFailure) Write([]byte) (int, error) { return 0, errors.New("connection closed") }
+
+func assertClaimWriteFailureRolledBack(t *testing.T, taskID string) {
+	t.Helper()
+	var status string
+	var tokenCount int
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status)
+	dbfx.QueryRow(t, `SELECT count(*) FROM task_token WHERE task_id = $1`, taskID).Scan(&tokenCount)
+	if status != "queued" || tokenCount != 0 {
+		t.Fatalf("failed response left status=%q tokens=%d, want queued/0", status, tokenCount)
+	}
+}
+
+func TestClaimTaskByRuntime_WriteFailureRollsBackFinalization(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Claim write failure runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Claim write failure agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "claim-write-failure")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(&claimWriteFailure{}, req)
+	assertClaimWriteFailureRolledBack(t, taskID)
+}
+
+func TestClaimTasksByRuntime_WriteFailureRollsBackFinalization(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Batch write failure runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Batch write failure agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	testHandler.ClaimTasksByRuntime(&claimWriteFailure{}, batchClaimRequest(testWorkspaceID, []string{runtimeID}, 1, ""))
+	assertClaimWriteFailureRolledBack(t, taskID)
+}
 
 type batchClaimReceiptResponse struct {
 	Tasks []struct {
@@ -345,5 +407,208 @@ func TestClaimTasksByRuntime_RepairsStaleCommentPlan(t *testing.T) {
 	}
 	if rebuilt < 1 {
 		t.Fatalf("expected the surviving comment rebuilt into a new trigger task, found %d", rebuilt)
+	}
+}
+
+func setupGitHubClaimRevocation(t *testing.T, issueID string) (*atomic.Int32, <-chan string) {
+	t.Helper()
+	projectID := dbfx.Project(t, "GitHub claim rollback project")
+	dbfx.Exec(t, `UPDATE issue SET project_id = $1 WHERE id = $2`, projectID, issueID)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `UPDATE issue SET project_id = NULL WHERE id = $1`, issueID)
+	})
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID,
+		"resource_type": "github_repo", "resource_ref": `{"url":"https://github.com/test-owner/test-repo"}`,
+		"position": 0,
+	})
+	dbfx.Insert(t, "github_installation", testutil.Cols{
+		"workspace_id": testWorkspaceID, "installation_id": 943001,
+		"account_login": "test-owner", "account_type": "Organization",
+	})
+
+	pemBytes, _ := generateTestRSAKeyPEM(t)
+	t.Setenv("GITHUB_APP_ID", "943")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
+	minted := &atomic.Int32{}
+	revoked := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/943001/access_tokens":
+			minted.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"github-test-token","repositories":[{"full_name":"test-owner/test-repo"}]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token":
+			revoked <- r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	oldBase := githubAPIBase
+	githubAPIBase = srv.URL
+	t.Cleanup(func() { githubAPIBase = oldBase })
+	return minted, revoked
+}
+
+func TestClaimTaskByRuntime_DefersGitHubCredentialMintUntilAfterFinalize(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Deferred GitHub runtime")
+	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id = 'deferred-github' WHERE id = $1`, runtimeID)
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Deferred GitHub agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	minted, _ := setupGitHubClaimRevocation(t, issueID)
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "deferred-github")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	w := httptest.NewRecorder()
+	testHandler.ClaimTaskByRuntime(w, req)
+	var response struct {
+		Task struct {
+			GitHubCredentials []githubapp.Credential `json:"github_credentials"`
+		} `json:"task"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if minted.Load() != 0 || len(response.Task.GitHubCredentials) != 0 {
+		t.Fatalf("claim minted=%d credentials=%d, want zero", minted.Load(), len(response.Task.GitHubCredentials))
+	}
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
+	acquireReq := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", nil, testWorkspaceID, "deferred-github")
+	acquireReq = withURLParams(acquireReq, "runtimeId", runtimeID, "taskId", taskID)
+	acquire := httptest.NewRecorder()
+	testHandler.AcquireTaskGitHubCredentials(acquire, acquireReq)
+	if acquire.Code != http.StatusOK || minted.Load() != 1 {
+		t.Fatalf("acquire status=%d minted=%d body=%s", acquire.Code, minted.Load(), acquire.Body.String())
+	}
+}
+
+func TestAcquireTaskGitHubCredentialsMintsOnlyRequestedProjectRepository(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Exact GitHub repository runtime")
+	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id = 'exact-github' WHERE id = $1`, runtimeID)
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Exact GitHub repository agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	minted, _ := setupGitHubClaimRevocation(t, issueID)
+	var projectID string
+	dbfx.QueryRow(t, `SELECT project_id FROM issue WHERE id = $1`, issueID).Scan(&projectID)
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID,
+		"resource_type": "github_repo", "resource_ref": `{"url":"https://github.com/test-owner/other-repo"}`,
+		"position": 1,
+	})
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
+
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", map[string]string{"repository": "git@github.com:test-owner/test-repo.git"}, testWorkspaceID, "exact-github")
+	req = withURLParams(req, "runtimeId", runtimeID, "taskId", taskID)
+	w := httptest.NewRecorder()
+	testHandler.AcquireTaskGitHubCredentials(w, req)
+	var response struct {
+		Credentials []githubapp.Credential `json:"credentials"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK || minted.Load() != 1 || len(response.Credentials) != 1 || response.Credentials[0].Repository != "test-owner/test-repo" {
+		t.Fatalf("status=%d minted=%d credentials=%+v body=%s", w.Code, minted.Load(), response.Credentials, w.Body.String())
+	}
+	unauthorized := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/"+taskID+"/github-credentials", map[string]string{"repository": "evil-owner/unlisted"}, testWorkspaceID, "exact-github")
+	unauthorized = withURLParams(unauthorized, "runtimeId", runtimeID, "taskId", taskID)
+	denied := httptest.NewRecorder()
+	testHandler.AcquireTaskGitHubCredentials(denied, unauthorized)
+	if denied.Code != http.StatusForbidden || minted.Load() != 1 {
+		t.Fatalf("unauthorized status=%d minted=%d, want 403 and no additional mint", denied.Code, minted.Load())
+	}
+}
+
+func TestAcquireTaskGitHubCredentialsRequiresExactDaemonAuthentication(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	const exactDaemonID = "github-credential-daemon"
+	runtimeID := dbfx.Runtime(t, "GitHub credential auth runtime", testutil.Cols{"daemon_id": exactDaemonID})
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "GitHub credential auth agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running' WHERE id = $1`, taskID)
+	minted, _ := setupGitHubClaimRevocation(t, issueID)
+
+	router := chi.NewRouter()
+	router.Use(middleware.DaemonAuth(testHandler.Queries, nil, nil, nil))
+	router.Post("/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/github-credentials", testHandler.AcquireTaskGitHubCredentials)
+	path := "/api/daemon/runtimes/" + runtimeID + "/tasks/" + taskID + "/github-credentials"
+
+	daemonToken := func(daemonID string) string {
+		t.Helper()
+		raw := "mdt_" + daemonID
+		dbfx.Exec(t, `INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, expires_at) VALUES ($1, $2, $3, now() + interval '1 day')`, auth.HashToken(raw), testWorkspaceID, daemonID)
+		return raw
+	}
+	pat := "mul_github_credential_member"
+	dbfx.Insert(t, "personal_access_token", testutil.Cols{
+		"user_id": testUserID, "name": "GitHub credential member", "token_hash": auth.HashToken(pat),
+		"token_prefix": pat[:8], "expires_at": nil,
+	})
+	memberJWT, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": testUserID,
+		"exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString(auth.JWTSecret())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{name: "sibling daemon", token: daemonToken("github-credential-sibling"), want: http.StatusForbidden},
+		{name: "member PAT", token: pat, want: http.StatusForbidden},
+		{name: "member JWT", token: memberJWT, want: http.StatusForbidden},
+		{name: "exact daemon", token: daemonToken(exactDaemonID), want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d, want %d: %s", w.Code, tc.want, w.Body.String())
+			}
+			wantMinted := int32(0)
+			if tc.want == http.StatusOK {
+				wantMinted = 1
+			}
+			if minted.Load() != wantMinted {
+				t.Fatalf("minted=%d, want %d", minted.Load(), wantMinted)
+			}
+		})
+	}
+}
+
+func TestClaimTaskByRuntime_LegacyGitCapabilityFailsBeforeMint(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Legacy Git runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Legacy Git agent")
+	seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	minted, _ := setupGitHubClaimRevocation(t, issueID)
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "legacy-git")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV1)
+	w := httptest.NewRecorder()
+	testHandler.ClaimTaskByRuntime(w, req)
+	if minted.Load() != 0 {
+		t.Fatalf("legacy Git capability minted %d GitHub tokens, want 0", minted.Load())
 	}
 }

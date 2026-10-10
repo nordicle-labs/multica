@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/multica-ai/multica/server/pkg/deliverycontract"
 )
 
 type startTaskTransport func(*http.Request) (*http.Response, error)
@@ -31,6 +33,31 @@ func TestStartTaskBoundsResponseRead(t *testing.T) {
 	}
 	if read := responseSize - body.Len(); read > (1<<20)+1 {
 		t.Fatalf("read %d bytes before rejecting oversized response", read)
+	}
+}
+
+func TestStartTaskSendsDeliveryPreflight(t *testing.T) {
+	profile := deliverycontract.CurrentProfile()
+	hash, err := profile.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflight := deliverycontract.Preflight{ProfileVersion: profile.Version, ProfileHash: hash, ResourceReady: true}
+	client := NewClient("https://daemon.test")
+	client.client.Transport = startTaskTransport(func(r *http.Request) (*http.Response, error) {
+		var body struct {
+			DeliveryPreflight *deliverycontract.Preflight `json:"delivery_preflight"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.DeliveryPreflight == nil || body.DeliveryPreflight.ProfileHash != hash {
+			t.Fatalf("delivery preflight = %+v", body.DeliveryPreflight)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header)}, nil
+	})
+	if _, err := client.StartTaskWithDeliveryPreflight(context.Background(), startTestClaim(), &preflight); err != nil {
+		t.Fatal(err)
 	}
 }
 
