@@ -11,23 +11,31 @@ import (
 	"time"
 )
 
-const CurrentVersion = "delivery-v1"
+const CurrentVersion = "delivery-v2"
 
 var requiredToolsets = []string{"code_execution", "file", "terminal"}
+var requiredServices = []string{"postgres", "pgvector"}
 
 type CapabilityProfile struct {
 	Version          string   `json:"version"`
 	RequiredToolsets []string `json:"required_toolsets"`
+	RequiredServices []string `json:"required_services"`
 }
 
 func CurrentProfile() CapabilityProfile {
-	return CapabilityProfile{Version: CurrentVersion, RequiredToolsets: append([]string(nil), requiredToolsets...)}
+	return CapabilityProfile{
+		Version:          CurrentVersion,
+		RequiredToolsets: append([]string(nil), requiredToolsets...),
+		RequiredServices: append([]string(nil), requiredServices...),
+	}
 }
 
 func (p CapabilityProfile) Hash() (string, error) {
 	toolsets := append([]string(nil), p.RequiredToolsets...)
 	slices.Sort(toolsets)
-	data, err := json.Marshal(CapabilityProfile{Version: p.Version, RequiredToolsets: toolsets})
+	services := append([]string(nil), p.RequiredServices...)
+	slices.Sort(services)
+	data, err := json.Marshal(CapabilityProfile{Version: p.Version, RequiredToolsets: toolsets, RequiredServices: services})
 	if err != nil {
 		return "", err
 	}
@@ -43,18 +51,19 @@ type Repository struct {
 }
 
 type Preflight struct {
-	ProfileVersion     string     `json:"profile_version"`
-	ProfileHash        string     `json:"profile_hash"`
-	ResourceReady      bool       `json:"resource_ready"`
-	RepositoryRequired bool       `json:"repository_required"`
-	Repository         Repository `json:"repository"`
-	DiskWritable       bool       `json:"disk_writable"`
-	CLIAvailable       bool       `json:"cli_available"`
-	Authenticated      bool       `json:"authenticated"`
-	Toolsets           []string   `json:"toolsets"`
-	CanonicalBranch    string     `json:"canonical_branch,omitempty"`
-	RunBaseSHA         string     `json:"run_base_sha,omitempty"`
-	CanonicalRefSHA    string     `json:"canonical_ref_sha,omitempty"`
+	ProfileVersion     string          `json:"profile_version"`
+	ProfileHash        string          `json:"profile_hash"`
+	ResourceReady      bool            `json:"resource_ready"`
+	RepositoryRequired bool            `json:"repository_required"`
+	Repository         Repository      `json:"repository"`
+	DiskWritable       bool            `json:"disk_writable"`
+	CLIAvailable       bool            `json:"cli_available"`
+	Authenticated      bool            `json:"authenticated"`
+	Toolsets           []string        `json:"toolsets"`
+	Services           map[string]bool `json:"services"`
+	CanonicalBranch    string          `json:"canonical_branch,omitempty"`
+	RunBaseSHA         string          `json:"run_base_sha,omitempty"`
+	CanonicalRefSHA    string          `json:"canonical_ref_sha,omitempty"`
 }
 
 func (p Preflight) Validate(profile CapabilityProfile) error {
@@ -83,6 +92,11 @@ func (p Preflight) Validate(profile CapabilityProfile) error {
 	for _, required := range profile.RequiredToolsets {
 		if !slices.Contains(p.Toolsets, required) {
 			return fmt.Errorf("required toolset %q is unavailable", required)
+		}
+	}
+	for _, required := range profile.RequiredServices {
+		if !p.Services[required] {
+			return fmt.Errorf("required service %q is unavailable", required)
 		}
 	}
 	if p.RepositoryRequired {

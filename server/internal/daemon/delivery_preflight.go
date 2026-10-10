@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/pkg/deliverycontract"
 )
@@ -26,6 +28,7 @@ func buildDeliveryPreflight(ctx context.Context, workDir string, repositoryRequi
 		RepositoryRequired: repositoryRequired,
 		Authenticated:      authenticated,
 		Toolsets:           append([]string(nil), profile.RequiredToolsets...),
+		Services:           probeDeliveryServices(ctx, os.Getenv("MULTICA_DELIVERY_TEST_DATABASE_URL")),
 	}
 	if info, err := os.Stat(workDir); err == nil && info.IsDir() {
 		report.ResourceReady = true
@@ -53,6 +56,27 @@ func buildDeliveryPreflight(ctx context.Context, workDir string, repositoryRequi
 		report.CanonicalRefSHA = worktree.CanonicalRefExpected
 	}
 	return report
+}
+
+func probeDeliveryServices(parent context.Context, databaseURL string) map[string]bool {
+	services := map[string]bool{"postgres": false, "pgvector": false}
+	if strings.TrimSpace(databaseURL) == "" {
+		return services
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		return services
+	}
+	defer conn.Close(context.Background())
+	var vectorAvailable bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'vector')").Scan(&vectorAvailable); err != nil {
+		return services
+	}
+	services["postgres"] = true
+	services["pgvector"] = vectorAvailable
+	return services
 }
 
 func gitPreflight(ctx context.Context, workDir string, args ...string) string {

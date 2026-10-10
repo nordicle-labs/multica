@@ -21,6 +21,7 @@ func validPreflight(t *testing.T) Preflight {
 		CLIAvailable:   true,
 		Authenticated:  true,
 		Toolsets:       append([]string(nil), profile.RequiredToolsets...),
+		Services:       map[string]bool{"postgres": true, "pgvector": true},
 	}
 }
 
@@ -36,6 +37,12 @@ func TestPreflightValidatesVersionedCapabilitiesAndRepository(t *testing.T) {
 	report.ProfileHash = strings.Repeat("0", 64)
 	if err := report.Validate(profile); err == nil || !strings.Contains(err.Error(), "capability hash") {
 		t.Fatalf("hash mismatch error = %v", err)
+	}
+
+	report = validPreflight(t)
+	report.Services["pgvector"] = false
+	if err := report.Validate(profile); err == nil || !strings.Contains(err.Error(), "pgvector") {
+		t.Fatalf("missing pgvector error = %v", err)
 	}
 }
 

@@ -34,10 +34,10 @@ func startGitHubCredentialSession(credentials []GitHubCredential) (*githubCreden
 	return session, nil
 }
 
-// apply strips claim-time secrets before the provider is created. Publication
-// is performed by the host daemon after worktree finalization.
-func (s *githubCredentialSession) apply(task *Task) {
-	if s == nil || task == nil {
+// stripGitHubCredentials removes ambient or legacy claim-time Git credentials
+// before provider context construction. V3 claims contain no token at all.
+func stripGitHubCredentials(task *Task) {
+	if task == nil {
 		return
 	}
 	task.GitHubCredentials = nil

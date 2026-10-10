@@ -222,6 +222,7 @@ func daemonCommonCapabilities() []string {
 	if gitSupportsCredentialIsolation() {
 		capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV2)
 	}
+	capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV3)
 	return capabilities
 }
 
@@ -281,6 +282,20 @@ func (c *Client) ackGitHubCredentials(ctx context.Context, task *Task) error {
 	}
 	task.GitHubCredentialAck = ""
 	return nil
+}
+
+// AcquireGitHubCredentials asks the server to mint the short-lived publication
+// token after provider execution and host-side worktree finalization.
+func (c *Client) AcquireGitHubCredentials(ctx context.Context, task Task) ([]GitHubCredential, error) {
+	var response struct {
+		Credentials []GitHubCredential `json:"credentials"`
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-credentials",
+		url.PathEscape(task.RuntimeID), url.PathEscape(task.ID))
+	if err := c.postJSON(ctx, path, map[string]any{}, &response); err != nil {
+		return nil, fmt.Errorf("acquire GitHub App publication credentials: %w", err)
+	}
+	return response.Credentials, nil
 }
 
 func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, taskID, contributionID string) (http.Header, error) {

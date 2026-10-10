@@ -60,7 +60,10 @@ func setupGitHubClaimTestBroker(t *testing.T, repoURLs ...string) {
 
 func completeGitHubClaimForTest(t *testing.T, ack string) {
 	t.Helper()
-	if ack == "" || testHandler.takePendingGitHubClaim(ack) == nil {
+	if ack == "" {
+		return
+	}
+	if testHandler.takePendingGitHubClaim(ack) == nil {
 		t.Fatalf("GitHub claim acknowledgement %q is not pending", ack)
 	}
 }

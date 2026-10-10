@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -33,7 +32,7 @@ func TestGitHubCredentialSessionKeepsTokenOutOfProviderAndRevokes(t *testing.T) 
 		t.Fatal(err)
 	}
 	task := Task{Agent: &AgentData{CustomEnv: map[string]string{"GITHUB_TOKEN": "ambient"}}, GitHubCredentials: []GitHubCredential{{Repository: "owner/repo", Token: token}}}
-	session.apply(&task)
+	stripGitHubCredentials(&task)
 	if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
 		t.Fatal("GitHub credential reached provider task state")
 	}
@@ -50,14 +49,17 @@ func TestGitHubCredentialSessionKeepsTokenOutOfProviderAndRevokes(t *testing.T) 
 	}
 }
 
-func TestHandleTaskAcknowledgesGitHubCredentialAndRevokesOnLocalFailure(t *testing.T) {
+func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
 	record := func(call string) { mu.Lock(); calls = append(calls, call); mu.Unlock() }
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/claim-ack"):
-			record("ack")
+		case strings.HasSuffix(r.URL.Path, "/github-credentials"):
+			record("acquire")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"credentials":[]}`))
+			return
 		case r.Method == http.MethodDelete:
 			record("revoke")
 		case strings.HasSuffix(r.URL.Path, "/status"):
@@ -76,15 +78,15 @@ func TestHandleTaskAcknowledgesGitHubCredentialAndRevokesOnLocalFailure(t *testi
 		if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
 			t.Fatal("runner received GitHub credentials")
 		}
-		return TaskResult{}, errors.New("local launch failed")
+		return TaskResult{BranchName: "canonical", CommitSHA: strings.Repeat("a", 40), DurableWorkDir: t.TempDir()}, nil
 	})
-	d.handleTask(context.Background(), Task{ID: "task-1", RuntimeID: "runtime-1", Agent: &AgentData{Name: "test-agent"}, GitHubCredentials: []GitHubCredential{{Repository: "owner/repo", Token: "ghs_test_secret"}}, GitHubCredentialAck: "ack-1"}, 0)
+	d.handleTask(context.Background(), Task{ID: "task-1", RuntimeID: "runtime-1", Agent: &AgentData{Name: "test-agent"}, Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}}, 0)
 
 	mu.Lock()
 	got := append([]string(nil), calls...)
 	mu.Unlock()
-	if strings.Join(got, ",") != "ack,run,revoke" {
-		t.Fatalf("credential lifecycle calls = %v, want [ack run revoke]", got)
+	if strings.Join(got, ",") != "run,acquire" {
+		t.Fatalf("credential lifecycle calls = %v, want [run acquire]", got)
 	}
 }
 

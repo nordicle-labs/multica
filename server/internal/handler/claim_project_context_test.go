@@ -130,7 +130,7 @@ func TestClaimTask_IssueProjectInForeignWorkspace_DegradesToWorkspaceRepos(t *te
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-claim-foreign-issue-project")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -186,7 +186,7 @@ func TestClaimTask_QuickCreateProjectInForeignWorkspace_DegradesToWorkspaceRepos
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, daemonID)
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -268,7 +268,7 @@ func TestClaimTask_ProjectResourceFromForeignWorkspace_IsFilteredOut(t *testing.
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-claim-foreign-resource")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 

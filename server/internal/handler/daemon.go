@@ -3768,16 +3768,15 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 
 	if len(resp.Repos) > 0 {
-		if !requestHasClientCapability(r, protocol.DaemonCapabilityGitHubAppCredentialsV2) {
+		if !requestHasClientCapability(r, protocol.DaemonCapabilityGitHubAppCredentialsV3) {
 			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
 				r.Context(), task,
-				"This run requires GitHub App credentials, but the claiming runtime cannot isolate them safely. Update Git to 2.31 or newer and retry.",
+				"This run requires host-side GitHub publication, but the claiming runtime cannot acquire credentials after finalization. Update the runtime and retry.",
 				taskfailure.ReasonInvalidTaskIdentity,
 				"error_github_credentials_capability", http.StatusUnprocessableEntity, "runtime does not support GitHub App credentials",
 			)
 		}
-		credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, resp.WorkspaceID, resp.Repos)
-		if err != nil {
+		if _, err := h.githubPublicationPlan(r.Context(), runtime, resp.WorkspaceID, resp.Repos); err != nil {
 			slog.Error("task claim: GitHub App credential broker rejected run", "task_id", uuidToString(task.ID), "error", err)
 			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
 				r.Context(), task,
@@ -3786,7 +3785,6 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				"error_github_credentials", http.StatusForbidden, "GitHub App authorization failed",
 			)
 		}
-		resp.GitHubCredentials = credentials
 	}
 
 	// Wakeup rules that waited for this run hand it their inputs now, after
@@ -3819,7 +3817,13 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, nil
 }
 
-func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.AgentRuntime, workspaceID string, repos []RepoData) ([]githubapp.Credential, error) {
+type githubPublicationTarget struct {
+	installationID int64
+	repository     string
+	permissions    githubapp.Permissions
+}
+
+func (h *Handler) githubPublicationPlan(ctx context.Context, runtime db.AgentRuntime, workspaceID string, repos []RepoData) ([]githubPublicationTarget, error) {
 	if !runtime.OwnerID.Valid {
 		return nil, errors.New("runtime owner is required")
 	}
@@ -3837,13 +3841,11 @@ func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.Agen
 	if err != nil || len(installations) == 0 {
 		return nil, errors.New("workspace has no GitHub App installation")
 	}
-	broker := githubAppBroker()
-	credentials := make([]githubapp.Credential, 0, len(repos))
+	targets := make([]githubPublicationTarget, 0, len(repos))
 	seen := make(map[string]struct{}, len(repos))
 	for _, repo := range repos {
 		repository, parseErr := githubapp.ParseRepository(repo.URL)
 		if parseErr != nil {
-			revokeGitHubClaimCredentials(broker, credentials)
 			return nil, parseErr
 		}
 		if _, ok := seen[repository]; ok {
@@ -3852,10 +3854,22 @@ func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.Agen
 		seen[repository] = struct{}{}
 		installation, installErr := githubInstallationForRepository(installations, repository)
 		if installErr != nil {
-			revokeGitHubClaimCredentials(broker, credentials)
 			return nil, installErr
 		}
-		credential, mintErr := broker.Mint(ctx, installation.InstallationID, repository, permissions)
+		targets = append(targets, githubPublicationTarget{installationID: installation.InstallationID, repository: repository, permissions: permissions})
+	}
+	return targets, nil
+}
+
+func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.AgentRuntime, workspaceID string, repos []RepoData) ([]githubapp.Credential, error) {
+	targets, err := h.githubPublicationPlan(ctx, runtime, workspaceID, repos)
+	if err != nil {
+		return nil, err
+	}
+	broker := githubAppBroker()
+	credentials := make([]githubapp.Credential, 0, len(targets))
+	for _, target := range targets {
+		credential, mintErr := broker.Mint(ctx, target.installationID, target.repository, target.permissions)
 		if mintErr != nil {
 			revokeGitHubClaimCredentials(broker, credentials)
 			return nil, fmt.Errorf("repository is not authorized by a workspace GitHub App installation: %w", mintErr)
@@ -3863,6 +3877,79 @@ func (h *Handler) githubCredentialsForClaim(ctx context.Context, runtime db.Agen
 		credentials = append(credentials, credential)
 	}
 	return credentials, nil
+}
+
+func (h *Handler) taskPublicationProject(ctx context.Context, task db.AgentTaskQueue, workspaceID pgtype.UUID) (claimProjectContext, error) {
+	var projectID pgtype.UUID
+	switch {
+	case task.IssueID.Valid:
+		issue, err := h.Queries.GetIssue(ctx, task.IssueID)
+		if err != nil || issue.WorkspaceID != workspaceID {
+			return claimProjectContext{}, errors.New("task issue is outside the runtime workspace")
+		}
+		projectID = issue.ProjectID
+	case task.ChatSessionID.Valid:
+		chat, err := h.Queries.GetChatSession(ctx, task.ChatSessionID)
+		if err != nil || chat.WorkspaceID != workspaceID {
+			return claimProjectContext{}, errors.New("task chat is outside the runtime workspace")
+		}
+		projectID = chat.ProjectID
+	case task.AutopilotRunID.Valid:
+		run, err := h.Queries.GetAutopilotRun(ctx, task.AutopilotRunID)
+		if err != nil {
+			return claimProjectContext{}, err
+		}
+		autopilot, err := h.Queries.GetAutopilot(ctx, run.AutopilotID)
+		if err != nil || autopilot.WorkspaceID != workspaceID {
+			return claimProjectContext{}, errors.New("task autopilot is outside the runtime workspace")
+		}
+		projectID = autopilot.ProjectID
+	default:
+		var quick service.QuickCreateContext
+		if json.Unmarshal(task.Context, &quick) == nil && quick.Type == service.QuickCreateContextType {
+			if quick.WorkspaceID != uuidToString(workspaceID) {
+				return claimProjectContext{}, errors.New("quick-create task is outside the runtime workspace")
+			}
+			if quick.ProjectID != "" {
+				parsed, err := util.ParseUUID(quick.ProjectID)
+				if err != nil {
+					return claimProjectContext{}, errors.New("quick-create project is invalid")
+				}
+				projectID = parsed
+			}
+		}
+	}
+	return h.resolveClaimProjectContext(ctx, projectID, workspaceID)
+}
+
+// AcquireTaskGitHubCredentials mints publication-only credentials after the
+// daemon has finalized the task's canonical commit. Nothing is minted at claim.
+func (h *Handler) AcquireTaskGitHubCredentials(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID)
+	if !ok {
+		return
+	}
+	taskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "taskId")
+	if !ok {
+		return
+	}
+	task, err := h.Queries.GetAgentTask(r.Context(), taskID)
+	if err != nil || task.RuntimeID != runtime.ID || task.Status != "running" {
+		writeError(w, http.StatusConflict, "task is not running on this runtime")
+		return
+	}
+	project, err := h.taskPublicationProject(r.Context(), task, runtime.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resolve task repositories")
+		return
+	}
+	credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, uuidToString(runtime.WorkspaceID), project.Repos)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "GitHub App authorization failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"credentials": credentials})
 }
 
 func githubInstallationForRepository(installations []db.GithubInstallation, repository string) (db.GithubInstallation, error) {

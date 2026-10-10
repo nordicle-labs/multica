@@ -68,6 +68,9 @@ const (
 	// Git is new enough to isolate credential helpers via GIT_CONFIG_COUNT, and
 	// the daemon acknowledges receipt before a minted credential is committed.
 	DaemonCapabilityGitHubAppCredentialsV2 = "github-app-credentials-v2"
+	// DaemonCapabilityGitHubAppCredentialsV3 mints repository credentials only
+	// after the provider has exited and the host finalized its canonical ref.
+	DaemonCapabilityGitHubAppCredentialsV3 = "github-app-credentials-v3"
 	// DaemonCapabilityTaskSupplementV1 advertises that this provider run can accept
 	// an additional text instruction without cancelling or starting a task.
 	// It is persisted when this exact task enters running; absence always means

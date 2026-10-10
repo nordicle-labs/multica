@@ -336,7 +336,7 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 		testWorkspaceID,
 		"chat-project-context-test",
 	)
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {
