@@ -1,6 +1,6 @@
 -- Decision Impact Review is a queue safety gate, so it belongs in the same
--- row-locking fence used by every issue-scoped task INSERT. The issue KEY SHARE
--- lock serializes with metadata updates and closes the stale-snapshot race.
+-- row-locking fence used by every issue-scoped task INSERT. The issue UPDATE
+-- lock conflicts with metadata updates and closes the stale-snapshot race.
 CREATE OR REPLACE FUNCTION lock_task_owner_rows(
     p_agent_id uuid,
     p_issue_id uuid,
@@ -68,7 +68,7 @@ BEGIN
         INTO review_state
         FROM issue
         WHERE id = p_issue_id
-        FOR KEY SHARE;
+        FOR UPDATE;
         IF FOUND THEN locked := locked + 1; END IF;
         IF review_state IN ('pending', 'failed') THEN
             RETURN FALSE;

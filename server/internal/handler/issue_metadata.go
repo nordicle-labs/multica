@@ -192,7 +192,9 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "only a workspace owner can update a decision impact review")
 			return
 		}
-		if err := decisionimpact.ValidateReview(req.Value, uuidToString(member.UserID)); err != nil {
+		currentReview, _ := parseIssueMetadata(issue.Metadata)[decisionImpactMetadataKey].(map[string]any)
+		currentReviewRaw, _ := json.Marshal(currentReview)
+		if err := decisionimpact.ValidateReviewTransition(req.Value, currentReviewRaw, uuidToString(member.UserID), uuidToString(issue.ID)); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

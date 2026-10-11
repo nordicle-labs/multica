@@ -215,6 +215,7 @@ func TestInjectRuntimeConfigKeepsTriggerCommentOutOfBrief(t *testing.T) {
 		// halves — a compression that drops either delivery case must fail
 		// here.
 		"**Every issue turn runs the same workflow.**",
+		"decision_impact_review` in `pending` or `failed`",
 		"with the `--parent` value it gives you for THIS turn",
 		"never one from an earlier turn",
 		"With no triggering comment, post a new top-level comment",

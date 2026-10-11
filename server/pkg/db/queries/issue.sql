@@ -1,3 +1,11 @@
+-- name: ListDecisionImpactIssuesPage :many
+-- Full-workspace deterministic scan used only after an owner opens a decision
+-- review. Stable ordering plus limit/offset makes page exhaustion explicit.
+SELECT * FROM issue
+WHERE workspace_id = sqlc.arg('workspace_id')
+ORDER BY created_at ASC, id ASC
+LIMIT sqlc.arg('page_limit') OFFSET sqlc.arg('page_offset');
+
 -- name: ListIssues :many
 -- involves_user_id widens the assignee filter to surface issues where the user
 -- is *indirectly* the assignee — via an owned agent or a squad they belong to /
@@ -182,10 +190,10 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
-    stage, properties, last_activity_at, id
+    stage, properties, metadata, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    sqlc.narg('stage'), COALESCE(sqlc.narg('properties')::jsonb, '{}'::jsonb), now(), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
+    sqlc.narg('stage'), COALESCE(sqlc.narg('properties')::jsonb, '{}'::jsonb), COALESCE(sqlc.narg('metadata')::jsonb, '{}'::jsonb), now(), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 ) RETURNING *;
 
 -- name: GetIssueByNumber :one
@@ -410,10 +418,10 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
-    origin_type, origin_id, stage, properties, last_activity_at, id
+    origin_type, origin_id, stage, properties, metadata, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    sqlc.narg('origin_type'), sqlc.narg('origin_id'), sqlc.narg('stage'), COALESCE(sqlc.narg('properties')::jsonb, '{}'::jsonb), now(), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
+    sqlc.narg('origin_type'), sqlc.narg('origin_id'), sqlc.narg('stage'), COALESCE(sqlc.narg('properties')::jsonb, '{}'::jsonb), COALESCE(sqlc.narg('metadata')::jsonb, '{}'::jsonb), now(), COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 ) RETURNING *;
 
 -- name: LockIssueDuplicateKey :exec
@@ -731,6 +739,19 @@ UPDATE issue SET
     updated_at = now()
 WHERE id = sqlc.arg('id') AND workspace_id = sqlc.arg('workspace_id')
   AND metadata -> sqlc.arg('key')::text IS DISTINCT FROM sqlc.arg('value')::jsonb
+RETURNING id, workspace_id, metadata, revision;
+
+-- name: SetIssueMetadataKeyIfRevision :one
+-- Opens safety gates without adopting a concurrent issue write. The row update
+-- both checks the caller's snapshot and conflicts with task enqueue's FOR UPDATE
+-- fence, so either the gate or the enqueue wins from one serialized state.
+UPDATE issue SET
+    metadata = jsonb_set(metadata, ARRAY[sqlc.arg('key')::text], sqlc.arg('value')::jsonb),
+    revision = revision + 1,
+    last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now()),
+    updated_at = now()
+WHERE id = sqlc.arg('id') AND workspace_id = sqlc.arg('workspace_id')
+  AND revision = sqlc.arg('expected_revision')
 RETURNING id, workspace_id, metadata, revision;
 
 -- name: DeleteIssueMetadataKey :one

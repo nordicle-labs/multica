@@ -18,7 +18,7 @@ func TestAnalyzeHistoricalDecisionScenario(t *testing.T) {
 
 	result := Analyze(in)
 	assertAction(t, result, "HERM-888", Continue)
-	assertAction(t, result, "HERM-885", Close)
+	assertAction(t, result, "HERM-885", Supersede)
 	assertAction(t, result, "HERM-934", Continue)
 	if len(result.Mutations) != 1 || result.Mutations[0].TargetID != "0199ee0c-7518-7000-8000-000000000927" {
 		t.Fatalf("mutations = %#v, want exact obsolete HERM-927 run", result.Mutations)
@@ -64,16 +64,37 @@ func TestConfirmAppliedReportsOnlyRevalidatedMutations(t *testing.T) {
 
 func TestValidateReviewRequiresOwnerIdentityAndNoPendingCompletion(t *testing.T) {
 	const owner = "0199ee0c-7518-7000-8000-000000000001"
-	valid := []byte(`{"state":"completed","decision_issue_id":"0199ee0c-7518-7000-8000-000000000931","authorized_member_id":"` + owner + `","decision_changed":"new vault","pending_impact":[]}`)
-	if err := ValidateReview(valid, owner); err != nil {
+	const issueID = "0199ee0c-7518-7000-8000-000000000931"
+	valid := []byte(`{"state":"completed","decision_issue_id":"` + issueID + `","authorized_member_id":"` + owner + `","decision_changed":"new vault","pending_impact":[],"active_after_review":[{"issue":"HERM-934","relation":"reference","impact":"continue","action":"continue","proof":"active implementation"}]}`)
+	if err := ValidateReview(valid, owner, issueID); err != nil {
 		t.Fatalf("valid completed review: %v", err)
 	}
-	if err := ValidateReview(valid, "0199ee0c-7518-7000-8000-000000000002"); err == nil {
+	if err := ValidateReview(valid, "0199ee0c-7518-7000-8000-000000000002", issueID); err == nil {
 		t.Fatal("mismatched owner identity was accepted")
 	}
 	pending := []byte(`{"state":"completed","decision_issue_id":"0199ee0c-7518-7000-8000-000000000931","authorized_member_id":"` + owner + `","decision_changed":"new vault","pending_impact":[{"issue":"HERM-885"}]}`)
-	if err := ValidateReview(pending, owner); err == nil {
+	if err := ValidateReview(pending, owner, issueID); err == nil {
 		t.Fatal("completed review with pending impact was accepted")
+	}
+	empty := []byte(`{"state":"completed","decision_issue_id":"` + issueID + `","authorized_member_id":"` + owner + `","decision_changed":"new vault"}`)
+	if err := ValidateReview(empty, owner, issueID); err == nil {
+		t.Fatal("completed review without an audit matrix was accepted")
+	}
+	if err := ValidateReview(valid, owner, "0199ee0c-7518-7000-8000-000000000999"); err == nil {
+		t.Fatal("review for another decision issue was accepted")
+	}
+}
+
+func TestValidateReviewTransitionRequiresEveryScannedCandidate(t *testing.T) {
+	const owner = "0199ee0c-7518-7000-8000-000000000001"
+	const issueID = "0199ee0c-7518-7000-8000-000000000931"
+	current, err := PendingReviewWithMatrix(issueID, owner, "new vault", []MatrixRow{{IssueIdentifier: "HERM-885"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := []byte(`{"state":"completed","decision_issue_id":"` + issueID + `","authorized_member_id":"` + owner + `","decision_changed":"new vault","not_impacted":[{"issue":"HERM-934","relation":"project","impact":"none","action":"no impact proved","proof":"checked"}]}`)
+	if err := ValidateReviewTransition(next, current, owner, issueID); err == nil {
+		t.Fatal("completion omitted a scanned candidate")
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -28,6 +30,7 @@ type Decision struct {
 	ProjectID  string `json:"project_id"`
 	ActorType  string `json:"actor_type"`
 	ActorRole  string `json:"actor_role"`
+	Text       string `json:"text,omitempty"`
 }
 
 type Issue struct {
@@ -37,6 +40,8 @@ type Issue struct {
 	References       []string `json:"references,omitempty"`
 	Status           string   `json:"status"`
 	RequestedAction  Action   `json:"requested_action,omitempty"`
+	Text             string   `json:"text,omitempty"`
+	Comments         []string `json:"comments,omitempty"`
 }
 
 type ObsolescenceProof struct {
@@ -98,7 +103,38 @@ type Review struct {
 	ActiveAfterReview    []MatrixRow `json:"active_after_review"`
 }
 
-func ValidateReview(raw []byte, authorizedMemberID string) error {
+func HasMarker(value string) bool {
+	upper := strings.ReplaceAll(strings.ToUpper(value), "É", "E")
+	return strings.Contains(upper, "DECISION CLEMENT")
+}
+
+func PendingReview(decisionIssueID, authorizedMemberID, decisionChanged string) ([]byte, error) {
+	return json.Marshal(Review{
+		State:                "pending",
+		DecisionIssueID:      decisionIssueID,
+		AuthorizedMemberID:   authorizedMemberID,
+		DecisionChanged:      decisionChanged,
+		ImpactedAndCorrected: []MatrixRow{},
+		PendingImpact:        []MatrixRow{},
+		NotImpacted:          []MatrixRow{},
+		ActiveAfterReview:    []MatrixRow{},
+	})
+}
+
+func PendingReviewWithMatrix(decisionIssueID, authorizedMemberID, decisionChanged string, matrix []MatrixRow) ([]byte, error) {
+	return json.Marshal(Review{
+		State:                "pending",
+		DecisionIssueID:      decisionIssueID,
+		AuthorizedMemberID:   authorizedMemberID,
+		DecisionChanged:      decisionChanged,
+		ImpactedAndCorrected: []MatrixRow{},
+		PendingImpact:        matrix,
+		NotImpacted:          []MatrixRow{},
+		ActiveAfterReview:    []MatrixRow{},
+	})
+}
+
+func ValidateReview(raw []byte, authorizedMemberID, decisionIssueID string) error {
 	var review Review
 	if err := json.Unmarshal(raw, &review); err != nil {
 		return fmt.Errorf("decode decision impact review: %w", err)
@@ -108,6 +144,9 @@ func ValidateReview(raw []byte, authorizedMemberID string) error {
 	}
 	if _, err := uuid.Parse(review.DecisionIssueID); err != nil {
 		return errors.New("decision impact review requires a valid decision_issue_id")
+	}
+	if review.DecisionIssueID != decisionIssueID {
+		return errors.New("decision impact review must describe the issue being updated")
 	}
 	switch review.State {
 	case "pending", "failed":
@@ -119,17 +158,62 @@ func ValidateReview(raw []byte, authorizedMemberID string) error {
 		if len(review.PendingImpact) != 0 {
 			return errors.New("completed decision impact review cannot contain pending impact")
 		}
+		if len(review.ImpactedAndCorrected)+len(review.NotImpacted)+len(review.ActiveAfterReview) == 0 {
+			return errors.New("completed decision impact review requires an audit matrix")
+		}
+		for _, rows := range [][]MatrixRow{review.ImpactedAndCorrected, review.NotImpacted, review.ActiveAfterReview} {
+			for _, row := range rows {
+				if row.IssueIdentifier == "" || row.Relation == "" || row.Impact == "" || row.Proof == "" || normalizedAction(row.Action) != row.Action {
+					return errors.New("completed decision impact review requires complete structured matrix rows")
+				}
+			}
+		}
 		return nil
 	default:
 		return errors.New("decision impact review state must be pending, failed, or completed")
 	}
 }
 
+func ValidateReviewTransition(raw, current []byte, authorizedMemberID, decisionIssueID string) error {
+	if err := ValidateReview(raw, authorizedMemberID, decisionIssueID); err != nil {
+		return err
+	}
+	var next, previous Review
+	if err := json.Unmarshal(raw, &next); err != nil || next.State != "completed" || len(current) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(current, &previous); err != nil {
+		return errors.New("existing decision impact review is invalid")
+	}
+	classified := map[string]bool{}
+	for _, rows := range [][]MatrixRow{next.ImpactedAndCorrected, next.NotImpacted, next.ActiveAfterReview} {
+		for _, row := range rows {
+			classified[row.IssueIdentifier] = true
+		}
+	}
+	for _, row := range previous.PendingImpact {
+		if !classified[row.IssueIdentifier] {
+			return fmt.Errorf("completed decision impact review omits scanned candidate %s", row.IssueIdentifier)
+		}
+	}
+	return nil
+}
+
 func Analyze(in Input) Result {
+	superseded := supersededIdentifiers(in.Decision.Text)
 	result := Result{Matrix: make([]MatrixRow, 0, len(in.Issues))}
 	for _, issue := range in.Issues {
 		relation := relationToDecision(in.Decision, issue)
 		action := normalizedAction(issue.RequestedAction)
+		if issue.Identifier == in.Decision.Identifier || issue.Status == "done" {
+			action = Continue
+		} else if superseded[issue.Identifier] {
+			action = Supersede
+		} else if issue.RequestedAction == "" && (relation == "reference" || relation == "comment") {
+			action = Continue
+		} else if issue.RequestedAction == "" && relation == "child" {
+			action = Amend
+		}
 		row := MatrixRow{IssueIdentifier: issue.Identifier, Relation: relation, Action: action}
 		if relation == "none" {
 			row.Action = NoImpact
@@ -191,10 +275,39 @@ func relationToDecision(decision Decision, issue Issue) string {
 			return "reference"
 		}
 	}
+	if containsIdentifier(issue.Text, decision.Identifier) {
+		return "reference"
+	}
+	for _, comment := range issue.Comments {
+		if containsIdentifier(comment, decision.Identifier) {
+			return "comment"
+		}
+	}
 	if decision.ProjectID != "" && issue.ProjectID == decision.ProjectID {
 		return "project"
 	}
 	return "none"
+}
+
+var supersessionRE = regexp.MustCompile(`(?i)(?:supersedes|replaces|absorbed_by)\s+([A-Z][A-Z0-9]*-[0-9]+)`)
+
+func supersededIdentifiers(text string) map[string]bool {
+	result := map[string]bool{}
+	for _, match := range supersessionRE.FindAllStringSubmatch(text, -1) {
+		result[strings.ToUpper(match[1])] = true
+	}
+	return result
+}
+
+func containsIdentifier(text, identifier string) bool {
+	for _, field := range strings.FieldsFunc(strings.ToUpper(text), func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '-'
+	}) {
+		if field == strings.ToUpper(identifier) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizedAction(action Action) Action {

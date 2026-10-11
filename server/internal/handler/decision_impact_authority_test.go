@@ -37,8 +37,10 @@ func TestDecisionImpactReviewMetadataRequiresAuthenticatedOwner(t *testing.T) {
 		"decision_changed":       "new vault",
 		"impacted_and_corrected": []any{},
 		"pending_impact":         []any{},
-		"not_impacted":           []any{},
-		"active_after_review":    []any{},
+		"not_impacted": []any{map[string]any{
+			"issue": "TEST-1", "relation": "project", "impact": "no impact", "action": "no impact proved", "proof": "reviewed",
+		}},
+		"active_after_review": []any{},
 	}
 	body, _ := json.Marshal(map[string]any{"value": value})
 

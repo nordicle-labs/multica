@@ -2520,6 +2520,13 @@ SELECT * FROM agent_task_queue
 WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
 ORDER BY created_at DESC;
 
+-- name: ListDecisionImpactRunsByIssue :many
+-- Decision review also treats durable deferred work as active because it can
+-- resume after the direction has changed.
+SELECT * FROM agent_task_queue
+WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+ORDER BY created_at DESC;
+
 -- name: ListActiveTasksByIssueFamily :many
 -- Cross-issue coordination read for parallel sub-issue work (#7768). Given a
 -- family root — the target issue's parent, or the target itself when it has
