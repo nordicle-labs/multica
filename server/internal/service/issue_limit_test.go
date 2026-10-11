@@ -158,3 +158,11 @@ func TestIssueCountLimitSerializesConcurrentCreatesAndDeleteFreesCapacity(t *tes
 		t.Fatalf("create after delete: %v", err)
 	}
 }
+
+func TestIssueCreateRejectsDecisionMarkerWithoutOwnerAuthority(t *testing.T) {
+	s := &IssueService{}
+	_, err := s.Create(context.Background(), IssueCreateParams{Title: "DECISION CLEMENT: rotate vault"}, IssueCreateOpts{})
+	if !errors.Is(err, ErrDecisionImpactOwnerRequired) {
+		t.Fatalf("Create error = %v, want %v", err, ErrDecisionImpactOwnerRequired)
+	}
+}

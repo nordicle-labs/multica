@@ -24,6 +24,14 @@ SELECT * FROM (
 ) AS recent
 ORDER BY created_at ASC, id ASC;
 
+-- name: ListDecisionImpactCommentsPage :many
+-- Exhaustive, deterministic scan for the exceptional owner-triggered decision
+-- audit. Unlike ListCommentsForIssue this page never drops old roots/threads.
+SELECT * FROM comment
+WHERE issue_id = @issue_id AND workspace_id = @workspace_id
+ORDER BY created_at ASC, id ASC
+LIMIT @page_limit OFFSET @page_offset;
+
 -- name: ListCommentsByIDsForIssue :many
 -- The subset of @ids that exists within this issue and workspace.
 --

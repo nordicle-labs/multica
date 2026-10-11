@@ -298,10 +298,10 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
-    stage, properties, last_activity_at, id
+    stage, properties, metadata, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    $16, COALESCE($17::jsonb, '{}'::jsonb), now(), COALESCE($18::uuid, gen_random_uuid())
+    $16, COALESCE($17::jsonb, '{}'::jsonb), COALESCE($18::jsonb, '{}'::jsonb), now(), COALESCE($19::uuid, gen_random_uuid())
 ) RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
 `
 
@@ -323,6 +323,7 @@ type CreateIssueParams struct {
 	ProjectID     pgtype.UUID `json:"project_id"`
 	Stage         pgtype.Int4 `json:"stage"`
 	Properties    []byte      `json:"properties"`
+	Metadata      []byte      `json:"metadata"`
 	ID            pgtype.UUID `json:"id"`
 }
 
@@ -345,6 +346,7 @@ func (q *Queries) CreateIssue(ctx context.Context, arg CreateIssueParams) (Issue
 		arg.ProjectID,
 		arg.Stage,
 		arg.Properties,
+		arg.Metadata,
 		arg.ID,
 	)
 	var i Issue
@@ -388,10 +390,10 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
-    origin_type, origin_id, stage, properties, last_activity_at, id
+    origin_type, origin_id, stage, properties, metadata, last_activity_at, id
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    $16, $17, $18, COALESCE($19::jsonb, '{}'::jsonb), now(), COALESCE($20::uuid, gen_random_uuid())
+    $16, $17, $18, COALESCE($19::jsonb, '{}'::jsonb), COALESCE($20::jsonb, '{}'::jsonb), now(), COALESCE($21::uuid, gen_random_uuid())
 ) RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id
 `
 
@@ -415,6 +417,7 @@ type CreateIssueWithOriginParams struct {
 	OriginID      pgtype.UUID `json:"origin_id"`
 	Stage         pgtype.Int4 `json:"stage"`
 	Properties    []byte      `json:"properties"`
+	Metadata      []byte      `json:"metadata"`
 	ID            pgtype.UUID `json:"id"`
 }
 
@@ -439,6 +442,7 @@ func (q *Queries) CreateIssueWithOrigin(ctx context.Context, arg CreateIssueWith
 		arg.OriginID,
 		arg.Stage,
 		arg.Properties,
+		arg.Metadata,
 		arg.ID,
 	)
 	var i Issue
@@ -1182,6 +1186,107 @@ type ListChildrenByParentsParams struct {
 // creation order as ListChildIssues.
 func (q *Queries) ListChildrenByParents(ctx context.Context, arg ListChildrenByParentsParams) ([]Issue, error) {
 	rows, err := q.db.Query(ctx, listChildrenByParents, arg.WorkspaceID, arg.ParentIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Issue{}
+	for rows.Next() {
+		var i Issue
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.Title,
+			&i.Description,
+			&i.Status,
+			&i.Priority,
+			&i.AssigneeType,
+			&i.AssigneeID,
+			&i.CreatorType,
+			&i.CreatorID,
+			&i.ParentIssueID,
+			&i.AcceptanceCriteria,
+			&i.ContextRefs,
+			&i.Position,
+			&i.DueDate,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Number,
+			&i.ProjectID,
+			&i.OriginType,
+			&i.OriginID,
+			&i.FirstExecutedAt,
+			&i.StartDate,
+			&i.Metadata,
+			&i.Stage,
+			&i.Properties,
+			&i.Revision,
+			&i.LastActivityAt,
+			&i.TriageState,
+			&i.DuplicateOfIssueID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDecisionImpactDependencies = `-- name: ListDecisionImpactDependencies :many
+SELECT d.issue_id, d.depends_on_issue_id
+FROM issue_dependency d
+JOIN issue source ON source.id = d.issue_id
+JOIN issue target ON target.id = d.depends_on_issue_id
+WHERE source.workspace_id = $1
+  AND target.workspace_id = $1
+ORDER BY d.issue_id, d.depends_on_issue_id
+`
+
+type ListDecisionImpactDependenciesRow struct {
+	IssueID          pgtype.UUID `json:"issue_id"`
+	DependsOnIssueID pgtype.UUID `json:"depends_on_issue_id"`
+}
+
+func (q *Queries) ListDecisionImpactDependencies(ctx context.Context, workspaceID pgtype.UUID) ([]ListDecisionImpactDependenciesRow, error) {
+	rows, err := q.db.Query(ctx, listDecisionImpactDependencies, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDecisionImpactDependenciesRow{}
+	for rows.Next() {
+		var i ListDecisionImpactDependenciesRow
+		if err := rows.Scan(&i.IssueID, &i.DependsOnIssueID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDecisionImpactIssuesPage = `-- name: ListDecisionImpactIssuesPage :many
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
+WHERE workspace_id = $1
+ORDER BY created_at ASC, id ASC
+LIMIT $3 OFFSET $2
+`
+
+type ListDecisionImpactIssuesPageParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	PageOffset  int32       `json:"page_offset"`
+	PageLimit   int32       `json:"page_limit"`
+}
+
+// Full-workspace deterministic scan used only after an owner opens a decision
+// review. Stable ordering plus limit/offset makes page exhaustion explicit.
+func (q *Queries) ListDecisionImpactIssuesPage(ctx context.Context, arg ListDecisionImpactIssuesPageParams) ([]Issue, error) {
+	rows, err := q.db.Query(ctx, listDecisionImpactIssuesPage, arg.WorkspaceID, arg.PageOffset, arg.PageLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -2078,6 +2183,53 @@ func (q *Queries) SetIssueMetadataKey(ctx context.Context, arg SetIssueMetadataK
 		arg.WorkspaceID,
 	)
 	var i SetIssueMetadataKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Metadata,
+		&i.Revision,
+	)
+	return i, err
+}
+
+const setIssueMetadataKeyIfRevision = `-- name: SetIssueMetadataKeyIfRevision :one
+UPDATE issue SET
+    metadata = jsonb_set(metadata, ARRAY[$1::text], $2::jsonb),
+    revision = revision + 1,
+    last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now()),
+    updated_at = now()
+WHERE id = $3 AND workspace_id = $4
+  AND revision = $5
+RETURNING id, workspace_id, metadata, revision
+`
+
+type SetIssueMetadataKeyIfRevisionParams struct {
+	Key              string      `json:"key"`
+	Value            []byte      `json:"value"`
+	ID               pgtype.UUID `json:"id"`
+	WorkspaceID      pgtype.UUID `json:"workspace_id"`
+	ExpectedRevision int64       `json:"expected_revision"`
+}
+
+type SetIssueMetadataKeyIfRevisionRow struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Metadata    []byte      `json:"metadata"`
+	Revision    int64       `json:"revision"`
+}
+
+// Opens safety gates without adopting a concurrent issue write. The row update
+// both checks the caller's snapshot and conflicts with task enqueue's FOR UPDATE
+// fence, so either the gate or the enqueue wins from one serialized state.
+func (q *Queries) SetIssueMetadataKeyIfRevision(ctx context.Context, arg SetIssueMetadataKeyIfRevisionParams) (SetIssueMetadataKeyIfRevisionRow, error) {
+	row := q.db.QueryRow(ctx, setIssueMetadataKeyIfRevision,
+		arg.Key,
+		arg.Value,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.ExpectedRevision,
+	)
+	var i SetIssueMetadataKeyIfRevisionRow
 	err := row.Scan(
 		&i.ID,
 		&i.WorkspaceID,

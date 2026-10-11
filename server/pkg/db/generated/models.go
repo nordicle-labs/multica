@@ -634,6 +634,20 @@ type DaemonToken struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type DecisionImpactCandidate struct {
+	ScanID           pgtype.UUID        `json:"scan_id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	DecisionIssueID  pgtype.UUID        `json:"decision_issue_id"`
+	CandidateIssueID pgtype.UUID        `json:"candidate_issue_id"`
+	IssueIdentifier  string             `json:"issue_identifier"`
+	Relation         string             `json:"relation"`
+	ExpectedAction   string             `json:"expected_action"`
+	IssueRevision    int64              `json:"issue_revision"`
+	IssueStatus      string             `json:"issue_status"`
+	ActiveRunIds     []pgtype.UUID      `json:"active_run_ids"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type DingtalkBotIdentity struct {
 	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
 	InstallationID   pgtype.UUID        `json:"installation_id"`

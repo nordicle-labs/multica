@@ -3314,6 +3314,19 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 	// Determine creator identity: agent (via X-Agent-ID header) or member.
 	creatorType, actualCreatorID := h.resolveActor(r, creatorID, workspaceID)
+	var decisionImpactOwnerID pgtype.UUID
+	description := ""
+	if req.Description != nil {
+		description = *req.Description
+	}
+	if hasDecisionMarker(req.Title + "\n" + description) {
+		member, memberOK := ctxMember(r.Context())
+		if creatorType != "member" || !memberOK || member.Role != "owner" {
+			writeError(w, http.StatusForbidden, "only a workspace owner can authorize a decision impact review")
+			return
+		}
+		decisionImpactOwnerID = member.UserID
+	}
 
 	// Optional origin stamping (quick-create / autopilot). Only the
 	// allowed origin types are accepted; anything else is rejected so a
@@ -3399,26 +3412,27 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := h.IssueService.Create(r.Context(), service.IssueCreateParams{
-		WorkspaceID:    wsUUID,
-		Title:          req.Title,
-		Description:    ptrToText(req.Description),
-		Status:         status,
-		Priority:       priority,
-		AssigneeType:   assigneeType,
-		AssigneeID:     assigneeID,
-		CreatorType:    creatorType,
-		CreatorID:      parseUUID(actualCreatorID),
-		ParentIssueID:  parentIssueID,
-		ProjectID:      projectID,
-		StartDate:      startDate,
-		DueDate:        dueDate,
-		OriginType:     originType,
-		OriginID:       originID,
-		Stage:          ptrToInt4(req.Stage),
-		AttachmentIDs:  attachmentIDs,
-		LabelIDs:       labelIDs,
-		Properties:     properties,
-		AllowDuplicate: req.AllowDuplicate,
+		WorkspaceID:           wsUUID,
+		Title:                 req.Title,
+		Description:           ptrToText(req.Description),
+		Status:                status,
+		Priority:              priority,
+		AssigneeType:          assigneeType,
+		AssigneeID:            assigneeID,
+		CreatorType:           creatorType,
+		CreatorID:             parseUUID(actualCreatorID),
+		ParentIssueID:         parentIssueID,
+		ProjectID:             projectID,
+		StartDate:             startDate,
+		DueDate:               dueDate,
+		OriginType:            originType,
+		OriginID:              originID,
+		Stage:                 ptrToInt4(req.Stage),
+		AttachmentIDs:         attachmentIDs,
+		LabelIDs:              labelIDs,
+		Properties:            properties,
+		AllowDuplicate:        req.AllowDuplicate,
+		DecisionImpactOwnerID: decisionImpactOwnerID,
 	}, service.IssueCreateOpts{
 		ActorID:          actualCreatorID,
 		AnalyticsAgentID: analyticsAgentID,
@@ -3483,6 +3497,18 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	issue := res.Issue
+	if decisionImpactOwnerID.Valid {
+		if err := h.scanDecisionImpactReview(r.Context(), issue, decisionImpactOwnerID); err != nil {
+			slog.Warn("scan created decision impact review failed", append(logger.RequestAttrs(r), "error", err, "issue_id", uuidToString(issue.ID), "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "decision created but impact review scan failed; execution remains blocked")
+			return
+		}
+		issue, err = h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{ID: issue.ID, WorkspaceID: issue.WorkspaceID})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "decision created but impact review reload failed; execution remains blocked")
+			return
+		}
+	}
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
 	resp := issueToResponse(issue, prefix)
@@ -3793,6 +3819,40 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		params.ExpectedRevision = pgtype.Int8{Int64: *req.ExpectedRevision, Valid: true}
 	}
 
+	// An explicit change-of-direction marker opens the durable impact gate before
+	// the issue mutation. That ordering is fail-closed: concurrent issue-scoped
+	// enqueues observe pending (the SQL queue fence locks this same row), and a
+	// later update failure leaves the review pending rather than starting work on
+	// an unaudited direction. Text identifies the event; authenticated workspace
+	// ownership supplies the authority.
+	var decisionImpactMemberID pgtype.UUID
+	if startsDecisionImpactReview(prevIssue, req) {
+		actorType, _ := h.resolveActor(r, userID, workspaceID)
+		member, memberOK := ctxMember(r.Context())
+		if actorType != "member" || !memberOK || member.Role != "owner" {
+			writeError(w, http.StatusForbidden, "only a workspace owner can authorize a decision impact review")
+			return
+		}
+		decisionImpactMemberID = member.UserID
+		gatedIssue, gateErr := h.beginDecisionImpactReview(r.Context(), prevIssue, member.UserID)
+		if gateErr != nil {
+			if errors.Is(gateErr, pgx.ErrNoRows) {
+				current, reloadErr := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{ID: prevIssue.ID, WorkspaceID: prevIssue.WorkspaceID})
+				if reloadErr == nil {
+					writeRevisionConflict(w, "issue", current.ID, prevIssue.Revision, current.Revision)
+					return
+				}
+			}
+			slog.Warn("begin decision impact review failed", append(logger.RequestAttrs(r), "error", gateErr, "issue_id", id, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to begin decision impact review")
+			return
+		}
+		prevIssue = gatedIssue
+		if req.ExpectedRevision != nil {
+			params.ExpectedRevision = pgtype.Int8{Int64: gatedIssue.Revision, Valid: true}
+		}
+	}
+
 	// COALESCE fields — only set when explicitly provided
 	if req.Title != nil {
 		params.Title = pgtype.Text{String: *req.Title, Valid: true}
@@ -3996,6 +4056,18 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("update issue failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to update issue: "+err.Error())
 		return
+	}
+	if decisionImpactMemberID.Valid {
+		if err := h.scanDecisionImpactReview(r.Context(), issue, decisionImpactMemberID); err != nil {
+			slog.Warn("scan decision impact review failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "decision updated but impact review scan failed; execution remains blocked")
+			return
+		}
+		issue, err = h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{ID: issue.ID, WorkspaceID: issue.WorkspaceID})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "decision updated but impact review reload failed; execution remains blocked")
+			return
+		}
 	}
 
 	// Determine actor identity: agent (via X-Agent-ID header) or member.
