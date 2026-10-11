@@ -13,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/decisionimpact"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -156,7 +158,8 @@ func TestDecisionImpactScanReadsPastFirstPageAndComments(t *testing.T) {
 		t.Fatal("database required for decision impact pagination")
 	}
 	ctx := context.Background()
-	decisionID := parseUUID(dbfx.Issue(t, "DECISION CLEMENT pagination"))
+	projectID := dbfx.Project(t, "decision impact large project")
+	decisionID := parseUUID(dbfx.Issue(t, "DECISION CLEMENT pagination", testutil.Cols{"project_id": projectID}))
 	decision, err := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: decisionID, WorkspaceID: parseUUID(testWorkspaceID)})
 	if err != nil {
 		t.Fatal(err)
@@ -164,10 +167,23 @@ func TestDecisionImpactScanReadsPastFirstPageAndComments(t *testing.T) {
 	prefix := testHandler.getIssuePrefix(ctx, decision.WorkspaceID)
 	decisionIdentifier := fmt.Sprintf("%s-%d", prefix, decision.Number)
 	for i := 0; i < 100; i++ {
-		dbfx.Issue(t, fmt.Sprintf("pagination filler %03d", i))
+		dbfx.Issue(t, fmt.Sprintf("pagination filler %03d", i), testutil.Cols{"project_id": projectID})
 	}
-	targetID := dbfx.Issue(t, "comment-only impact candidate")
+	targetID := dbfx.Issue(t, "comment-only impact candidate", testutil.Cols{"project_id": projectID})
+	for i := 0; i < 35; i++ {
+		dbfx.Comment(t, targetID, fmt.Sprintf("old filler comment %02d", i))
+	}
 	dbfx.Comment(t, targetID, "still depends on "+decisionIdentifier)
+	dependencyID := dbfx.Issue(t, "graph-only impact candidate")
+	dbfx.Insert(t, "issue_dependency", testutil.Cols{"issue_id": dependencyID, "depends_on_issue_id": util.UUIDToString(decisionID), "type": "blocks"})
+	sharedProjectID := dbfx.Project(t, "shared resource project")
+	sharedIssueID := dbfx.Issue(t, "shared-resource impact candidate", testutil.Cols{"project_id": sharedProjectID})
+	for _, candidateProjectID := range []string{projectID, sharedProjectID} {
+		dbfx.Insert(t, "project_resource", testutil.Cols{
+			"project_id": candidateProjectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo",
+			"resource_ref": testutil.Raw(`'{"url":"https://example.invalid/shared"}'::jsonb`), "position": 0, "created_by": testUserID,
+		})
+	}
 	if err := testHandler.scanDecisionImpactReview(ctx, decision, parseUUID(testUserID)); err != nil {
 		t.Fatal(err)
 	}
@@ -183,15 +199,60 @@ func TestDecisionImpactScanReadsPastFirstPageAndComments(t *testing.T) {
 	if err := json.Unmarshal(metadata[decisionImpactMetadataKey], &review); err != nil {
 		t.Fatal(err)
 	}
+	if len(review.PendingImpact) != 0 {
+		t.Fatalf("exhaustive matrix leaked into bounded metadata: %#v", review.PendingImpact)
+	}
+	var metadataBytes int
+	if err := testPool.QueryRow(ctx, `SELECT pg_column_size(metadata) FROM issue WHERE id=$1`, decisionID).Scan(&metadataBytes); err != nil {
+		t.Fatal(err)
+	}
+	if metadataBytes > 8192 {
+		t.Fatalf("normalized metadata size = %d, exceeds 8192", metadataBytes)
+	}
+	candidates, err := testHandler.Queries.LockDecisionImpactCandidatesForCompletion(ctx, db.LockDecisionImpactCandidatesForCompletionParams{
+		ScanID: parseUUID(review.ScanID), WorkspaceID: decision.WorkspaceID, DecisionIssueID: decisionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) < 102 {
+		t.Fatalf("normalized candidates = %d, want at least 102", len(candidates))
+	}
 	targetIssue, err := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: parseUUID(targetID), WorkspaceID: decision.WorkspaceID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	targetIdentifier := fmt.Sprintf("%s-%d", prefix, targetIssue.Number)
-	for _, row := range review.PendingImpact {
-		if row.IssueIdentifier == targetIdentifier && row.Relation == "comment" {
-			return
+	dependencyIssue, _ := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: parseUUID(dependencyID), WorkspaceID: decision.WorkspaceID})
+	sharedIssue, _ := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: parseUUID(sharedIssueID), WorkspaceID: decision.WorkspaceID})
+	wantRelations := map[string]string{
+		targetIdentifier: "comment",
+		fmt.Sprintf("%s-%d", prefix, dependencyIssue.Number): "dependency",
+		fmt.Sprintf("%s-%d", prefix, sharedIssue.Number):     "shared_resource",
+	}
+	for _, row := range candidates {
+		if want, ok := wantRelations[row.IssueIdentifier]; ok && row.Relation == want {
+			delete(wantRelations, row.IssueIdentifier)
 		}
 	}
-	t.Fatalf("second-page comment candidate %s missing from matrix: %#v", targetIdentifier, review.PendingImpact)
+	if len(wantRelations) != 0 {
+		t.Fatalf("missing normalized relations %#v in candidates %#v", wantRelations, candidates)
+	}
+}
+
+func TestDecisionImpactCompletionRevalidatesCorrectedCandidate(t *testing.T) {
+	review := decisionimpact.Review{ImpactedAndCorrected: []decisionimpact.MatrixRow{{
+		IssueIdentifier: "HERM-885", Relation: "reference", Impact: "obsolete", Action: decisionimpact.Supersede, Proof: "owner closed obsolete issue",
+	}}}
+	candidate := db.LockDecisionImpactCandidatesForCompletionRow{
+		IssueIdentifier: "HERM-885", Relation: "reference", IssueRevision: 2,
+		CurrentRevision: 3, CurrentStatus: "cancelled", StatusCategory: "closed", HasActiveRuns: true,
+	}
+	if err := validateDecisionImpactCompletion(review, []db.LockDecisionImpactCandidatesForCompletionRow{candidate}); err == nil {
+		t.Fatal("corrected candidate with an active run was accepted")
+	}
+	candidate.HasActiveRuns = false
+	if err := validateDecisionImpactCompletion(review, []db.LockDecisionImpactCandidatesForCompletionRow{candidate}); err != nil {
+		t.Fatalf("closed candidate without active runs was rejected: %v", err)
+	}
 }

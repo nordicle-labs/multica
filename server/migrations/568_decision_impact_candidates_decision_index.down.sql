@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS decision_impact_candidate_decision_idx;

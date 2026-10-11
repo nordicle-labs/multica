@@ -6,6 +6,15 @@ WHERE workspace_id = sqlc.arg('workspace_id')
 ORDER BY created_at ASC, id ASC
 LIMIT sqlc.arg('page_limit') OFFSET sqlc.arg('page_offset');
 
+-- name: ListDecisionImpactDependencies :many
+SELECT d.issue_id, d.depends_on_issue_id
+FROM issue_dependency d
+JOIN issue source ON source.id = d.issue_id
+JOIN issue target ON target.id = d.depends_on_issue_id
+WHERE source.workspace_id = @workspace_id
+  AND target.workspace_id = @workspace_id
+ORDER BY d.issue_id, d.depends_on_issue_id;
+
 -- name: ListIssues :many
 -- involves_user_id widens the assignee filter to surface issues where the user
 -- is *indirectly* the assignee — via an owned agent or a squad they belong to /

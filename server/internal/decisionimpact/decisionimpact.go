@@ -40,6 +40,8 @@ type Issue struct {
 	References       []string `json:"references,omitempty"`
 	Status           string   `json:"status"`
 	RequestedAction  Action   `json:"requested_action,omitempty"`
+	Dependency       bool     `json:"dependency,omitempty"`
+	SharedResource   bool     `json:"shared_resource,omitempty"`
 	Text             string   `json:"text,omitempty"`
 	Comments         []string `json:"comments,omitempty"`
 }
@@ -94,13 +96,16 @@ type Report struct {
 
 type Review struct {
 	State                string      `json:"state"`
+	ScanID               string      `json:"scan_id"`
 	DecisionIssueID      string      `json:"decision_issue_id"`
 	AuthorizedMemberID   string      `json:"authorized_member_id"`
 	DecisionChanged      string      `json:"decision_changed"`
-	ImpactedAndCorrected []MatrixRow `json:"impacted_and_corrected"`
-	PendingImpact        []MatrixRow `json:"pending_impact"`
-	NotImpacted          []MatrixRow `json:"not_impacted"`
-	ActiveAfterReview    []MatrixRow `json:"active_after_review"`
+	CandidateCount       int         `json:"candidate_count"`
+	ClassifiedCount      int         `json:"classified_count,omitempty"`
+	ImpactedAndCorrected []MatrixRow `json:"impacted_and_corrected,omitempty"`
+	PendingImpact        []MatrixRow `json:"pending_impact,omitempty"`
+	NotImpacted          []MatrixRow `json:"not_impacted,omitempty"`
+	ActiveAfterReview    []MatrixRow `json:"active_after_review,omitempty"`
 }
 
 func HasMarker(value string) bool {
@@ -111,6 +116,7 @@ func HasMarker(value string) bool {
 func PendingReview(decisionIssueID, authorizedMemberID, decisionChanged string) ([]byte, error) {
 	return json.Marshal(Review{
 		State:                "pending",
+		ScanID:               uuid.NewString(),
 		DecisionIssueID:      decisionIssueID,
 		AuthorizedMemberID:   authorizedMemberID,
 		DecisionChanged:      decisionChanged,
@@ -124,20 +130,55 @@ func PendingReview(decisionIssueID, authorizedMemberID, decisionChanged string) 
 func PendingReviewWithMatrix(decisionIssueID, authorizedMemberID, decisionChanged string, matrix []MatrixRow) ([]byte, error) {
 	return json.Marshal(Review{
 		State:                "pending",
+		ScanID:               uuid.NewString(),
 		DecisionIssueID:      decisionIssueID,
 		AuthorizedMemberID:   authorizedMemberID,
 		DecisionChanged:      decisionChanged,
 		ImpactedAndCorrected: []MatrixRow{},
 		PendingImpact:        matrix,
+		CandidateCount:       len(matrix),
 		NotImpacted:          []MatrixRow{},
 		ActiveAfterReview:    []MatrixRow{},
 	})
 }
 
-func ValidateReview(raw []byte, authorizedMemberID, decisionIssueID string) error {
+func PendingReviewForScan(scanID, decisionIssueID, authorizedMemberID, decisionChanged string, candidateCount int) ([]byte, error) {
+	return json.Marshal(Review{
+		State:              "pending",
+		ScanID:             scanID,
+		DecisionIssueID:    decisionIssueID,
+		AuthorizedMemberID: authorizedMemberID,
+		DecisionChanged:    decisionChanged,
+		CandidateCount:     candidateCount,
+	})
+}
+
+func DecodeReview(raw []byte) (Review, error) {
 	var review Review
 	if err := json.Unmarshal(raw, &review); err != nil {
-		return fmt.Errorf("decode decision impact review: %w", err)
+		return Review{}, fmt.Errorf("decode decision impact review: %w", err)
+	}
+	return review, nil
+}
+
+func CompactCompletedReview(raw []byte) ([]byte, error) {
+	review, err := DecodeReview(raw)
+	if err != nil {
+		return nil, err
+	}
+	review.ClassifiedCount = len(review.ImpactedAndCorrected) + len(review.NotImpacted) + len(review.ActiveAfterReview)
+	review.CandidateCount = review.ClassifiedCount
+	review.ImpactedAndCorrected = nil
+	review.PendingImpact = nil
+	review.NotImpacted = nil
+	review.ActiveAfterReview = nil
+	return json.Marshal(review)
+}
+
+func ValidateReview(raw []byte, authorizedMemberID, decisionIssueID string) error {
+	review, err := DecodeReview(raw)
+	if err != nil {
+		return err
 	}
 	if review.AuthorizedMemberID != authorizedMemberID {
 		return errors.New("decision impact review authority does not match the authenticated owner")
@@ -147,6 +188,9 @@ func ValidateReview(raw []byte, authorizedMemberID, decisionIssueID string) erro
 	}
 	if review.DecisionIssueID != decisionIssueID {
 		return errors.New("decision impact review must describe the issue being updated")
+	}
+	if _, err := uuid.Parse(review.ScanID); err != nil {
+		return errors.New("decision impact review requires a valid scan_id")
 	}
 	switch review.State {
 	case "pending", "failed":
@@ -184,6 +228,9 @@ func ValidateReviewTransition(raw, current []byte, authorizedMemberID, decisionI
 	}
 	if err := json.Unmarshal(current, &previous); err != nil {
 		return errors.New("existing decision impact review is invalid")
+	}
+	if previous.State != "pending" || next.ScanID != previous.ScanID {
+		return errors.New("completed decision impact review does not match the current pending scan")
 	}
 	classified := map[string]bool{}
 	for _, rows := range [][]MatrixRow{next.ImpactedAndCorrected, next.NotImpacted, next.ActiveAfterReview} {
@@ -270,6 +317,9 @@ func relationToDecision(decision Decision, issue Issue) string {
 	if issue.ParentIdentifier == decision.Identifier {
 		return "child"
 	}
+	if issue.Dependency {
+		return "dependency"
+	}
 	for _, ref := range issue.References {
 		if ref == decision.Identifier {
 			return "reference"
@@ -282,6 +332,9 @@ func relationToDecision(decision Decision, issue Issue) string {
 		if containsIdentifier(comment, decision.Identifier) {
 			return "comment"
 		}
+	}
+	if issue.SharedResource {
+		return "shared_resource"
 	}
 	if decision.ProjectID != "" && issue.ProjectID == decision.ProjectID {
 		return "project"

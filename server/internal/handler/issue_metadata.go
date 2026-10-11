@@ -185,6 +185,7 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	completeDecisionImpact := false
 	if key == decisionImpactMetadataKey {
 		actorType, _ := h.resolveActor(r, userID, uuidToString(issue.WorkspaceID))
 		member, memberOK := ctxMember(r.Context())
@@ -198,6 +199,12 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		review, err := decisionimpact.DecodeReview(req.Value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		completeDecisionImpact = review.State == "completed"
 	}
 
 	// Enforce the key-count cap in the handler. The DB only guards size,
@@ -210,16 +217,32 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	queryStarted := time.Now()
-	updated, err := wakeupWrite(h, r, func(q *db.Queries) (db.SetIssueMetadataKeyRow, error) {
-		return q.SetIssueMetadataKey(r.Context(), db.SetIssueMetadataKeyParams{
-			ID:          issue.ID,
-			WorkspaceID: issue.WorkspaceID,
-			Key:         key,
-			Value:       []byte(req.Value),
+	var updated db.SetIssueMetadataKeyRow
+	var err error
+	if completeDecisionImpact {
+		updated, err = h.completeDecisionImpactReview(r.Context(), issue, req.Value)
+	} else {
+		updated, err = wakeupWrite(h, r, func(q *db.Queries) (db.SetIssueMetadataKeyRow, error) {
+			return q.SetIssueMetadataKey(r.Context(), db.SetIssueMetadataKeyParams{
+				ID:          issue.ID,
+				WorkspaceID: issue.WorkspaceID,
+				Key:         key,
+				Value:       []byte(req.Value),
+			})
 		})
-	})
+	}
 	queryDuration := time.Since(queryStarted)
 	if err != nil {
+		if completeDecisionImpact && errors.Is(err, errInvalidDecisionImpactCompletion) {
+			h.recordIssueMetadataMutation(r, "set", "rejected", issueID, key, queryDuration)
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if completeDecisionImpact && errors.Is(err, pgx.ErrNoRows) {
+			h.recordIssueMetadataMutation(r, "set", "conflict", issueID, key, queryDuration)
+			writeError(w, http.StatusConflict, "decision impact review changed while completion was being validated")
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			fallbackStarted := time.Now()
 			current, getErr := h.Queries.GetIssueMetadataInWorkspace(r.Context(), db.GetIssueMetadataInWorkspaceParams{

@@ -1235,6 +1235,41 @@ func (q *Queries) ListChildrenByParents(ctx context.Context, arg ListChildrenByP
 	return items, nil
 }
 
+const listDecisionImpactDependencies = `-- name: ListDecisionImpactDependencies :many
+SELECT d.issue_id, d.depends_on_issue_id
+FROM issue_dependency d
+JOIN issue source ON source.id = d.issue_id
+JOIN issue target ON target.id = d.depends_on_issue_id
+WHERE source.workspace_id = $1
+  AND target.workspace_id = $1
+ORDER BY d.issue_id, d.depends_on_issue_id
+`
+
+type ListDecisionImpactDependenciesRow struct {
+	IssueID          pgtype.UUID `json:"issue_id"`
+	DependsOnIssueID pgtype.UUID `json:"depends_on_issue_id"`
+}
+
+func (q *Queries) ListDecisionImpactDependencies(ctx context.Context, workspaceID pgtype.UUID) ([]ListDecisionImpactDependenciesRow, error) {
+	rows, err := q.db.Query(ctx, listDecisionImpactDependencies, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDecisionImpactDependenciesRow{}
+	for rows.Next() {
+		var i ListDecisionImpactDependenciesRow
+		if err := rows.Scan(&i.IssueID, &i.DependsOnIssueID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listDecisionImpactIssuesPage = `-- name: ListDecisionImpactIssuesPage :many
 SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, revision, last_activity_at, triage_state, duplicate_of_issue_id FROM issue
 WHERE workspace_id = $1
