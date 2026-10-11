@@ -40,9 +40,8 @@ func startsDecisionImpactReview(prev db.Issue, req UpdateIssueRequest) bool {
 }
 
 func hasDecisionMarker(value string) bool {
-	upper := strings.ToUpper(value)
-	return strings.Contains(upper, "DECISION CLEMENT") ||
-		strings.Contains(upper, "DECISION CLÉMENT")
+	upper := strings.ReplaceAll(strings.ToUpper(value), "É", "E")
+	return strings.Contains(upper, "DECISION CLEMENT")
 }
 
 func (h *Handler) beginDecisionImpactReview(ctx context.Context, issue db.Issue, memberID pgtype.UUID) (db.Issue, error) {

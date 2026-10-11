@@ -1,17 +1,27 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func TestDecisionImpactReviewMetadataRequiresAuthenticatedOwner(t *testing.T) {
 	issue := dbfx.Issue(t, "decision impact authority")
 	agent := dbfx.Agent(t, "decision impact agent", testRuntimeID)
+	member, err := testHandler.Queries.GetMemberByUserAndWorkspace(context.Background(), db.GetMemberByUserAndWorkspaceParams{
+		UserID:      parseUUID(testUserID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load workspace owner: %v", err)
+	}
 	task := dbfx.Task(t, agent, testutil.Cols{
 		"runtime_id":          testRuntimeID,
 		"issue_id":            issue,
@@ -35,6 +45,7 @@ func TestDecisionImpactReviewMetadataRequiresAuthenticatedOwner(t *testing.T) {
 	call := func(asAgent bool) int {
 		req := newRequest("PUT", "/", json.RawMessage(body))
 		req = withURLParams(req, "id", issue, "key", decisionImpactMetadataKey)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, member))
 		if asAgent {
 			req.Header.Set("X-Agent-ID", agent)
 			req.Header.Set("X-Task-ID", task)
