@@ -253,6 +253,7 @@ func TestRunRepoCheckoutUsesDaemonVisibleTaskWorkdir(t *testing.T) {
 
 	t.Setenv("MULTICA_DAEMON_PORT", strings.TrimPrefix(srv.URL, "http://127.0.0.1:"))
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_AGENT_ID", "agent-1")
 	t.Setenv("MULTICA_TASK_ID", "task-1")
 	t.Setenv("MULTICA_TOKEN", "mat_repo_checkout_test")
 	visibleRoot := t.TempDir()
@@ -260,8 +261,15 @@ func TestRunRepoCheckoutUsesDaemonVisibleTaskWorkdir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
 		t.Fatalf("create marker directory: %v", err)
 	}
-	if err := os.WriteFile(markerPath, []byte(`{"managed_by":"`+execenv.TaskContextMarkerManagedBy+`"}`), 0o644); err != nil {
+	if err := os.WriteFile(markerPath, []byte(`{"managed_by":"`+execenv.TaskContextMarkerManagedBy+`","agent_id":"agent-1"}`), 0o644); err != nil {
 		t.Fatalf("write task marker: %v", err)
+	}
+	nestedMarker := filepath.Join(visibleRoot, "services", execenv.TaskContextMarkerRelPath)
+	if err := os.MkdirAll(filepath.Dir(nestedMarker), 0o755); err != nil {
+		t.Fatalf("create nested marker directory: %v", err)
+	}
+	if err := os.WriteFile(nestedMarker, []byte(`{"managed_by":"`+execenv.TaskContextMarkerManagedBy+`","agent_id":"agent-1"}`), 0o644); err != nil {
+		t.Fatalf("write nested task marker: %v", err)
 	}
 	child := filepath.Join(visibleRoot, "services", "api")
 	if err := os.MkdirAll(child, 0o755); err != nil {

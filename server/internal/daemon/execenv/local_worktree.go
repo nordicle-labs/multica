@@ -884,12 +884,10 @@ func (w *LocalWorktree) makeStandalone(logger *slog.Logger) error {
 			return fmt.Errorf("execenv: copy task snapshot into standalone checkout: %w", err)
 		}
 	}
-	if origin, err := runGitTrimmed(w.GitRoot, "config", "--get", "remote.origin.url"); err == nil && origin != "" {
-		if out, err := runGit(tmp, "remote", "set-url", "origin", origin); err != nil {
-			return fmt.Errorf("execenv: preserve task checkout origin: %s: %w", strings.TrimSpace(out), err)
-		}
-	} else {
-		_, _ = runGit(tmp, "remote", "remove", "origin")
+	// Publication is owned by the task-scoped finalizer. Do not expose the
+	// user's remote URL (which may contain credentials) inside the runtime.
+	if out, err := runGit(tmp, "remote", "remove", "origin"); err != nil {
+		return fmt.Errorf("execenv: remove standalone task checkout origin: %s: %w", strings.TrimSpace(out), err)
 	}
 	if err := removeLocalWorktreeDir(w.GitRoot, w.Path, logger); err != nil {
 		return fmt.Errorf("execenv: detach linked task worktree: %w", err)
@@ -1019,10 +1017,53 @@ func (w *LocalWorktree) markStandaloneBranchActive() error {
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(w.Path) == "" || !filepath.IsAbs(w.Path) {
+		return errors.New("standalone branch marker requires an absolute checkout path")
+	}
 	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(marker, []byte(w.Path), 0o600)
+	data, err := json.Marshal(struct {
+		Path string `json:"path"`
+	}{Path: w.Path})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(marker), ".active-worktree-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, marker)
+}
+
+func readStandaloneBranchMarker(marker string) (string, error) {
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.Path) == "" || !filepath.IsAbs(payload.Path) {
+		return "", errors.New("invalid standalone branch marker path")
+	}
+	return payload.Path, nil
 }
 
 func (w *LocalWorktree) clearStandaloneBranchActive() {
@@ -1030,8 +1071,8 @@ func (w *LocalWorktree) clearStandaloneBranchActive() {
 	if err != nil {
 		return
 	}
-	path, err := os.ReadFile(marker)
-	if err == nil && strings.TrimSpace(string(path)) == w.Path {
+	path, err := readStandaloneBranchMarker(marker)
+	if err == nil && path == w.Path {
 		_ = os.Remove(marker)
 	}
 }
@@ -1041,14 +1082,14 @@ func standaloneBranchActive(gitRoot, branch string) bool {
 	if err != nil {
 		return true
 	}
-	path, err := os.ReadFile(marker)
+	path, err := readStandaloneBranchMarker(marker)
 	if errors.Is(err, os.ErrNotExist) {
 		return false
 	}
 	if err != nil {
 		return true
 	}
-	if _, err := os.Stat(strings.TrimSpace(string(path))); err == nil || !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return true
 	}
 	_ = os.Remove(marker)

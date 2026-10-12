@@ -2,6 +2,7 @@ package execenv
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -411,6 +412,16 @@ func TestPrepareLocalWorktreeCopiesUnadvertisedSnapshotWithResolvedGit(t *testin
 	}
 }
 
+func TestPrepareLocalWorktreeDoesNotExposeOriginCredentials(t *testing.T) {
+	repo := newTestRepo(t)
+	gitRun(t, repo, "remote", "add", "origin", "https://user:placeholder-secret@example.com/org/repo.git?token=placeholder-secret")
+
+	wt := prepareForTest(t, repo)
+	if _, err := runGitTrimmed(wt.Path, "config", "--get", "remote.origin.url"); err == nil {
+		t.Fatal("standalone checkout exposes the host repository origin")
+	}
+}
+
 // Concurrency is the entire point of the mode: two tasks on one directory must
 // both get a working checkout, with distinct branches, without corrupting git's
 // admin files.
@@ -655,6 +666,58 @@ func TestPrepareLocalWorktreeKeepsInaccessibleStandaloneBranchExclusive(t *testi
 		t.Fatalf("second turn reused inaccessible standalone checkout branch %q", first.Branch)
 	}
 	finalizeOK(t, second)
+}
+
+func TestStandaloneBranchMarkerFailsClosed(t *testing.T) {
+	repo := newTestRepo(t)
+	wt := &LocalWorktree{GitRoot: repo, Branch: "agent/test/marker", Path: filepath.Join(t.TempDir(), "checkout")}
+	if err := os.MkdirAll(wt.Path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.markStandaloneBranchActive(); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := standaloneBranchMarker(repo, wt.Branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Path string `json:"path"`
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json.Unmarshal(data, &payload) != nil || payload.Path != wt.Path {
+		t.Fatal("standalone branch marker is not structured")
+	}
+
+	for _, corrupt := range []string{"", "{", `{"path":""}`, `{"path":"relative"}`} {
+		if err := os.WriteFile(marker, []byte(corrupt), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if !standaloneBranchActive(repo, wt.Branch) {
+			t.Fatalf("corrupt marker %q failed open", corrupt)
+		}
+		if _, err := os.Lstat(marker); err != nil {
+			t.Fatalf("corrupt marker %q was removed: %v", corrupt, err)
+		}
+	}
+}
+
+func TestStandaloneBranchMarkerTreatsBrokenSymlinkAsActive(t *testing.T) {
+	repo := newTestRepo(t)
+	path := filepath.Join(t.TempDir(), "checkout")
+	wt := &LocalWorktree{GitRoot: repo, Branch: "agent/test/symlink", Path: path}
+	if err := wt.markStandaloneBranchActive(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), path); err != nil {
+		t.Fatal(err)
+	}
+	if !standaloneBranchActive(repo, wt.Branch) {
+		t.Fatal("broken symlink path entry failed open")
+	}
 }
 
 // The one operation in this flow that can destroy work is `git worktree remove
