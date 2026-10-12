@@ -533,8 +533,8 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 // error and DELIBERATELY LEAVES THE WORKTREE IN PLACE. Removing it would be the
 // one operation in this file that destroys work with no way back, and a warning
 // in the daemon log is not an acceptable substitute for the user's changes. The
-// surviving worktree stays registered in the user's repo, so `git worktree list`
-// points straight at it.
+// surviving standalone checkout is reported by path and remains marked active
+// so another task cannot reuse its branch.
 func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, error) {
 	if w == nil {
 		return LocalWorktreeOutcome{}, nil
@@ -880,8 +880,8 @@ func (w *LocalWorktree) makeStandalone(logger *slog.Logger) error {
 		if object == "" {
 			continue
 		}
-		if out, err := runGit(tmp, "fetch", "--no-tags", w.GitRoot, object); err != nil {
-			return fmt.Errorf("execenv: copy task snapshot into standalone checkout: %s: %w", strings.TrimSpace(out), err)
+		if _, err := pushGitObject(w.GitRoot, tmp, object); err != nil {
+			return fmt.Errorf("execenv: copy task snapshot into standalone checkout: %w", err)
 		}
 	}
 	if origin, err := runGitTrimmed(w.GitRoot, "config", "--get", "remote.origin.url"); err == nil && origin != "" {
@@ -928,8 +928,13 @@ previous=$(git rev-parse --verify "$tip^1") || exit 0
 ref="refs/heads/$branch"
 current=$(git -C "$host" rev-parse --verify "$ref") || exit 0
 [ "$current" = "$previous" ] || exit 0
-git -C "$host" fetch --no-tags "$root" "$tip" >/dev/null 2>&1 || exit 0
-git -C "$host" update-ref "$ref" "$tip" "$current" >/dev/null 2>&1 || exit 0
+transfer="refs/multica/transfer/$tip"
+git -C "$root" push --no-verify "$host" "$tip:$transfer" >/dev/null 2>&1 || exit 0
+git -C "$host" update-ref "$ref" "$tip" "$current" >/dev/null 2>&1 || {
+  git -C "$host" update-ref -d "$transfer" >/dev/null 2>&1
+  exit 0
+}
+git -C "$host" update-ref -d "$transfer" >/dev/null 2>&1
 exit 0
 `
 	return os.WriteFile(filepath.Join(w.Path, ".git", "hooks", "post-commit"), []byte(hook), 0o755)
@@ -957,13 +962,25 @@ func (w *LocalWorktree) syncStandaloneBranch() error {
 	if _, err := runGit(w.Path, "merge-base", "--is-ancestor", current, tip); err != nil {
 		return fmt.Errorf("task branch moved independently from %s to %s", shortID(w.BaseCommit), shortID(current))
 	}
-	if out, err := runGit(w.GitRoot, "fetch", "--no-tags", w.Path, tip); err != nil {
-		return fmt.Errorf("copy standalone checkout objects: %s: %w", strings.TrimSpace(out), err)
+	transferRef, err := pushGitObject(w.Path, w.GitRoot, tip)
+	if err != nil {
+		return fmt.Errorf("copy standalone checkout objects: %w", err)
 	}
+	defer runGit(w.GitRoot, "update-ref", "-d", transferRef)
 	if out, err := runGit(w.GitRoot, "update-ref", ref, tip, current); err != nil {
 		return fmt.Errorf("advance task branch with compare-and-swap: %s: %w", strings.TrimSpace(out), err)
 	}
 	return nil
+}
+
+// pushGitObject transfers an object through an advertised temporary ref. Git
+// 2.15 rejects fetches by raw, unadvertised object ID even between local repos.
+func pushGitObject(source, destination, object string) (string, error) {
+	ref := "refs/multica/transfer/" + object
+	if out, err := runGit(source, "push", "--no-verify", destination, object+":"+ref); err != nil {
+		return "", fmt.Errorf("git push object %s: %s: %w", shortID(object), strings.TrimSpace(out), err)
+	}
+	return ref, nil
 }
 
 func (w *LocalWorktree) removePath(logger *slog.Logger) error {
@@ -973,11 +990,11 @@ func (w *LocalWorktree) removePath(logger *slog.Logger) error {
 	if !w.Standalone {
 		return removeLocalWorktreeDir(w.GitRoot, w.Path, logger)
 	}
-	w.clearStandaloneBranchActive()
 	if err := os.RemoveAll(w.Path); err != nil {
 		return err
 	}
 	if _, err := os.Lstat(w.Path); errors.Is(err, os.ErrNotExist) {
+		w.clearStandaloneBranchActive()
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("confirm standalone checkout removal: %w", err)

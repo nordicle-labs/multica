@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -65,7 +66,8 @@ func buildTestRepoTemplate() (string, error) {
 		}
 	}
 	for _, args := range [][]string{
-		{"init", "-b", "main"},
+		{"init"},
+		{"symbolic-ref", "HEAD", "refs/heads/main"},
 		{"config", "user.name", "Test User"},
 		{"config", "user.email", "test@test.com"},
 		// git commit forks a DETACHED `git maintenance run --auto` and
@@ -116,6 +118,13 @@ func gitTry(t *testing.T, dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+func removeTestWorktree(t *testing.T, gitRoot, path string) {
+	t.Helper()
+	if err := removeLocalWorktreeDir(gitRoot, path, worktreeTestLogger()); err != nil {
+		t.Fatalf("remove test worktree: %v", err)
+	}
 }
 
 func readFile(t *testing.T, path string) string {
@@ -374,7 +383,8 @@ func TestPrepareLocalWorktreeRejectsNonGitDirectory(t *testing.T) {
 func TestPrepareLocalWorktreeRejectsRepoWithoutCommits(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	gitRun(t, dir, "init", "-b", "main")
+	gitRun(t, dir, "init")
+	gitRun(t, dir, "symbolic-ref", "HEAD", "refs/heads/main")
 
 	_, err := PrepareLocalWorktree(LocalWorktreeParams{
 		LocalPath: dir,
@@ -386,6 +396,18 @@ func TestPrepareLocalWorktreeRejectsRepoWithoutCommits(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no commit") {
 		t.Errorf("error should explain the missing commit, got: %v", err)
+	}
+}
+
+// The daemon must work with the git binary it actually resolves. Git 2.15
+// refuses a fetch by raw object ID when the snapshot is not advertised.
+func TestPrepareLocalWorktreeCopiesUnadvertisedSnapshotWithResolvedGit(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, filepath.Join(repo, "tracked.txt"), "edited by user\n")
+
+	wt := prepareForTest(t, repo)
+	if got := readFile(t, filepath.Join(wt.Path, "tracked.txt")); got != "edited by user\n" {
+		t.Errorf("standalone checkout missed the user snapshot: %q", got)
 	}
 }
 
@@ -532,7 +554,7 @@ func TestPrepareLocalWorktreePrunesStaleRegistrations(t *testing.T) {
 		t.Fatalf("resolve orphan env root: %v", err)
 	}
 	orphan := filepath.Join(orphanEnv, "dead-task")
-	gitRun(t, repo, "worktree", "add", "--quiet", "--detach", orphan)
+	gitRun(t, repo, "worktree", "add", "--detach", orphan)
 	// Simulate the crash: the directory disappears with GC, the registration
 	// survives in the user's repo.
 	if err := os.RemoveAll(orphan); err != nil {
@@ -558,6 +580,46 @@ func finalizeOK(t *testing.T, wt *LocalWorktree) LocalWorktreeOutcome {
 		t.Fatalf("Finalize: %v", err)
 	}
 	return outcome
+}
+
+func TestFinalizeKeepsBranchExclusiveWhenStandaloneRemovalFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not reliably reject removal on Windows")
+	}
+	repo := newTestRepo(t)
+	first := prepareTurn(t, repo, "MUL-cleanup", turnOneTask)
+	writeFile(t, filepath.Join(first.Path, "agent.txt"), "work survives cleanup failure\n")
+
+	parent := filepath.Dir(first.Path)
+	info, err := os.Stat(parent)
+	if err != nil {
+		t.Fatalf("stat worktree parent: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(parent, info.Mode().Perm())
+		first.clearStandaloneBranchActive()
+		_ = os.RemoveAll(first.Path)
+	})
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("make worktree parent non-removable: %v", err)
+	}
+
+	outcome, err := first.Finalize(worktreeTestLogger())
+	if err == nil {
+		t.Fatal("Finalize succeeded although the standalone checkout could not be removed")
+	}
+	if outcome.PreservedPath != first.Path {
+		t.Fatalf("PreservedPath = %q, want %q", outcome.PreservedPath, first.Path)
+	}
+	if _, err := os.Stat(first.Path); err != nil {
+		t.Fatalf("standalone checkout was not preserved: %v", err)
+	}
+
+	second := prepareTurn(t, repo, "MUL-cleanup", turnTwoTask)
+	if second.Branch == first.Branch {
+		t.Fatalf("second turn reused preserved checkout branch %q", first.Branch)
+	}
+	finalizeOK(t, second)
 }
 
 // The one operation in this flow that can destroy work is `git worktree remove
@@ -1213,7 +1275,7 @@ func TestPrepareLocalWorktreeRefusesToAdoptABranchItDoesNotOwn(t *testing.T) {
 
 	// The user made this branch themselves, with content of their own.
 	gitRun(t, repo, "branch", "agent/j/mul-6881")
-	gitRun(t, repo, "worktree", "add", "--quiet", filepath.Join(t.TempDir(), "theirs"), "agent/j/mul-6881")
+	gitRun(t, repo, "worktree", "add", filepath.Join(t.TempDir(), "theirs"), "agent/j/mul-6881")
 	userBranchDir := ""
 	for _, line := range strings.Split(gitRun(t, repo, "worktree", "list", "--porcelain"), "\n") {
 		if strings.HasPrefix(line, "worktree ") && strings.HasSuffix(line, "theirs") {
@@ -1226,7 +1288,7 @@ func TestPrepareLocalWorktreeRefusesToAdoptABranchItDoesNotOwn(t *testing.T) {
 	writeFile(t, filepath.Join(userBranchDir, "unrelated.txt"), "the user's own work\n")
 	gitRun(t, userBranchDir, "add", "-A")
 	gitRun(t, userBranchDir, "commit", "-m", "the user's own commit")
-	gitRun(t, repo, "worktree", "remove", "--force", userBranchDir)
+	removeTestWorktree(t, repo, userBranchDir)
 	userTip := gitRun(t, repo, "rev-parse", "agent/j/mul-6881")
 
 	first := prepareTurn(t, repo, "MUL-6881", turnOneTask)
@@ -1421,11 +1483,11 @@ func TestPrepareLocalWorktreeRefusesABranchDeletedAndRecreatedUnderTheSameName(t
 	gitRun(t, repo, "branch", "-D", "agent/j/mul-6881")
 	gitRun(t, repo, "branch", "agent/j/mul-6881")
 	theirs := t.TempDir()
-	gitRun(t, repo, "worktree", "add", "--quiet", filepath.Join(theirs, "wt"), "agent/j/mul-6881")
+	gitRun(t, repo, "worktree", "add", filepath.Join(theirs, "wt"), "agent/j/mul-6881")
 	writeFile(t, filepath.Join(theirs, "wt", "unrelated.txt"), "the user's own work\n")
 	gitRun(t, filepath.Join(theirs, "wt"), "add", "-A")
 	gitRun(t, filepath.Join(theirs, "wt"), "commit", "-m", "the user's own commit")
-	gitRun(t, repo, "worktree", "remove", "--force", filepath.Join(theirs, "wt"))
+	removeTestWorktree(t, repo, filepath.Join(theirs, "wt"))
 	userTip := gitRun(t, repo, "rev-parse", "agent/j/mul-6881")
 
 	second := prepareTurn(t, repo, "MUL-6881", turnTwoTask)
@@ -1551,11 +1613,11 @@ func TestFinalizeFailsWhenTheBranchRecordCannotBeWritten(t *testing.T) {
 	gitRun(t, repo, "branch", "-D", "agent/j/mul-6881")
 	gitRun(t, repo, "branch", "agent/j/mul-6881")
 	worktree := filepath.Join(t.TempDir(), "theirs")
-	gitRun(t, repo, "worktree", "add", "--quiet", worktree, "agent/j/mul-6881")
+	gitRun(t, repo, "worktree", "add", worktree, "agent/j/mul-6881")
 	writeFile(t, filepath.Join(worktree, "unrelated.txt"), "the user's own work\n")
 	gitRun(t, worktree, "add", "-A")
 	gitRun(t, worktree, "commit", "-m", "the user's own commit")
-	gitRun(t, repo, "worktree", "remove", "--force", worktree)
+	removeTestWorktree(t, repo, worktree)
 
 	second := prepareTurn(t, repo, "MUL-6881", turnTwoTask)
 	if second.Continued || second.Branch == "agent/j/mul-6881" {
@@ -1608,11 +1670,11 @@ func TestFinalizeRefusesToRecordADeliveryThatResetPastItsBaseline(t *testing.T) 
 	gitRun(t, repo, "branch", "-D", "agent/j/mul-6881")
 	gitRun(t, repo, "branch", "agent/j/mul-6881")
 	theirs := filepath.Join(t.TempDir(), "theirs")
-	gitRun(t, repo, "worktree", "add", "--quiet", theirs, "agent/j/mul-6881")
+	gitRun(t, repo, "worktree", "add", theirs, "agent/j/mul-6881")
 	writeFile(t, filepath.Join(theirs, "unrelated.txt"), "the user's own work\n")
 	gitRun(t, theirs, "add", "-A")
 	gitRun(t, theirs, "commit", "-m", "the user's own commit")
-	gitRun(t, repo, "worktree", "remove", "--force", theirs)
+	removeTestWorktree(t, repo, theirs)
 
 	second := prepareTurn(t, repo, "MUL-6881", turnTwoTask)
 	if second.Continued || second.Branch == "agent/j/mul-6881" {
@@ -1768,11 +1830,11 @@ func TestConflictAfterAUserCommitOnTheBranchStillOffersTheEditAgain(t *testing.T
 	// The user reviews the branch and commits on top of it — the documented,
 	// supported case. The branch tip now sits past the recorded checkpoint.
 	worktree := filepath.Join(t.TempDir(), "review")
-	gitRun(t, repo, "worktree", "add", "--quiet", worktree, "agent/j/mul-6881")
+	gitRun(t, repo, "worktree", "add", worktree, "agent/j/mul-6881")
 	writeFile(t, filepath.Join(worktree, "review.txt"), "the user's own commit on the branch\n")
 	gitRun(t, worktree, "add", "-A")
 	gitRun(t, worktree, "commit", "-m", "the user's tweak on the agent's branch")
-	gitRun(t, repo, "worktree", "remove", "--force", worktree)
+	removeTestWorktree(t, repo, worktree)
 	movedTip := gitRun(t, repo, "rev-parse", "agent/j/mul-6881")
 
 	// And in their own directory they rewrite the same line the agent did, so
