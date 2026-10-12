@@ -149,6 +149,37 @@ func prepareForTest(t *testing.T, localPath string) *LocalWorktree {
 	return wt
 }
 
+// A task checkout may be mounted into a container without any other host
+// paths. Its git metadata must therefore live inside the checkout rather than
+// pointing at the user's repository through a linked-worktree .git file.
+func TestPrepareLocalWorktreeGitMetadataIsSelfContained(t *testing.T) {
+	t.Parallel()
+	repo := newTestRepo(t)
+	wt := prepareForTest(t, repo)
+
+	info, err := os.Stat(filepath.Join(wt.Path, ".git"))
+	if err != nil {
+		t.Fatalf("stat task git metadata: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("task .git is not a directory")
+	}
+
+	moved := repo + "-moved"
+	if err := os.Rename(repo, moved); err != nil {
+		t.Fatalf("hide host repository: %v", err)
+	}
+	if got := gitRun(t, wt.Path, "rev-parse", "--show-toplevel"); got != wt.Path {
+		t.Fatalf("task git root = %q, want %q", got, wt.Path)
+	}
+	writeFile(t, filepath.Join(wt.Path, "container-change.txt"), "works without the host repo\n")
+	gitRun(t, wt.Path, "add", "container-change.txt")
+	gitRun(t, wt.Path, "commit", "-m", "container change")
+	if got := gitRun(t, wt.Path, "status", "--porcelain"); got != "" {
+		t.Fatalf("task checkout is dirty after commit: %q", got)
+	}
+}
+
 // Nothing may write inside a repo this package hands to a test while the test
 // is reading it, and git's auto maintenance is the one writer tests do not
 // spawn themselves: it runs detached, outliving the command that started it.
@@ -558,10 +589,6 @@ func TestFinalizeKeepsWorktreeWhenCommitFails(t *testing.T) {
 	if got := readFile(t, filepath.Join(wt.Path, "agent-output.txt")); got != "irreplaceable work\n" {
 		t.Errorf("agent work was destroyed despite the commit failure, got %q", got)
 	}
-	// And it stays discoverable through git rather than only a log line.
-	if list := gitRun(t, repo, "worktree", "list"); !strings.Contains(list, wt.Path) {
-		t.Errorf("preserved worktree is no longer registered, so the user cannot find it:\n%s", list)
-	}
 	if !strings.Contains(err.Error(), wt.Path) {
 		t.Errorf("error should name the preserved path, got: %v", err)
 	}
@@ -737,9 +764,6 @@ func TestFinalizeAbortRefusesToCommitAndKeepsWorktree(t *testing.T) {
 	// And the work is still recoverable on disk.
 	if got := readFile(t, filepath.Join(wt.Path, "agent-output.txt")); got != "real work\n" {
 		t.Errorf("agent work was destroyed: %q", got)
-	}
-	if list := gitRun(t, repo, "worktree", "list"); !strings.Contains(list, wt.Path) {
-		t.Errorf("preserved worktree is no longer registered:\n%s", list)
 	}
 }
 

@@ -238,6 +238,30 @@ func TestRunRepoCheckoutForwardsManagedCheckoutMode(t *testing.T) {
 	}
 }
 
+func TestRunRepoCheckoutUsesDaemonVisibleTaskWorkdir(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode checkout body: %v", err)
+		}
+		json.NewEncoder(w).Encode(map[string]string{"path": "/host/task", "branch_name": "agent/test/task"})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_DAEMON_PORT", strings.TrimPrefix(srv.URL, "http://127.0.0.1:"))
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TASK_ID", "task-1")
+	t.Setenv("MULTICA_TOKEN", "mat_repo_checkout_test")
+	t.Setenv("MULTICA_TASK_HOST_WORKDIR", "/host/task")
+
+	if err := runRepoCheckout(&cobra.Command{}, []string{"https://github.com/org/repo.git"}); err != nil {
+		t.Fatalf("runRepoCheckout: %v", err)
+	}
+	if got := body["workdir"]; got != "/host/task" {
+		t.Fatalf("workdir = %q, want daemon-visible task workdir", got)
+	}
+}
+
 func TestRepoCheckoutSummary(t *testing.T) {
 	t.Parallel()
 	const repoURL = "https://github.com/org/repo.git"

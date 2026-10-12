@@ -17,6 +17,9 @@ const (
 	// phase-one hardening keeps the real HOME/XDG environment available to
 	// provider tooling while preventing implicit Owner-profile discovery.
 	TaskConfigRootEnv = "MULTICA_TASK_CONFIG_ROOT"
+	// TaskHostWorkDirEnv is the daemon-visible task root. Sandboxed tools may
+	// see the same files at another path (for example /workspace in Docker).
+	TaskHostWorkDirEnv = "MULTICA_TASK_HOST_WORKDIR"
 )
 
 // CLIConfig holds persistent CLI settings.

@@ -361,6 +361,9 @@ func runRepoCheckout(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("get working directory: %w", err)
 	}
+	if hostWorkDir := strings.TrimSpace(os.Getenv(cli.TaskHostWorkDirEnv)); hostWorkDir != "" {
+		workDir = hostWorkDir
+	}
 
 	reqBody := map[string]any{
 		"url":           repoURL,

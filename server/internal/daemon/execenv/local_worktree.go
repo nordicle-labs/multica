@@ -149,6 +149,9 @@ type LocalWorktree struct {
 	WorkDir string
 	// Branch is the branch created for this task, in the user's repo.
 	Branch string
+	// Standalone reports that Path owns its .git directory. Container runtimes
+	// can mount Path alone without inheriting host-only gitdir pointers.
+	Standalone bool
 	// BaseCommit is the commit the worktree started from — this turn's baseline
 	// when one was committed, otherwise the branch tip it continued. Finalize
 	// compares the delivered tip against it twice: to decide whether the task
@@ -399,6 +402,13 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 		// was busy is delivered once and never continued, so it records nothing.
 		tracksState: plan.tracksState && actualBranch == plan.name,
 	}
+	if err := wt.makeStandalone(logger); err != nil {
+		wt.removePath(logger)
+		if createdBranch {
+			dropBranch(gitRoot, actualBranch, logger)
+		}
+		return nil, err
+	}
 
 	// Tear the worktree back down on every failure below. A half-replayed tree
 	// is the worst outcome available: it looks like a working checkout, so
@@ -408,7 +418,7 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// it because THIS turn could not start would destroy the very thing the
 	// task was meant to build on.
 	rollback := func() {
-		removeLocalWorktreeDir(gitRoot, worktreePath, logger)
+		wt.removePath(logger)
 		if createdBranch {
 			dropBranch(gitRoot, actualBranch, logger)
 		}
@@ -470,6 +480,10 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 			// The branch now stands on a commit that carries this turn's snapshot,
 			// and everything downstream measures the delivery against it.
 			wt.BaseCommit = baseline
+		}
+		if err := wt.syncStandaloneBranch(); err != nil {
+			rollback()
+			return nil, fmt.Errorf("execenv: publish prepared task branch %s: %w", wt.Branch, err)
 		}
 		// The branch now carries this snapshot, so record it — together with the
 		// owner, which is what lets the next task prove this branch is its own
@@ -555,8 +569,8 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 				"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "error", w.aborted)
 		}
 		return outcome, fmt.Errorf(
-			"refusing to deliver branch %s: %w; the task worktree is preserved at %s (listed by `git worktree list` in %s)",
-			w.Branch, w.aborted, w.Path, w.GitRoot)
+			"refusing to deliver branch %s: %w; the standalone task checkout is preserved at %s",
+			w.Branch, w.aborted, w.Path)
 	}
 
 	// An unresolved merge is never committed. The worktree may be carrying the
@@ -579,9 +593,9 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 		}
 		return outcome, fmt.Errorf(
 			"refusing to deliver branch %s: your local edits to %s are still unmerged in the task worktree; "+
-				"the worktree is preserved at %s (listed by `git worktree list` in %s) — resolve the conflict there, "+
+				"the standalone task checkout is preserved at %s — resolve the conflict there, "+
 				"or re-run the task and let the agent finish the merge",
-			w.Branch, quotedPaths(unmerged), w.Path, w.GitRoot)
+			w.Branch, quotedPaths(unmerged), w.Path)
 	}
 
 	// Treat "can't tell" like "dirty": committing costs an empty commit at
@@ -603,8 +617,8 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 					"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "error", err)
 			}
 			return outcome, fmt.Errorf(
-				"could not commit the agent's changes to branch %s: %w; the work is preserved in the worktree at %s (listed by `git worktree list` in %s) — recover it before that directory is reclaimed",
-				w.Branch, err, w.Path, w.GitRoot)
+				"could not commit the agent's changes to branch %s: %w; the work is preserved in the standalone task checkout at %s — recover it before that directory is reclaimed",
+				w.Branch, err, w.Path)
 		}
 		outcome.AutoCommitted = committed
 	}
@@ -637,8 +651,8 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 			outcome.PreservedPath = w.Path
 			return outcome, fmt.Errorf(
 				"refusing to record branch %s: the merge with your local edits was never concluded and this branch has no earlier "+
-					"state to fall back on; the task worktree is preserved at %s (listed by `git worktree list` in %s)",
-				w.Branch, w.Path, w.GitRoot)
+					"state to fall back on; the standalone task checkout is preserved at %s",
+				w.Branch, w.Path)
 		}
 		if logger != nil {
 			logger.Info("execenv: the run concluded its merge without committing; keeping the branch's previous recorded state so the edits are offered again",
@@ -662,9 +676,15 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 					"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "tip", tip, "base", w.BaseCommit, "error", verifyErr)
 			}
 			return outcome, fmt.Errorf(
-				"refusing to record branch %s: %w; the task worktree is preserved at %s (listed by `git worktree list` in %s) — "+
+				"refusing to record branch %s: %w; the standalone task checkout is preserved at %s — "+
 					"recover the work from there, and let the run keep the commit the worktree started from instead of resetting past it",
-				w.Branch, verifyErr, w.Path, w.GitRoot)
+				w.Branch, verifyErr, w.Path)
+		}
+		if syncErr := w.syncStandaloneBranch(); syncErr != nil {
+			outcome.Branch = ""
+			outcome.PreservedPath = w.Path
+			return outcome, fmt.Errorf("could not publish standalone task branch %s: %w; the task checkout is preserved at %s",
+				w.Branch, syncErr, w.Path)
 		}
 		if recErr := w.recordState(tip, logger); recErr != nil {
 			outcome.PreservedPath = w.Path
@@ -674,13 +694,13 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, err
 			}
 			return outcome, fmt.Errorf(
 				"could not record branch %s as this conversation's: %w; the work is committed to that branch and the "+
-					"task worktree is preserved at %s (listed by `git worktree list` in %s) — a follow-up run will start "+
+					"standalone task checkout is preserved at %s — a follow-up run will start "+
 					"a new branch instead of continuing this one",
-				w.Branch, recErr, w.Path, w.GitRoot)
+				w.Branch, recErr, w.Path)
 		}
 	}
 
-	if removeErr := removeLocalWorktreeDir(w.GitRoot, w.Path, logger); removeErr != nil {
+	if removeErr := w.removePath(logger); removeErr != nil {
 		outcome.PreservedPath = w.Path
 		return outcome, fmt.Errorf(
 			"could not remove finalized worktree for branch %s: %w; the task worktree remains at %s",
@@ -726,7 +746,7 @@ func (w *LocalWorktree) Discard(logger *slog.Logger) {
 		return
 	}
 	defer unlock()
-	removeLocalWorktreeDir(w.GitRoot, w.Path, logger)
+	w.removePath(logger)
 	// Same rule as every other teardown: a branch this prepare did not create
 	// belongs to the turns before it and outlives this task.
 	if w.createdBranch {
@@ -833,6 +853,189 @@ func worktreeIsDirty(worktreePath string) (bool, error) {
 		return false, fmt.Errorf("git status: %s: %w", strings.TrimSpace(out), err)
 	}
 	return strings.TrimSpace(out) != "", nil
+}
+
+// makeStandalone replaces the linked worktree with an ordinary clone at the
+// same path. A linked worktree's .git file names host-only administration
+// paths, so mounting only the task directory into a container makes Git fail.
+func (w *LocalWorktree) makeStandalone(logger *slog.Logger) error {
+	if w == nil || w.Path == "" {
+		return errors.New("execenv: standalone task checkout requires a path")
+	}
+	tmp := w.Path + ".standalone"
+	if err := os.RemoveAll(tmp); err != nil {
+		return fmt.Errorf("clear standalone checkout staging path: %w", err)
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(tmp)
+		}
+	}()
+
+	if out, err := runGit(w.GitRoot, "clone", "--no-local", "--branch", w.Branch, "--", w.GitRoot, tmp); err != nil {
+		return fmt.Errorf("execenv: clone standalone task checkout: %s: %w", strings.TrimSpace(out), err)
+	}
+	for _, object := range []string{w.userState, w.priorState} {
+		if object == "" {
+			continue
+		}
+		if out, err := runGit(tmp, "fetch", "--no-tags", w.GitRoot, object); err != nil {
+			return fmt.Errorf("execenv: copy task snapshot into standalone checkout: %s: %w", strings.TrimSpace(out), err)
+		}
+	}
+	if origin, err := runGitTrimmed(w.GitRoot, "config", "--get", "remote.origin.url"); err == nil && origin != "" {
+		if out, err := runGit(tmp, "remote", "set-url", "origin", origin); err != nil {
+			return fmt.Errorf("execenv: preserve task checkout origin: %s: %w", strings.TrimSpace(out), err)
+		}
+	} else {
+		_, _ = runGit(tmp, "remote", "remove", "origin")
+	}
+	if err := removeLocalWorktreeDir(w.GitRoot, w.Path, logger); err != nil {
+		return fmt.Errorf("execenv: detach linked task worktree: %w", err)
+	}
+	if err := os.Rename(tmp, w.Path); err != nil {
+		return fmt.Errorf("execenv: install standalone task checkout: %w", err)
+	}
+	cleanup = false
+	w.Standalone = true
+	if err := w.installStandaloneSyncHook(); err != nil {
+		return fmt.Errorf("execenv: install standalone task branch sync hook: %w", err)
+	}
+	if err := w.markStandaloneBranchActive(); err != nil {
+		return fmt.Errorf("execenv: mark standalone task branch active: %w", err)
+	}
+	return nil
+}
+
+func (w *LocalWorktree) installStandaloneSyncHook() error {
+	for key, value := range map[string]string{
+		"multica.hostRoot":   w.GitRoot,
+		"multica.hostBranch": w.Branch,
+	} {
+		if out, err := runGit(w.Path, "config", "--local", key, value); err != nil {
+			return fmt.Errorf("git config %s: %s: %w", key, strings.TrimSpace(out), err)
+		}
+	}
+	hook := `#!/bin/sh
+host=$(git config --local multica.hostRoot) || exit 0
+branch=$(git config --local multica.hostBranch) || exit 0
+root=$(git rev-parse --show-toplevel) || exit 0
+[ -d "$host" ] || exit 0
+[ "$(git symbolic-ref --quiet --short HEAD)" = "$branch" ] || exit 0
+tip=$(git rev-parse --verify HEAD) || exit 0
+previous=$(git rev-parse --verify "$tip^1") || exit 0
+ref="refs/heads/$branch"
+current=$(git -C "$host" rev-parse --verify "$ref") || exit 0
+[ "$current" = "$previous" ] || exit 0
+git -C "$host" fetch --no-tags "$root" "$tip" >/dev/null 2>&1 || exit 0
+git -C "$host" update-ref "$ref" "$tip" "$current" >/dev/null 2>&1 || exit 0
+exit 0
+`
+	return os.WriteFile(filepath.Join(w.Path, ".git", "hooks", "post-commit"), []byte(hook), 0o755)
+}
+
+// syncStandaloneBranch copies the standalone checkout's objects into the
+// user's repository, then advances only this task's branch with a compare-and-
+// swap. A concurrently moved branch fails closed instead of being overwritten.
+func (w *LocalWorktree) syncStandaloneBranch() error {
+	if w == nil || !w.Standalone {
+		return nil
+	}
+	tip, err := runGitTrimmed(w.Path, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return fmt.Errorf("resolve standalone checkout HEAD: %w", err)
+	}
+	ref := "refs/heads/" + w.Branch
+	current, err := runGitTrimmed(w.GitRoot, "rev-parse", "--verify", ref)
+	if err != nil {
+		return fmt.Errorf("resolve task branch %s: %w", w.Branch, err)
+	}
+	if current == tip {
+		return nil
+	}
+	if _, err := runGit(w.Path, "merge-base", "--is-ancestor", current, tip); err != nil {
+		return fmt.Errorf("task branch moved independently from %s to %s", shortID(w.BaseCommit), shortID(current))
+	}
+	if out, err := runGit(w.GitRoot, "fetch", "--no-tags", w.Path, tip); err != nil {
+		return fmt.Errorf("copy standalone checkout objects: %s: %w", strings.TrimSpace(out), err)
+	}
+	if out, err := runGit(w.GitRoot, "update-ref", ref, tip, current); err != nil {
+		return fmt.Errorf("advance task branch with compare-and-swap: %s: %w", strings.TrimSpace(out), err)
+	}
+	return nil
+}
+
+func (w *LocalWorktree) removePath(logger *slog.Logger) error {
+	if w == nil {
+		return nil
+	}
+	if !w.Standalone {
+		return removeLocalWorktreeDir(w.GitRoot, w.Path, logger)
+	}
+	w.clearStandaloneBranchActive()
+	if err := os.RemoveAll(w.Path); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(w.Path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("confirm standalone checkout removal: %w", err)
+	}
+	return errors.New("standalone checkout still exists after removal")
+}
+
+func standaloneBranchMarker(gitRoot, branch string) (string, error) {
+	common, err := runGitTrimmed(gitRoot, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(gitRoot, common)
+	}
+	sum := sha256.Sum256([]byte(branch))
+	return filepath.Join(common, "multica-active-worktrees", hex.EncodeToString(sum[:])), nil
+}
+
+func (w *LocalWorktree) markStandaloneBranchActive() error {
+	marker, err := standaloneBranchMarker(w.GitRoot, w.Branch)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(marker, []byte(w.Path), 0o600)
+}
+
+func (w *LocalWorktree) clearStandaloneBranchActive() {
+	marker, err := standaloneBranchMarker(w.GitRoot, w.Branch)
+	if err != nil {
+		return
+	}
+	path, err := os.ReadFile(marker)
+	if err == nil && strings.TrimSpace(string(path)) == w.Path {
+		_ = os.Remove(marker)
+	}
+}
+
+func standaloneBranchActive(gitRoot, branch string) bool {
+	marker, err := standaloneBranchMarker(gitRoot, branch)
+	if err != nil {
+		return true
+	}
+	path, err := os.ReadFile(marker)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	if _, err := os.Stat(strings.TrimSpace(string(path))); err == nil {
+		return true
+	}
+	_ = os.Remove(marker)
+	return false
 }
 
 // removeLocalWorktreeDir unregisters the worktree from the user's repo and
@@ -1280,6 +1483,13 @@ func branchOwnedBy(gitRoot, branch string, owner branchOwner, logger *slog.Logge
 // delivering onto a task-scoped branch. It forks from the same base, so the
 // sibling still stands on the conversation's latest work.
 func addLocalWorktree(gitRoot, worktreePath string, plan taskBranchPlan, taskID string) (string, bool, error) {
+	if standaloneBranchActive(gitRoot, plan.name) {
+		alt := plan.altName(taskID)
+		if out, err := runGit(gitRoot, "worktree", "add", "-b", alt, worktreePath, plan.base); err != nil {
+			return "", false, fmt.Errorf("execenv: git worktree add: %s: %w", strings.TrimSpace(out), err)
+		}
+		return alt, true, nil
+	}
 	var args []string
 	switch {
 	case plan.continues:
@@ -1438,7 +1648,16 @@ func (w *LocalWorktree) verifyDeliveryPoint(tip string) error {
 	if tip == "" {
 		return errors.New("the task worktree has no resolvable HEAD")
 	}
-	branchTip, err := runGitTrimmed(w.GitRoot, "rev-parse", "--verify", "refs/heads/"+w.Branch)
+	gitDir := w.GitRoot
+	if w.Standalone {
+		branch, err := runGitTrimmed(w.Path, "symbolic-ref", "--quiet", "--short", "HEAD")
+		if err != nil || branch != w.Branch {
+			return fmt.Errorf("the worktree delivered %s while not checked out on branch %s, so the run did not deliver onto its own branch",
+				shortID(tip), w.Branch)
+		}
+		gitDir = w.Path
+	}
+	branchTip, err := runGitTrimmed(gitDir, "rev-parse", "--verify", "refs/heads/"+w.Branch)
 	if err != nil {
 		return fmt.Errorf("resolve branch %s: %w", w.Branch, err)
 	}
@@ -1449,7 +1668,7 @@ func (w *LocalWorktree) verifyDeliveryPoint(tip string) error {
 	if w.BaseCommit == "" {
 		return fmt.Errorf("branch %s has no commit of this task's own to prove it by", w.Branch)
 	}
-	if _, err := runGit(w.GitRoot, "merge-base", "--is-ancestor", w.BaseCommit, tip); err != nil {
+	if _, err := runGit(gitDir, "merge-base", "--is-ancestor", w.BaseCommit, tip); err != nil {
 		return fmt.Errorf("the delivered commit %s no longer contains %s, the commit this turn started from",
 			shortID(tip), shortID(w.BaseCommit))
 	}
