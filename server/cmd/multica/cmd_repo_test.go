@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/spf13/cobra"
 )
 
@@ -252,13 +255,64 @@ func TestRunRepoCheckoutUsesDaemonVisibleTaskWorkdir(t *testing.T) {
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
 	t.Setenv("MULTICA_TASK_ID", "task-1")
 	t.Setenv("MULTICA_TOKEN", "mat_repo_checkout_test")
-	t.Setenv("MULTICA_TASK_HOST_WORKDIR", "/host/task")
+	visibleRoot := t.TempDir()
+	markerPath := filepath.Join(visibleRoot, execenv.TaskContextMarkerRelPath)
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
+		t.Fatalf("create marker directory: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte(`{"managed_by":"`+execenv.TaskContextMarkerManagedBy+`"}`), 0o644); err != nil {
+		t.Fatalf("write task marker: %v", err)
+	}
+	child := filepath.Join(visibleRoot, "services", "api")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("create child workdir: %v", err)
+	}
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get cwd: %v", err)
+	}
+	if err := os.Chdir(child); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	hostRoot := filepath.Join(t.TempDir(), "host-task")
+	t.Setenv("MULTICA_TASK_HOST_WORKDIR", hostRoot)
 
 	if err := runRepoCheckout(&cobra.Command{}, []string{"https://github.com/org/repo.git"}); err != nil {
 		t.Fatalf("runRepoCheckout: %v", err)
 	}
-	if got := body["workdir"]; got != "/host/task" {
-		t.Fatalf("workdir = %q, want daemon-visible task workdir", got)
+	want := filepath.Join(hostRoot, "services", "api")
+	if got := body["workdir"]; got != want {
+		t.Fatalf("workdir = %q, want daemon-visible child workdir %q", got, want)
+	}
+}
+
+func TestMapRepoCheckoutWorkDir(t *testing.T) {
+	root := t.TempDir()
+	visibleRoot := filepath.Join(root, "visible")
+	hostRoot := filepath.Join(root, "host")
+	for _, tc := range []struct {
+		name        string
+		hostRoot    string
+		visibleRoot string
+		cwd         string
+		want        string
+		wantErr     bool
+	}{
+		{name: "root", hostRoot: hostRoot, visibleRoot: visibleRoot, cwd: visibleRoot, want: hostRoot},
+		{name: "subdirectory", hostRoot: hostRoot, visibleRoot: visibleRoot, cwd: filepath.Join(visibleRoot, "a", "b"), want: filepath.Join(hostRoot, "a", "b")},
+		{name: "same path space", hostRoot: visibleRoot, visibleRoot: visibleRoot, cwd: filepath.Join(visibleRoot, "a"), want: filepath.Join(visibleRoot, "a")},
+		{name: "escape", hostRoot: hostRoot, visibleRoot: visibleRoot, cwd: filepath.Join(root, "outside"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := mapRepoCheckoutWorkDir(tc.hostRoot, tc.visibleRoot, tc.cwd)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("mapRepoCheckoutWorkDir() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Fatalf("mapRepoCheckoutWorkDir() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

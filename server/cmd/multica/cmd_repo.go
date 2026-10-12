@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -340,6 +341,36 @@ func runRepoRemove(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func repoCheckoutWorkDir() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+	hostRoot := strings.TrimSpace(os.Getenv(cli.TaskHostWorkDirEnv))
+	if hostRoot == "" {
+		return cwd, nil
+	}
+	if mapped, err := mapRepoCheckoutWorkDir(hostRoot, hostRoot, cwd); err == nil {
+		return mapped, nil
+	}
+	markerPath := daemonTaskContextMarkerPath()
+	if markerPath == "" {
+		return "", fmt.Errorf("map checkout working directory: current directory %q is outside daemon-visible task root %q and no task marker identifies its visible root", cwd, hostRoot)
+	}
+	return mapRepoCheckoutWorkDir(hostRoot, filepath.Dir(filepath.Dir(markerPath)), cwd)
+}
+
+func mapRepoCheckoutWorkDir(hostRoot, visibleRoot, cwd string) (string, error) {
+	rel, err := filepath.Rel(filepath.Clean(visibleRoot), filepath.Clean(cwd))
+	if err != nil {
+		return "", fmt.Errorf("map checkout working directory: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("map checkout working directory: %q escapes visible task root %q", cwd, visibleRoot)
+	}
+	return filepath.Join(filepath.Clean(hostRoot), rel), nil
+}
+
 func runRepoCheckout(cmd *cobra.Command, args []string) error {
 	repoURL := args[0]
 
@@ -356,13 +387,9 @@ func runRepoCheckout(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("MULTICA_TOKEN not set (repo checkout requires the active task credential)")
 	}
 
-	// Use current working directory as the checkout target.
-	workDir, err := os.Getwd()
+	workDir, err := repoCheckoutWorkDir()
 	if err != nil {
-		return fmt.Errorf("get working directory: %w", err)
-	}
-	if hostWorkDir := strings.TrimSpace(os.Getenv(cli.TaskHostWorkDirEnv)); hostWorkDir != "" {
-		workDir = hostWorkDir
+		return err
 	}
 
 	reqBody := map[string]any{

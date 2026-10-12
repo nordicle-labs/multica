@@ -1048,7 +1048,7 @@ func standaloneBranchActive(gitRoot, branch string) bool {
 	if err != nil {
 		return true
 	}
-	if _, err := os.Stat(strings.TrimSpace(string(path))); err == nil {
+	if _, err := os.Stat(strings.TrimSpace(string(path))); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return true
 	}
 	_ = os.Remove(marker)

@@ -622,6 +622,41 @@ func TestFinalizeKeepsBranchExclusiveWhenStandaloneRemovalFails(t *testing.T) {
 	finalizeOK(t, second)
 }
 
+func TestPrepareLocalWorktreeKeepsInaccessibleStandaloneBranchExclusive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not reliably reject traversal on Windows")
+	}
+	repo := newTestRepo(t)
+	first := prepareTurn(t, repo, "MUL-inaccessible", turnOneTask)
+	writeFile(t, filepath.Join(first.Path, "agent.txt"), "work survives cleanup failure\n")
+	parent := filepath.Dir(first.Path)
+	info, err := os.Stat(parent)
+	if err != nil {
+		t.Fatalf("stat worktree parent: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(parent, info.Mode().Perm())
+		first.clearStandaloneBranchActive()
+		_ = os.RemoveAll(first.Path)
+	})
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("make worktree parent non-removable: %v", err)
+	}
+	outcome, err := first.Finalize(worktreeTestLogger())
+	if err == nil || outcome.PreservedPath != first.Path {
+		t.Fatalf("Finalize outcome = %+v, error = %v; want preserved checkout", outcome, err)
+	}
+	if err := os.Chmod(parent, 0); err != nil {
+		t.Fatalf("make preserved checkout inaccessible: %v", err)
+	}
+
+	second := prepareTurn(t, repo, "MUL-inaccessible", turnTwoTask)
+	if second.Branch == first.Branch {
+		t.Fatalf("second turn reused inaccessible standalone checkout branch %q", first.Branch)
+	}
+	finalizeOK(t, second)
+}
+
 // The one operation in this flow that can destroy work is `git worktree remove
 // --force`. If the agent's changes could not be committed, removing the
 // worktree would delete the only copy — so Finalize must keep it and say so.
