@@ -1720,6 +1720,59 @@ func TestCreateWorktreePathCollisionDoesNotLeakBranch(t *testing.T) {
 	}
 }
 
+func TestCreateUniqueTaskBranchClassifiesArbitraryErrorByExactRef(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	const branch = "agent/test-agent/localized-collision"
+	runGitAuthored(t, repo, "branch", branch, gitHead(t, repo))
+
+	attempts := 0
+	got, err := createUniqueTaskBranch(context.Background(), repo, branch, func(candidate string) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("erreur Git localisée arbitraire")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("createUniqueTaskBranch failed: %v", err)
+	}
+	if attempts != 2 || got == branch {
+		t.Fatalf("attempts = %d, branch = %q; want one exact-ref retry", attempts, got)
+	}
+}
+
+func TestCreateUniqueTaskBranchPreservesErrorWhenExactRefIsAbsent(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	wantErr := errors.New("unrelated Git failure")
+	attempts := 0
+
+	_, err := createUniqueTaskBranch(context.Background(), repo, "agent/test-agent/no-ref", func(string) error {
+		attempts++
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) || attempts != 1 {
+		t.Fatalf("error = %v, attempts = %d; want original error after one attempt", err, attempts)
+	}
+}
+
+func TestCreateUniqueTaskBranchPreservesCancellation(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts := 0
+
+	_, err := createUniqueTaskBranch(ctx, repo, "agent/test-agent/cancelled", func(string) error {
+		attempts++
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) || attempts != 1 {
+		t.Fatalf("error = %v, attempts = %d; want cancellation after one attempt", err, attempts)
+	}
+}
+
 func TestCheckoutNewBranchHandlesRepeatedBranchCollisions(t *testing.T) {
 	t.Parallel()
 	repo := createTestRepo(t)

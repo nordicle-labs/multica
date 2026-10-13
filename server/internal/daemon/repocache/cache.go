@@ -1417,7 +1417,7 @@ func checkoutNewBranch(repoPath, branchName, baseRef string) (string, error) {
 }
 
 func checkoutNewBranchContext(ctx context.Context, repoPath, branchName, baseRef string) (string, error) {
-	return createUniqueTaskBranch(branchName, func(candidate string) error {
+	return createUniqueTaskBranch(ctx, repoPath, branchName, func(candidate string) error {
 		out, err := runGitCombinedOutputContext(ctx, "-C", repoPath, "checkout", "-b", candidate, baseRef)
 		if err != nil {
 			return fmt.Errorf("git checkout -b: %s: %w", strings.TrimSpace(string(out)), err)
@@ -1426,7 +1426,7 @@ func checkoutNewBranchContext(ctx context.Context, repoPath, branchName, baseRef
 	})
 }
 
-func createUniqueTaskBranch(branchName string, create func(string) error) (string, error) {
+func createUniqueTaskBranch(ctx context.Context, repoPath, branchName string, create func(string) error) (string, error) {
 	candidate := branchName
 	suffix := time.Now().Unix()
 	for {
@@ -1434,7 +1434,7 @@ func createUniqueTaskBranch(branchName string, create func(string) error) (strin
 		if err == nil {
 			return candidate, nil
 		}
-		if !isBranchCollisionError(err) {
+		if !gitBranchExistsContext(ctx, repoPath, candidate) {
 			return "", err
 		}
 		candidate = fmt.Sprintf("%s-%d", branchName, suffix)
@@ -1492,7 +1492,7 @@ func createWorktreeContext(ctx context.Context, gitRoot, worktreePath, branchNam
 		return "", fmt.Errorf("worktree path already exists and is not a valid git worktree: %s", worktreePath)
 	}
 
-	return createUniqueTaskBranch(branchName, func(candidate string) error {
+	return createUniqueTaskBranch(ctx, gitRoot, branchName, func(candidate string) error {
 		return runWorktreeAddContext(ctx, gitRoot, worktreePath, candidate, baseRef)
 	})
 }
@@ -1508,18 +1508,8 @@ func runWorktreeAddContext(ctx context.Context, gitRoot, worktreePath, branchNam
 	return nil
 }
 
-// isBranchCollisionError returns true if err is specifically about a branch
-// name already existing. Git's other "already exists" messages (notably path
-// collisions from `git worktree add`) must NOT be treated as branch
-// collisions, or the retry-with-timestamp logic will leak branches while
-// still failing on the original path collision.
-func isBranchCollisionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	// Git's message is "fatal: a branch named 'X' already exists".
-	return strings.Contains(msg, "a branch named")
+func gitBranchExistsContext(ctx context.Context, repoPath, branchName string) bool {
+	return runGitContext(ctx, "-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName) == nil
 }
 
 // isGitWorktree checks if a path is an existing git worktree.
@@ -1655,20 +1645,7 @@ func updateExistingWorktreeContext(ctx context.Context, worktreePath, branchName
 	// "refs/remotes/origin/<branch>" but may be "refs/heads/<branch>" on a
 	// legacy/migration-pending cache. Either form is valid as a checkout
 	// startpoint.
-	out, err := runGitCombinedOutputContext(ctx, "-C", worktreePath, "checkout", "-b", branchName, baseRef)
-	if err == nil {
-		return branchName, nil
-	}
-	wrapped := fmt.Errorf("git checkout -b: %s: %w", strings.TrimSpace(string(out)), err)
-	if !isBranchCollisionError(wrapped) {
-		return "", wrapped
-	}
-	// Branch name collision: append timestamp and retry once.
-	branchName = fmt.Sprintf("%s-%d", branchName, time.Now().Unix())
-	if out2, err2 := runGitCombinedOutputContext(ctx, "-C", worktreePath, "checkout", "-b", branchName, baseRef); err2 != nil {
-		return "", fmt.Errorf("git checkout -b (retry): %s: %w", strings.TrimSpace(string(out2)), err2)
-	}
-	return branchName, nil
+	return checkoutNewBranchContext(ctx, worktreePath, branchName, baseRef)
 }
 
 // getRemoteDefaultBranch returns a ref path (e.g. "refs/remotes/origin/main")
