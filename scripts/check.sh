@@ -69,6 +69,10 @@ wait_for_port() {
   echo "    $name ready (${elapsed}s)"
 }
 
+echo "==> Checking E2E service ports..."
+bash scripts/check-e2e-preflight.sh || { EXIT_CODE=1; exit 1; }
+bash scripts/check-e2e-preflight.test.sh || { EXIT_CODE=1; exit 1; }
+
 # --------------------------------------------------------------------------
 # Step 0: Ensure DB
 # --------------------------------------------------------------------------
@@ -102,30 +106,22 @@ echo "==> Running database migrations..."
 bash scripts/test-go.sh || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
-# Step 4: Start services for E2E (only if not already running)
+# Step 4: Start services for E2E
 # --------------------------------------------------------------------------
 echo ""
 echo "==> [4/5] Starting services for E2E..."
 
-if curl -sf "http://localhost:${PORT}/health" > /dev/null 2>&1; then
-  echo "    Backend already running on :$PORT"
-else
-  echo "    Starting backend..."
-  (cd server && go run ./cmd/server) > /tmp/multica-check-backend.log 2>&1 &
-  BACKEND_PID=$!
-  STARTED_BACKEND=true
-  wait_for_port "$PORT" "Backend" 90 "/health"
-fi
+echo "    Starting backend..."
+(cd server && go run ./cmd/server) > /tmp/multica-check-backend.log 2>&1 &
+BACKEND_PID=$!
+STARTED_BACKEND=true
+wait_for_port "$PORT" "Backend" 90 "/health"
 
-if curl -sf "http://localhost:${FRONTEND_PORT}" > /dev/null 2>&1; then
-  echo "    Frontend already running on :$FRONTEND_PORT"
-else
-  echo "    Starting frontend..."
-  pnpm dev:web > /tmp/multica-check-frontend.log 2>&1 &
-  FRONTEND_PID=$!
-  STARTED_FRONTEND=true
-  wait_for_port "$FRONTEND_PORT" "Frontend" 120 "/"
-fi
+echo "    Starting frontend..."
+pnpm dev:web > /tmp/multica-check-frontend.log 2>&1 &
+FRONTEND_PID=$!
+STARTED_FRONTEND=true
+wait_for_port "$FRONTEND_PORT" "Frontend" 120 "/"
 
 # --------------------------------------------------------------------------
 # Step 5: E2E tests (Playwright)
