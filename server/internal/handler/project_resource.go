@@ -966,11 +966,9 @@ func (c claimProjectContext) applyTo(resp *AgentTaskResponse) {
 //     deleted, or points outside this workspace, and the claim degrades to
 //     workspace context.
 //
-// Repo precedence: project-bound github_repo resources override workspace repos
-// when present. Mixing both would just confuse the agent — if a project
-// explicitly attached its repos, those are the authoritative set. With no
-// project, no github_repo resources, or a stale reference, the workspace repos
-// are the fallback.
+// Repo precedence: an existing project owns its repository scope. Its
+// github_repo resources are authoritative, including an empty set. Only no
+// project or a stale reference falls back to workspace repos.
 func (h *Handler) resolveClaimProjectContext(ctx context.Context, projectID, workspaceID pgtype.UUID) (claimProjectContext, error) {
 	var out claimProjectContext
 
@@ -1000,7 +998,7 @@ func (h *Handler) resolveClaimProjectContext(ctx context.Context, projectID, wor
 		}
 	}
 
-	if len(out.Repos) > 0 {
+	if out.ProjectID != "" {
 		return out, nil
 	}
 

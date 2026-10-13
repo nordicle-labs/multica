@@ -97,6 +97,94 @@ type claimProjectFields struct {
 	ProjectResources    []ProjectResourceData `json:"project_resources"`
 }
 
+func TestClaimTask_ExistingProjectWithoutGitHubRepoDoesNotUseWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "https://github.com/first-owner/first-repo"},
+		{"url": "https://github.com/second-owner/second-repo"},
+	})
+	projectID := dbfx.Project(t, "Local-only project")
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id":    projectID,
+		"workspace_id":  testWorkspaceID,
+		"resource_type": "local_directory",
+		"resource_ref":  `{"daemon_id":"local-daemon","local_path":"/srv/local-only","execution_mode":"in_place"}`,
+		"position":      0,
+	})
+
+	var agentID, runtimeID string
+	dbfx.QueryRow(t,
+		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
+		testWorkspaceID,
+	).Scan(&agentID, &runtimeID)
+	issueID := dbfx.Issue(t, "issue in a local-only project", testutil.Cols{
+		"project_id": projectID,
+		"priority":   "medium",
+		"number":     88100,
+	})
+	dbfx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": issueID})
+
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
+		testWorkspaceID, "test-claim-local-only-project")
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req = withURLParam(req, "runtimeId", runtimeID)
+	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
+
+	var resp struct {
+		Task *claimProjectFields `json:"task"`
+	}
+	w.JSON(&resp)
+	if resp.Task == nil {
+		t.Fatal("expected task in response")
+	}
+	if resp.Task.ProjectID != projectID || len(resp.Task.ProjectResources) != 1 {
+		t.Fatalf("project context = %+v, want local-only project %s", resp.Task, projectID)
+	}
+	if len(resp.Task.Repos) != 0 {
+		t.Fatalf("repos = %+v, want none for an existing project without github_repo resources", resp.Task.Repos)
+	}
+	if resp.Task.GitHubCredentialAck != "" {
+		t.Fatalf("github credential plan = %q, want none", resp.Task.GitHubCredentialAck)
+	}
+}
+
+func TestResolveClaimProjectContext_NoProjectUsesWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setHandlerTestWorkspaceRepos(t, []map[string]string{{"url": localFallbackRepoURL}})
+
+	got, err := testHandler.resolveClaimProjectContext(context.Background(), db.Project{}.ID, parseUUID(testWorkspaceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 1 || got.Repos[0].URL != localFallbackRepoURL {
+		t.Fatalf("repos = %+v, want workspace fallback", got.Repos)
+	}
+}
+
+func TestResolveClaimProjectContext_StaleProjectUsesWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setHandlerTestWorkspaceRepos(t, []map[string]string{{"url": localFallbackRepoURL}})
+
+	got, err := testHandler.resolveClaimProjectContext(
+		context.Background(),
+		parseUUID("00000000-0000-0000-0000-000000000001"),
+		parseUUID(testWorkspaceID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 1 || got.Repos[0].URL != localFallbackRepoURL {
+		t.Fatalf("repos = %+v, want workspace fallback", got.Repos)
+	}
+}
+
 // An issue whose project_id points at another workspace's project must degrade
 // to workspace context. Before MUL-6547 the issue branch used GetProject, which
 // has no workspace predicate, so the foreign project's title, description,

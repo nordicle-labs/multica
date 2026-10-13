@@ -2224,58 +2224,6 @@ func TestClaimTask_QuickCreateInjectsProjectDescription(t *testing.T) {
 	}
 }
 
-// When the issue's project has no github_repo resources, the claim handler
-// must fall back to workspace repos (the pre-override behavior).
-func TestClaimTask_ProjectWithoutRepos_FallsBackToWorkspaceRepos(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-
-	setHandlerTestWorkspaceRepos(t, []map[string]string{
-		{"url": "https://github.com/example/workspace-fallback", "description": "ws"},
-	})
-	setupGitHubClaimTestBroker(t, "https://github.com/example/workspace-fallback")
-
-	projectID := dbfx.Project(t, "Claim project without repos")
-
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
-
-	issueID := dbfx.Issue(t, "no project repos", testutil.Cols{
-		"project_id": projectID,
-		"priority":   "medium",
-		"number":     88002,
-	})
-
-	dbfx.Task(t, agentID, testutil.Cols{
-		"runtime_id": runtimeID,
-		"issue_id":   issueID,
-	})
-
-	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-fallback")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
-	req = withURLParam(req, "runtimeId", runtimeID)
-	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
-
-	var resp struct {
-		Task *struct {
-			GitHubCredentialAck string     `json:"github_credential_ack"`
-			Repos               []RepoData `json:"repos"`
-		} `json:"task"`
-	}
-	w.JSON(&resp)
-	if resp.Task == nil {
-		t.Fatal("expected task in response")
-	}
-	if len(resp.Task.Repos) != 1 || !strings.HasSuffix(resp.Task.Repos[0].URL, "workspace-fallback") {
-		t.Fatalf("expected workspace fallback repo, got %+v", resp.Task.Repos)
-	}
-	completeGitHubClaimForTest(t, resp.Task.GitHubCredentialAck)
-}
-
 // Regression test for #1276: ClaimTaskByRuntime must populate both
 // workspace and project context for run_only autopilot tasks. Project context
 // is what lets the daemon select a bound local_directory and materialize the
