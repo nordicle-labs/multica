@@ -192,6 +192,8 @@ func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T)
 	oldRemote := githubRepositoryRemote
 	githubRepositoryRemote = func(string) string { return remote }
 	t.Cleanup(func() { githubRepositoryRemote = oldRemote })
+	tracePath := filepath.Join(t.TempDir(), "git-trace.log")
+	t.Setenv("GIT_TRACE", tracePath)
 
 	session, err := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "secret-never-logged"}})
 	if err != nil {
@@ -200,6 +202,13 @@ func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T)
 	remoteSHA, err := session.publish(context.Background(), work, "canonical", sha)
 	if err != nil || remoteSHA != sha {
 		t.Fatalf("publish = %q, %v; want %s", remoteSHA, err, sha)
+	}
+	trace, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(trace), "--force-with-lease=refs/heads/canonical:") || strings.Contains(string(trace), "secret-never-logged") {
+		t.Fatalf("git trace lacks lease or leaks token: %s", trace)
 	}
 }
 

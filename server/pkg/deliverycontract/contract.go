@@ -65,8 +65,10 @@ func (p CapabilityProfile) Hash() (string, error) {
 
 type Repository struct {
 	Git       bool   `json:"git"`
+	GitRoot   string `json:"git_root,omitempty"`
 	Branch    string `json:"branch,omitempty"`
 	CommitSHA string `json:"commit_sha,omitempty"`
+	TreeSHA   string `json:"tree_sha,omitempty"`
 	Worktree  bool   `json:"worktree"`
 }
 
@@ -120,8 +122,8 @@ func (p Preflight) Validate(profile CapabilityProfile) error {
 		}
 	}
 	if p.RepositoryRequired {
-		if !p.Repository.Git || !p.Repository.Worktree || strings.TrimSpace(p.Repository.Branch) == "" || !validSHA(p.Repository.CommitSHA) {
-			return errors.New("git repository, branch, commit SHA, and worktree are required")
+		if !p.Repository.Git || !p.Repository.Worktree || strings.TrimSpace(p.Repository.GitRoot) == "" || strings.TrimSpace(p.Repository.Branch) == "" || !validSHA(p.Repository.CommitSHA) || !validSHA(p.Repository.TreeSHA) {
+			return errors.New("git repository root, branch, commit SHA, tree SHA, and worktree are required")
 		}
 	}
 	if p.CanonicalBranch != "" {

@@ -12,21 +12,30 @@ import (
 )
 
 const (
-	recoveryManifestName = "manifest.json"
-	maxRecoveryManifests = 100
+	recoveryManifestName         = "manifest.json"
+	maxRecoveryManifests         = 100
+	PublicationPrepared          = "prepared"
+	PublicationCredentialMinted  = "credential_minted"
+	PublicationBranchPublished   = "branch_published"
+	PublicationPRReadBack        = "PR_read_back"
+	PublicationCredentialRevoked = "credential_revoked"
 )
 
 // RecoveryManifest is the non-secret durable journal written before provider
 // launch. A restart can preserve a finalized commit even if publication never
 // ran.
 type RecoveryManifest struct {
-	TaskID          string `json:"task_id"`
-	RuntimeID       string `json:"runtime_id,omitempty"`
-	GitRoot         string `json:"git_root"`
-	CanonicalBranch string `json:"canonical_branch"`
-	BaseSHA         string `json:"base_sha"`
-	ExpectedRefSHA  string `json:"expected_ref_sha"`
-	HeadSHA         string `json:"head_sha,omitempty"`
+	TaskID            string `json:"task_id"`
+	RuntimeID         string `json:"runtime_id,omitempty"`
+	GitRoot           string `json:"git_root"`
+	CanonicalBranch   string `json:"canonical_branch"`
+	BaseSHA           string `json:"base_sha"`
+	ExpectedRefSHA    string `json:"expected_ref_sha"`
+	HeadSHA           string `json:"head_sha,omitempty"`
+	PublicationPhase  string `json:"publication_phase"`
+	RemoteSHA         string `json:"remote_sha,omitempty"`
+	PullRequestNumber int    `json:"pull_request_number,omitempty"`
+	PullRequestURL    string `json:"pull_request_url,omitempty"`
 }
 
 func recoveryTaskDir(root, taskID string) (string, error) {
@@ -41,6 +50,43 @@ func WriteRecoveryManifest(root string, manifest RecoveryManifest) error {
 	return writeRecoveryManifest(root, manifest, func(file *os.File) error { return file.Sync() })
 }
 
+// AdvanceRecoveryManifest records non-secret publication evidence after each
+// completed side effect. The installation token is never part of the journal.
+func AdvanceRecoveryManifest(root, taskID, phase, remoteSHA string, prNumber int, prURL string) error {
+	dir, err := recoveryTaskDir(root, taskID)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, recoveryManifestName))
+	if err != nil {
+		return err
+	}
+	var manifest RecoveryManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return err
+	}
+	order := map[string]int{
+		PublicationPrepared: 0, PublicationCredentialMinted: 1,
+		PublicationBranchPublished: 2, PublicationPRReadBack: 3,
+		PublicationCredentialRevoked: 4,
+	}
+	current := manifest.PublicationPhase
+	if current == "" {
+		current = PublicationPrepared
+	}
+	if _, ok := order[phase]; !ok || order[phase] < order[current] || order[phase] > order[current]+1 {
+		return fmt.Errorf("invalid publication phase transition %s -> %s", current, phase)
+	}
+	manifest.PublicationPhase = phase
+	if remoteSHA != "" {
+		manifest.RemoteSHA = remoteSHA
+	}
+	if prNumber != 0 {
+		manifest.PullRequestNumber, manifest.PullRequestURL = prNumber, prURL
+	}
+	return WriteRecoveryManifest(root, manifest)
+}
+
 func writeRecoveryManifest(root string, manifest RecoveryManifest, syncFile func(*os.File) error) error {
 	dir, err := recoveryTaskDir(root, manifest.TaskID)
 	if err != nil {
@@ -48,6 +94,9 @@ func writeRecoveryManifest(root string, manifest RecoveryManifest, syncFile func
 	}
 	if manifest.GitRoot == "" || manifest.CanonicalBranch == "" || manifest.BaseSHA == "" || manifest.ExpectedRefSHA == "" {
 		return errors.New("recovery manifest requires repository, branch, base, and expected ref")
+	}
+	if manifest.PublicationPhase == "" {
+		manifest.PublicationPhase = PublicationPrepared
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create recovery manifest directory: %w", err)

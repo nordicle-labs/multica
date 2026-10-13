@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -45,17 +46,40 @@ func buildDeliveryPreflight(ctx context.Context, workDir string, repositoryRequi
 	if !repositoryRequired {
 		return report
 	}
-	report.Repository.Git = gitPreflight(ctx, workDir, "rev-parse", "--is-inside-work-tree") == "true"
-	report.Repository.Worktree = report.Repository.Git
-	report.Repository.Branch = gitPreflight(ctx, workDir, "branch", "--show-current")
-	report.Repository.CommitSHA = gitPreflight(ctx, workDir, "rev-parse", "HEAD")
+	report.Repository = deriveRepositoryDescriptor(ctx, workDir)
 	if worktree != nil {
+		report.Repository.GitRoot = worktree.GitRoot
 		report.Repository.Branch = worktree.Branch
 		report.CanonicalBranch = worktree.Branch
 		report.RunBaseSHA = worktree.BaseCommit
 		report.CanonicalRefSHA = worktree.CanonicalRefExpected
 	}
 	return report
+}
+
+// deriveRepositoryDescriptor is the single Git boundary for every repository
+// source, so no delivery evidence is accepted from provider output.
+func deriveRepositoryDescriptor(ctx context.Context, workDir string) deliverycontract.Repository {
+	git := gitPreflight(ctx, workDir, "rev-parse", "--is-inside-work-tree") == "true"
+	if !git {
+		return deliverycontract.Repository{}
+	}
+	return deliverycontract.Repository{
+		Git:       true,
+		GitRoot:   gitPreflight(ctx, workDir, "rev-parse", "--show-toplevel"),
+		Branch:    gitPreflight(ctx, workDir, "branch", "--show-current"),
+		CommitSHA: gitPreflight(ctx, workDir, "rev-parse", "HEAD"),
+		TreeSHA:   gitPreflight(ctx, workDir, "rev-parse", "HEAD^{tree}"),
+		Worktree:  true,
+	}
+}
+
+func finalizeRepositoryDelivery(ctx context.Context, workDir string, required bool) (deliverycontract.Repository, error) {
+	descriptor := deriveRepositoryDescriptor(ctx, workDir)
+	if required && (descriptor.Branch == "" || descriptor.CommitSHA == "") {
+		return descriptor, fmt.Errorf("required repository delivery is missing branch or SHA")
+	}
+	return descriptor, nil
 }
 
 func probeDeliveryServices(parent context.Context, databaseURL string) map[string]bool {

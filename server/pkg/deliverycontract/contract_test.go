@@ -62,7 +62,7 @@ func TestPreflightValidatesVersionedCapabilitiesAndRepository(t *testing.T) {
 	profile := CurrentProfile()
 	report := validPreflight(t)
 	report.RepositoryRequired = true
-	report.Repository = Repository{Git: true, Branch: "agent/developer/HERM-941", CommitSHA: strings.Repeat("a", 40), Worktree: true}
+	report.Repository = Repository{Git: true, GitRoot: "/repo", Branch: "agent/developer/HERM-941", CommitSHA: strings.Repeat("a", 40), TreeSHA: strings.Repeat("b", 40), Worktree: true}
 	if err := report.Validate(profile); err != nil {
 		t.Fatalf("valid preflight rejected: %v", err)
 	}

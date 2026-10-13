@@ -23,6 +23,8 @@ var githubInstallationTokenURL = "https://api.github.com/installation/token"
 var githubAPIBaseURL = "https://api.github.com"
 var githubRepositoryRemote = func(repository string) string { return "https://github.com/" + repository + ".git" }
 
+const githubPublicationAttempts = 3
+
 type githubCredentialSession struct {
 	credentials []GitHubCredential
 }
@@ -31,6 +33,18 @@ type githubPullRequest struct {
 	Number  int
 	URL     string
 	HeadSHA string
+}
+
+// GitHubPublication is the host-side CLI boundary. Token is supplied
+// separately so it cannot enter argv or serialized request files.
+type GitHubPublication struct {
+	Repository string `json:"repository"`
+	WorkDir    string `json:"workdir"`
+	Branch     string `json:"branch"`
+	SHA        string `json:"sha"`
+	RemoteSHA  string `json:"remote_sha"`
+	PRNumber   int    `json:"pr_number"`
+	PRURL      string `json:"pr_url"`
 }
 
 type githubAPIError struct {
@@ -115,7 +129,25 @@ func (s *githubCredentialSession) publish(ctx context.Context, workDir, branch, 
 	}
 	remote := githubRepositoryRemote(credential.Repository)
 	env := append(os.Environ(), "GIT_ASKPASS="+taskpass, "GIT_TERMINAL_PROMPT=0", "MULTICA_GIT_TOKEN="+credential.Token)
-	push := exec.CommandContext(ctx, "git", "-C", workDir, "push", remote, sha+":refs/heads/"+branch)
+	baseProbe := exec.CommandContext(ctx, "git", "-C", workDir, "ls-remote", remote, "refs/heads/main")
+	baseProbe.Env = env
+	if out, probeErr := baseProbe.CombinedOutput(); probeErr != nil {
+		return "", fmt.Errorf("host publication base probe failed: %s: %w", strings.TrimSpace(string(out)), probeErr)
+	} else if fields := strings.Fields(string(out)); len(fields) > 0 && fields[0] == sha {
+		return "", errors.New("host publication refuses an empty pull request: delivery SHA equals main")
+	}
+	current := ""
+	leaseProbe := exec.CommandContext(ctx, "git", "-C", workDir, "ls-remote", remote, "refs/heads/"+branch)
+	leaseProbe.Env = env
+	if out, probeErr := leaseProbe.CombinedOutput(); probeErr != nil {
+		return "", fmt.Errorf("host publication lease probe failed: %s: %w", strings.TrimSpace(string(out)), probeErr)
+	} else if fields := strings.Fields(string(out)); len(fields) > 0 {
+		current = fields[0]
+	}
+	if current == sha {
+		return sha, nil
+	}
+	push := exec.CommandContext(ctx, "git", "-C", workDir, "push", "--force-with-lease=refs/heads/"+branch+":"+current, remote, sha+":refs/heads/"+branch)
 	push.Env = env
 	if out, err := push.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("host publication push failed: %s: %w", strings.TrimSpace(string(out)), err)
@@ -138,12 +170,60 @@ func (s *githubCredentialSession) publish(ctx context.Context, workDir, branch, 
 }
 
 func (s *githubCredentialSession) finalizePublication(ctx context.Context, workDir, branch, sha string) (string, githubPullRequest, error) {
-	remoteSHA, err := s.publish(ctx, workDir, branch, sha)
-	if err != nil {
-		return remoteSHA, githubPullRequest{}, err
+	return s.finalizePublicationWithProgress(ctx, workDir, branch, sha, nil)
+}
+
+func (s *githubCredentialSession) finalizePublicationWithProgress(ctx context.Context, workDir, branch, sha string, progress func(string, string, githubPullRequest) error) (string, githubPullRequest, error) {
+	var remoteSHA string
+	var pullRequest githubPullRequest
+	var err error
+	for attempt := 1; attempt <= githubPublicationAttempts; attempt++ {
+		remoteSHA, err = s.publish(ctx, workDir, branch, sha)
+		if err == nil && progress != nil {
+			err = progress("branch_published", remoteSHA, githubPullRequest{})
+		}
+		if err == nil {
+			pullRequest, err = s.ensurePullRequest(ctx, branch, sha)
+		}
+		if err == nil && progress != nil {
+			err = progress("PR_read_back", remoteSHA, pullRequest)
+		}
+		if err == nil || !retryablePublicationError(err) || attempt == githubPublicationAttempts {
+			return remoteSHA, pullRequest, err
+		}
+		select {
+		case <-ctx.Done():
+			return remoteSHA, pullRequest, ctx.Err()
+		case <-time.After(time.Duration(attempt) * 25 * time.Millisecond):
+		}
 	}
-	pullRequest, err := s.ensurePullRequest(ctx, branch, sha)
 	return remoteSHA, pullRequest, err
+}
+
+func retryablePublicationError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var apiErr *githubAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.status == http.StatusTooManyRequests || apiErr.status >= http.StatusInternalServerError
+	}
+	message := strings.ToLower(err.Error())
+	return !strings.Contains(message, "mismatch") && !strings.Contains(message, "requires") && !strings.Contains(message, "permission")
+}
+
+func PublishGitHubAppSHA(ctx context.Context, publication GitHubPublication, token string) (result GitHubPublication, err error) {
+	if strings.TrimSpace(token) == "" {
+		return result, errors.New("GitHub App installation token is required")
+	}
+	session, err := startGitHubCredentialSession([]GitHubCredential{{Repository: publication.Repository, Token: token}})
+	if err != nil {
+		return result, err
+	}
+	defer func() { err = errors.Join(err, session.close(context.Background())) }()
+	remoteSHA, pr, err := session.finalizePublication(ctx, publication.WorkDir, publication.Branch, publication.SHA)
+	publication.RemoteSHA, publication.PRNumber, publication.PRURL = remoteSHA, pr.Number, pr.URL
+	return publication, err
 }
 
 func (s *githubCredentialSession) ensurePullRequest(ctx context.Context, branch, sha string) (githubPullRequest, error) {

@@ -5894,19 +5894,43 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 
 	var credentialSession *githubCredentialSession
+	publicationRecoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	if err == nil && len(task.Repos) > 0 && (result.BranchName == "" || result.CommitSHA == "") {
+		err = errors.New("host-side GitHub publication required but finalized delivery is missing branch or SHA")
+	}
 	if err == nil && len(task.Repos) > 0 && result.BranchName != "" && result.CommitSHA != "" {
+		descriptor := deriveRepositoryDescriptor(ctx, result.DurableWorkDir)
+		if descriptor.GitRoot == "" {
+			descriptor.GitRoot = result.DurableWorkDir
+		}
+		if descriptor.CommitSHA == "" {
+			descriptor.CommitSHA = result.CommitSHA
+		}
+		journalErr := execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationPrepared, "", 0, "")
+		if errors.Is(journalErr, os.ErrNotExist) {
+			journalErr = execenv.WriteRecoveryManifest(publicationRecoveryRoot, execenv.RecoveryManifest{
+				TaskID: task.ID, RuntimeID: task.RuntimeID, GitRoot: descriptor.GitRoot,
+				CanonicalBranch: result.BranchName, BaseSHA: descriptor.CommitSHA,
+				ExpectedRefSHA: descriptor.CommitSHA, HeadSHA: result.CommitSHA,
+			})
+		}
+		if journalErr != nil {
+			err = fmt.Errorf("host-side GitHub publication failed (phase=prepared): %w", journalErr)
+		}
 		repository, acquireErr := githubRepositoryForWorkDir(result.DurableWorkDir)
 		var credentials []GitHubCredential
-		if acquireErr == nil {
+		if err == nil && acquireErr == nil {
 			credentials, acquireErr = d.client.AcquireGitHubCredentials(ctx, task, repository)
 		}
-		if acquireErr != nil {
+		if err == nil && acquireErr != nil {
 			err = fmt.Errorf("host-side GitHub publication failed (phase=acquire canonical_branch=%s head_sha=%s runtime_id=%s): %w",
 				result.BranchName, result.CommitSHA, task.RuntimeID, acquireErr)
-		} else {
+		} else if err == nil {
 			credentialSession, err = startGitHubCredentialSession(credentials)
 			if err == nil && credentialSession == nil {
 				err = errors.New("host-side GitHub publication returned no credential")
+			} else if err == nil {
+				err = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationCredentialMinted, "", 0, "")
 			}
 		}
 	}
@@ -5918,9 +5942,15 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		}()
 	}
 	if err == nil && credentialSession != nil {
-		remoteSHA, pullRequest, publishErr := credentialSession.finalizePublication(ctx, result.DurableWorkDir, result.BranchName, result.CommitSHA)
+		remoteSHA, pullRequest, publishErr := credentialSession.finalizePublicationWithProgress(ctx, result.DurableWorkDir, result.BranchName, result.CommitSHA,
+			func(phase, remoteSHA string, pr githubPullRequest) error {
+				return execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, phase, remoteSHA, pr.Number, pr.URL)
+			})
 		revokeErr := credentialSession.close(context.Background())
 		credentialSession = nil
+		if revokeErr == nil {
+			revokeErr = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationCredentialRevoked, remoteSHA, pullRequest.Number, pullRequest.URL)
+		}
 		if publishErr != nil {
 			err = fmt.Errorf("host-side GitHub publication failed (phase=publish canonical_branch=%s head_sha=%s remote_sha=%s runtime_id=%s): %w",
 				result.BranchName, result.CommitSHA, remoteSHA, task.RuntimeID, publishErr)

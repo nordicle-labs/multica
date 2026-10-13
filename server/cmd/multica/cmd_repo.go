@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/cli"
+	"github.com/multica-ai/multica/server/internal/daemon"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/spf13/cobra"
 )
@@ -62,9 +63,20 @@ var repoCheckoutCmd = &cobra.Command{
 	RunE: runRepoCheckout,
 }
 
+var repoPublishCmd = &cobra.Command{
+	Use:   "publish",
+	Short: "Publish an immutable SHA with a GitHub App credential",
+	Args:  cobra.NoArgs,
+	RunE:  runRepoPublish,
+}
+
 var (
-	repoCheckoutRef   string
-	repoCheckoutFresh bool
+	repoCheckoutRef       string
+	repoCheckoutFresh     bool
+	repoPublishWorkDir    string
+	repoPublishRepository string
+	repoPublishBranch     string
+	repoPublishSHA        string
 )
 
 func init() {
@@ -79,11 +91,37 @@ func init() {
 
 	repoCheckoutCmd.Flags().StringVar(&repoCheckoutRef, "ref", "", "branch, tag, or commit to check out instead of the remote default branch")
 	repoCheckoutCmd.Flags().BoolVar(&repoCheckoutFresh, "fresh", false, "discard an existing checkout's uncommitted changes and untracked files and start over on a new branch from the latest default branch (or --ref); commits stay on the old branch")
+	repoPublishCmd.Flags().StringVar(&repoPublishWorkDir, "workdir", "", "local Git working tree")
+	repoPublishCmd.Flags().StringVar(&repoPublishRepository, "repository", "", "GitHub owner/repository")
+	repoPublishCmd.Flags().StringVar(&repoPublishBranch, "branch", "", "canonical branch to publish")
+	repoPublishCmd.Flags().StringVar(&repoPublishSHA, "sha", "", "immutable commit SHA to publish")
+	_ = repoPublishCmd.MarkFlagRequired("workdir")
+	_ = repoPublishCmd.MarkFlagRequired("repository")
+	_ = repoPublishCmd.MarkFlagRequired("branch")
+	_ = repoPublishCmd.MarkFlagRequired("sha")
 
 	repoCmd.AddCommand(repoListCmd)
 	repoCmd.AddCommand(repoAddCmd)
 	repoCmd.AddCommand(repoRemoveCmd)
 	repoCmd.AddCommand(repoCheckoutCmd)
+	repoCmd.AddCommand(repoPublishCmd)
+}
+
+func runRepoPublish(cmd *cobra.Command, _ []string) error {
+	token := os.Getenv("MULTICA_GITHUB_APP_TOKEN")
+	if token == "" {
+		return errors.New("MULTICA_GITHUB_APP_TOKEN is required")
+	}
+	ctx, cancel := cli.APIContext(cmd.Context())
+	defer cancel()
+	result, err := daemon.PublishGitHubAppSHA(ctx, daemon.GitHubPublication{
+		Repository: repoPublishRepository, WorkDir: repoPublishWorkDir,
+		Branch: repoPublishBranch, SHA: repoPublishSHA,
+	}, token)
+	if err != nil {
+		return err
+	}
+	return cli.PrintJSON(os.Stdout, result)
 }
 
 type workspaceRepo struct {
