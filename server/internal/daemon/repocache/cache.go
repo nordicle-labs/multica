@@ -1417,19 +1417,29 @@ func checkoutNewBranch(repoPath, branchName, baseRef string) (string, error) {
 }
 
 func checkoutNewBranchContext(ctx context.Context, repoPath, branchName, baseRef string) (string, error) {
-	out, err := runGitCombinedOutputContext(ctx, "-C", repoPath, "checkout", "-b", branchName, baseRef)
-	if err == nil {
-		return branchName, nil
+	return createUniqueTaskBranch(branchName, func(candidate string) error {
+		out, err := runGitCombinedOutputContext(ctx, "-C", repoPath, "checkout", "-b", candidate, baseRef)
+		if err != nil {
+			return fmt.Errorf("git checkout -b: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+		return nil
+	})
+}
+
+func createUniqueTaskBranch(branchName string, create func(string) error) (string, error) {
+	candidate := branchName
+	suffix := time.Now().Unix()
+	for {
+		err := create(candidate)
+		if err == nil {
+			return candidate, nil
+		}
+		if !isBranchCollisionError(err) {
+			return "", err
+		}
+		candidate = fmt.Sprintf("%s-%d", branchName, suffix)
+		suffix++
 	}
-	wrapped := fmt.Errorf("git checkout -b: %s: %w", strings.TrimSpace(string(out)), err)
-	if !isBranchCollisionError(wrapped) {
-		return "", wrapped
-	}
-	branchName = fmt.Sprintf("%s-%d", branchName, time.Now().Unix())
-	if out2, err2 := runGitCombinedOutputContext(ctx, "-C", repoPath, "checkout", "-b", branchName, baseRef); err2 != nil {
-		return "", fmt.Errorf("git checkout -b (retry): %s: %w", strings.TrimSpace(string(out2)), err2)
-	}
-	return branchName, nil
 }
 
 func resolveBaseRef(barePath, requestedRef string) (string, error) {
@@ -1482,16 +1492,9 @@ func createWorktreeContext(ctx context.Context, gitRoot, worktreePath, branchNam
 		return "", fmt.Errorf("worktree path already exists and is not a valid git worktree: %s", worktreePath)
 	}
 
-	err := runWorktreeAddContext(ctx, gitRoot, worktreePath, branchName, baseRef)
-	if err != nil && isBranchCollisionError(err) {
-		// Branch name collision: append timestamp and retry once.
-		branchName = fmt.Sprintf("%s-%d", branchName, time.Now().Unix())
-		err = runWorktreeAddContext(ctx, gitRoot, worktreePath, branchName, baseRef)
-	}
-	if err != nil {
-		return "", err
-	}
-	return branchName, nil
+	return createUniqueTaskBranch(branchName, func(candidate string) error {
+		return runWorktreeAddContext(ctx, gitRoot, worktreePath, candidate, baseRef)
+	})
 }
 
 func runWorktreeAdd(gitRoot, worktreePath, branchName, baseRef string) error {

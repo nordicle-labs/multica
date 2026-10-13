@@ -1720,6 +1720,40 @@ func TestCreateWorktreePathCollisionDoesNotLeakBranch(t *testing.T) {
 	}
 }
 
+func TestCheckoutNewBranchHandlesRepeatedBranchCollisions(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	base := gitHead(t, repo)
+	const branch = "agent/test-agent/reused-task"
+
+	first, err := checkoutNewBranch(repo, branch, base)
+	if err != nil {
+		t.Fatalf("first checkoutNewBranch failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "local.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("write local commit: %v", err)
+	}
+	runGitAuthored(t, repo, "add", "local.txt")
+	runGitAuthored(t, repo, "commit", "-m", "local work")
+	localCommit := gitHead(t, repo)
+
+	// Seed the timestamp range used by the old one-shot collision retry.
+	now := time.Now().Unix()
+	for suffix := now - 2; suffix <= now+10; suffix++ {
+		runGitAuthored(t, repo, "branch", fmt.Sprintf("%s-%d", branch, suffix), base)
+	}
+	second, err := checkoutNewBranch(repo, branch, base)
+	if err != nil {
+		t.Fatalf("checkoutNewBranch after repeated collisions failed: %v", err)
+	}
+	if first == second {
+		t.Fatalf("branches are not unique: %q", first)
+	}
+	if got := gitRefCommit(t, repo, "refs/heads/"+first); got != localCommit {
+		t.Fatalf("first branch = %s, want preserved local commit %s", got, localCommit)
+	}
+}
+
 // TestGetRemoteDefaultBranchScansForCustomDefault verifies fallback (3) of
 // getRemoteDefaultBranch: when the cache has refs/remotes/origin/<custom>
 // (e.g. develop, trunk) but no refs/remotes/origin/HEAD and no main/master,
