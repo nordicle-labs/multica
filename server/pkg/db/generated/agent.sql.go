@@ -7282,8 +7282,13 @@ func (q *Queries) MergeDelegatedFailureCommentIntoPendingTask(ctx context.Contex
 	return i, err
 }
 
-const nextDeferredTaskFireAtForRuntimes = `-- name: NextDeferredTaskFireAtForRuntimes :one
-SELECT MIN(fire_at)::timestamptz
+const nextDeferredTaskDelayMillisForRuntimes = `-- name: NextDeferredTaskDelayMillisForRuntimes :one
+SELECT COALESCE(MIN(
+  GREATEST(
+    1000::bigint,
+    CEIL(EXTRACT(EPOCH FROM (fire_at - clock_timestamp())) * 1000)::bigint
+  )
+), -1)::bigint
 FROM agent_task_queue t
 WHERE t.runtime_id = ANY($1::uuid[])
   AND t.status = 'deferred'
@@ -7310,7 +7315,7 @@ WHERE t.runtime_id = ANY($1::uuid[])
   )
 `
 
-type NextDeferredTaskFireAtForRuntimesParams struct {
+type NextDeferredTaskDelayMillisForRuntimesParams struct {
 	RuntimeIds       []pgtype.UUID `json:"runtime_ids"`
 	RuntimeStaleSecs float64       `json:"runtime_stale_secs"`
 }
@@ -7320,12 +7325,12 @@ type NextDeferredTaskFireAtForRuntimesParams struct {
 // whose runtime is offline/stale or that are blocked by an existing issue+agent
 // occupant are omitted so they cannot cause a tight poll loop. Keep both fences
 // in sync with PromoteDueDeferredTasksForRuntimes: a task that cannot be
-// promoted must not advertise an immediate follow-up claim. The response
-// converts the timestamp to a relative delay, avoiding any dependency on
-// daemon/server clock synchronization.
-func (q *Queries) NextDeferredTaskFireAtForRuntimes(ctx context.Context, arg NextDeferredTaskFireAtForRuntimesParams) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, nextDeferredTaskFireAtForRuntimes, arg.RuntimeIds, arg.RuntimeStaleSecs)
-	var column_1 pgtype.Timestamptz
+// promoted must not advertise an immediate follow-up claim. PostgreSQL computes
+// the relative delay so the protocol never compares database and host clocks;
+// -1 preserves the handler's existing "no deferred task" omitted-field shape.
+func (q *Queries) NextDeferredTaskDelayMillisForRuntimes(ctx context.Context, arg NextDeferredTaskDelayMillisForRuntimesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, nextDeferredTaskDelayMillisForRuntimes, arg.RuntimeIds, arg.RuntimeStaleSecs)
+	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
 }

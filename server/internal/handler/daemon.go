@@ -1970,7 +1970,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 	// omit the support bit so the daemon conservatively retains its ordinary
 	// PollInterval.
 	if len(out) < maxTasks && requestHasClientCapability(r, protocol.DaemonCapabilityClaimPollHintsV1) {
-		nextDeferred, nextErr := h.Queries.NextDeferredTaskFireAtForRuntimes(r.Context(), db.NextDeferredTaskFireAtForRuntimesParams{
+		nextDeferred, nextErr := h.Queries.NextDeferredTaskDelayMillisForRuntimes(r.Context(), db.NextDeferredTaskDelayMillisForRuntimesParams{
 			RuntimeIds:       authorized,
 			RuntimeStaleSecs: service.RuntimeClaimFreshnessSeconds,
 		})
@@ -1979,8 +1979,8 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 				"error", nextErr)
 		} else {
 			response["claim_poll_hint_supported"] = true
-			if nextDeferred.Valid {
-				response["next_deferred_task_after_ms"] = claimPollHintDelay(time.Now(), nextDeferred.Time).Milliseconds()
+			if nextDeferred >= 0 {
+				response["next_deferred_task_after_ms"] = nextDeferred
 			}
 		}
 	}
@@ -1994,14 +1994,6 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-}
-
-func claimPollHintDelay(now, fireAt time.Time) time.Duration {
-	delay := fireAt.Sub(now)
-	if delay < claimPollHintMinDelay {
-		return claimPollHintMinDelay
-	}
-	return delay
 }
 
 // finalizeClaimDelivery is the shared final delivery gate for the singular and
