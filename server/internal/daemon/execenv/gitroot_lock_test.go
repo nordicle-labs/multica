@@ -257,15 +257,19 @@ func TestCaptureUserSnapshotIgnoresTheRepositoryIndexLock(t *testing.T) {
 }
 
 // Every failure through runGitStdout used to arrive as "exit status 1": stderr
-// was captured by cmd.Output() and then dropped on the floor.
+// was captured by cmd.Output() and then dropped on the floor. A Git alias keeps
+// the assertion independent of Git's localized diagnostics.
 func TestRunGitSurfacesStderrInTheError(t *testing.T) {
 	t.Parallel()
 	repo := newTestRepo(t)
-	_, err := runGitTrimmed(repo, "rev-parse", "--verify", "definitely-not-a-ref")
+	_, err := runGitTrimmed(repo,
+		"-c", "alias.multica-test-fail=!printf multica-test-stderr >&2; exit 37",
+		"multica-test-fail",
+	)
 	if err == nil {
-		t.Fatal("rev-parse of a bogus ref succeeded")
+		t.Fatal("failing git alias succeeded")
 	}
-	if !strings.Contains(err.Error(), "fatal:") {
+	if !strings.Contains(err.Error(), "multica-test-stderr") {
 		t.Errorf("error dropped git's stderr: %v", err)
 	}
 }
