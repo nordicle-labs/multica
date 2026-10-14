@@ -20,6 +20,8 @@ set +a
 
 # shellcheck disable=SC1091
 . scripts/local-env.sh
+# shellcheck disable=SC1091
+. scripts/check-e2e-process.sh
 
 BACKEND_PID=""
 FRONTEND_PID=""
@@ -33,12 +35,14 @@ EXIT_CODE=0
 cleanup() {
   echo ""
   if [ "$STARTED_BACKEND" = true ] && [ -n "$BACKEND_PID" ]; then
-    kill "$BACKEND_PID" 2>/dev/null && wait "$BACKEND_PID" 2>/dev/null || true
-    echo "    Stopped backend (PID $BACKEND_PID)"
+    terminate_process_tree "$BACKEND_PID" TERM
+    wait "$BACKEND_PID" 2>/dev/null || true
+    echo "    Stopped backend tree (root PID $BACKEND_PID)"
   fi
   if [ "$STARTED_FRONTEND" = true ] && [ -n "$FRONTEND_PID" ]; then
-    kill "$FRONTEND_PID" 2>/dev/null && wait "$FRONTEND_PID" 2>/dev/null || true
-    echo "    Stopped frontend (PID $FRONTEND_PID)"
+    terminate_process_tree "$FRONTEND_PID" TERM
+    wait "$FRONTEND_PID" 2>/dev/null || true
+    echo "    Stopped frontend tree (root PID $FRONTEND_PID)"
   fi
   echo ""
   if [ "$EXIT_CODE" -eq 0 ]; then
@@ -72,6 +76,7 @@ wait_for_port() {
 echo "==> Checking E2E service ports..."
 bash scripts/check-e2e-preflight.sh || { EXIT_CODE=1; exit 1; }
 bash scripts/check-e2e-preflight.test.sh || { EXIT_CODE=1; exit 1; }
+bash scripts/check-e2e-process.test.sh || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
 # Step 0: Ensure DB
@@ -112,13 +117,13 @@ echo ""
 echo "==> [4/5] Starting services for E2E..."
 
 echo "    Starting backend..."
-(cd server && go run ./cmd/server) > /tmp/multica-check-backend.log 2>&1 &
+(cd server && exec go run ./cmd/server) > /tmp/multica-check-backend.log 2>&1 &
 BACKEND_PID=$!
 STARTED_BACKEND=true
 wait_for_port "$PORT" "Backend" 90 "/health"
 
 echo "    Starting frontend..."
-pnpm dev:web > /tmp/multica-check-frontend.log 2>&1 &
+(cd apps/web && exec ./node_modules/.bin/next dev --webpack --port "$FRONTEND_PORT") > /tmp/multica-check-frontend.log 2>&1 &
 FRONTEND_PID=$!
 STARTED_FRONTEND=true
 wait_for_port "$FRONTEND_PORT" "Frontend" 120 "/"

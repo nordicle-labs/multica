@@ -8,7 +8,7 @@
  * navigation behavior of `document.title`.
  */
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render } from "@testing-library/react";
+import { render, waitFor } from "@testing-library/react";
 
 const route = vi.hoisted(() => ({ pathname: "/acme/issues", search: "" }));
 vi.mock("next/navigation", () => ({
@@ -122,6 +122,18 @@ describe("WorkspaceDocumentTitle", () => {
 
     view.unmount();
     expect(document.title).toBe(SITE_TITLE);
+  });
+
+  it("re-asserts the title when streamed metadata overwrites it after mount", async () => {
+    open("/acme/inbox");
+    presentation.title = "Inbox";
+    render(<WorkspaceDocumentTitle />);
+    expect(document.title).toBe("Inbox | Multica");
+
+    // Next can stream route metadata after client effects have mounted.
+    document.title = SITE_TITLE;
+
+    await waitFor(() => expect(document.title).toBe("Inbox | Multica"));
   });
 
   it("re-asserts the title when a navigation keeps the same page name", () => {

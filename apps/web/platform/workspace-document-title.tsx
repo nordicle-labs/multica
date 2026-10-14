@@ -45,7 +45,21 @@ export function WorkspaceDocumentTitle() {
   // happen to share a title (`/inbox` → `/inbox?view=archived`) has to
   // re-assert it.
   useEffect(() => {
-    document.title = documentTitle;
+    const enforceTitle = () => {
+      if (document.title !== documentTitle) document.title = documentTitle;
+    };
+
+    enforceTitle();
+    // Next may stream route metadata after client effects mount and overwrite
+    // document.title without another route render. Reassert only on an actual
+    // head mutation so the dashboard title remains the final writer.
+    const observer = new MutationObserver(enforceTitle);
+    observer.observe(document.head, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return () => observer.disconnect();
   }, [documentTitle, url]);
 
   // Leaving the dashboard entirely (logout, workspace switcher, landing) drops
