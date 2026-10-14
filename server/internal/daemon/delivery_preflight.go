@@ -68,7 +68,7 @@ func deriveRepositoryDescriptor(ctx context.Context, workDir string) deliverycon
 	return deliverycontract.Repository{
 		Git:       true,
 		GitRoot:   gitPreflight(ctx, workDir, "rev-parse", "--show-toplevel"),
-		Branch:    gitPreflight(ctx, workDir, "branch", "--show-current"),
+		Branch:    gitPreflight(ctx, workDir, "symbolic-ref", "--short", "HEAD"),
 		CommitSHA: gitPreflight(ctx, workDir, "rev-parse", "HEAD"),
 		TreeSHA:   gitPreflight(ctx, workDir, "rev-parse", "HEAD^{tree}"),
 		Worktree:  true,

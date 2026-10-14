@@ -177,6 +177,20 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 
 func TestHandleTaskDerivesInPlaceDeliveryBeforeCredentialAcquisition(t *testing.T) {
 	t.Setenv("IS_SANDBOX", "1")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitBin := t.TempDir()
+	writeTestExecutable(t, filepath.Join(gitBin, "git"), []byte(`#!/bin/sh
+case " $* " in
+  *" init -b "*|*" branch --show-current "*) exit 129 ;;
+esac
+exec "$REAL_GIT" "$@"
+`))
+	t.Setenv("REAL_GIT", realGit)
+	t.Setenv("PATH", gitBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	var acquired bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -193,7 +207,8 @@ func TestHandleTaskDerivesInPlaceDeliveryBeforeCredentialAcquisition(t *testing.
 	t.Cleanup(srv.Close)
 
 	repo := t.TempDir()
-	gitTestRun(t, "", "init", "-b", "canonical", repo)
+	gitTestRun(t, "", "init", repo)
+	gitTestRun(t, repo, "checkout", "-b", "canonical")
 	gitTestRun(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	if err := os.WriteFile(filepath.Join(repo, "delivery.txt"), []byte("delivery\n"), 0o644); err != nil {
 		t.Fatal(err)
