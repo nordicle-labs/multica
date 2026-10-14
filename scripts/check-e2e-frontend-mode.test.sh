@@ -17,6 +17,15 @@ if grep -Fq 'next dev' "$CHECK_SCRIPT"; then
   exit 1
 fi
 
+if ! grep -Fq 'NEXT_ENV_BACKUP="$(mktemp "${TMPDIR:-/tmp}/multica-next-env.XXXXXX")"' "$CHECK_SCRIPT"; then
+  echo "check.sh must snapshot Next's generated next-env.d.ts before build" >&2
+  exit 1
+fi
+if ! grep -Fq 'cp "$NEXT_ENV_BACKUP" "$NEXT_ENV_FILE"' "$CHECK_SCRIPT"; then
+  echo "check.sh must restore next-env.d.ts during cleanup" >&2
+  exit 1
+fi
+
 build_line=$(grep -nF 'STANDALONE=false pnpm --filter @multica/web build' "$CHECK_SCRIPT" | cut -d: -f1)
 start_line=$(grep -nF 'exec ./node_modules/.bin/next start --port "$FRONTEND_PORT"' "$CHECK_SCRIPT" | cut -d: -f1)
 if [ "$build_line" -ge "$start_line" ]; then

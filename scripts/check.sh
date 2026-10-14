@@ -28,11 +28,22 @@ FRONTEND_PID=""
 STARTED_BACKEND=false
 STARTED_FRONTEND=false
 EXIT_CODE=0
+NEXT_ENV_FILE="apps/web/next-env.d.ts"
+NEXT_ENV_BACKUP=""
+NEXT_ENV_EXISTED=false
 
 # --------------------------------------------------------------------------
 # Cleanup: kill only services this script started
 # --------------------------------------------------------------------------
 cleanup() {
+  if [ -n "$NEXT_ENV_BACKUP" ]; then
+    if [ "$NEXT_ENV_EXISTED" = true ]; then
+      cp "$NEXT_ENV_BACKUP" "$NEXT_ENV_FILE"
+    else
+      rm -f "$NEXT_ENV_FILE"
+    fi
+    rm -f "$NEXT_ENV_BACKUP"
+  fi
   echo ""
   if [ "$STARTED_BACKEND" = true ] && [ -n "$BACKEND_PID" ]; then
     terminate_process_tree "$BACKEND_PID" TERM
@@ -118,6 +129,14 @@ echo ""
 echo "==> [4/5] Building frontend and starting services for E2E..."
 
 echo "    Building frontend production bundle..."
+# Next rewrites this tracked generated declaration between dev and production
+# modes. Preserve the caller's exact pre-gate state so verification is
+# read-only even when the build succeeds or exits early.
+NEXT_ENV_BACKUP="$(mktemp "${TMPDIR:-/tmp}/multica-next-env.XXXXXX")"
+if [ -f "$NEXT_ENV_FILE" ]; then
+  NEXT_ENV_EXISTED=true
+  cp "$NEXT_ENV_FILE" "$NEXT_ENV_BACKUP"
+fi
 STANDALONE=false pnpm --filter @multica/web build || { EXIT_CODE=1; exit 1; }
 
 echo "    Starting backend..."
