@@ -37,6 +37,12 @@ var projectCreateCmd = &cobra.Command{
 	RunE:  runProjectCreate,
 }
 
+var projectBootstrapCmd = &cobra.Command{
+	Use:   "bootstrap",
+	Short: "Create a canonical nordicle-labs repository and linked project",
+	RunE:  runProjectBootstrap,
+}
+
 var projectUpdateCmd = &cobra.Command{
 	Use:   "update <id>",
 	Short: "Update a project",
@@ -111,6 +117,7 @@ func init() {
 	projectCmd.AddCommand(projectListCmd)
 	projectCmd.AddCommand(projectGetCmd)
 	projectCmd.AddCommand(projectCreateCmd)
+	projectCmd.AddCommand(projectBootstrapCmd)
 	projectCmd.AddCommand(projectUpdateCmd)
 	projectCmd.AddCommand(projectDeleteCmd)
 	projectCmd.AddCommand(projectStatusCmd)
@@ -139,6 +146,10 @@ func init() {
 	projectCreateCmd.Flags().String("due-date", "", "Due date (calendar day, YYYY-MM-DD)")
 	projectCreateCmd.Flags().StringArray("repo", nil, "Attach a github_repo resource by URL (may be repeated)")
 	projectCreateCmd.Flags().String("output", "json", "Output format: table or json")
+	projectBootstrapCmd.Flags().String("name", "", "Repository name (required)")
+	projectBootstrapCmd.Flags().String("visibility", "", "Repository visibility: private, internal, or public (required)")
+	projectBootstrapCmd.Flags().String("product", "", "Multica project title (required)")
+	projectBootstrapCmd.Flags().String("output", "json", "Output format: table or json")
 
 	// project resource list
 	projectResourceListCmd.Flags().String("output", "table", "Output format: table or json")
@@ -383,6 +394,35 @@ func runProjectCreate(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	return cli.PrintJSON(os.Stdout, result)
+}
+
+func runProjectBootstrap(cmd *cobra.Command, _ []string) error {
+	name := strings.TrimSpace(mustString(cmd, "name"))
+	visibility := strings.TrimSpace(mustString(cmd, "visibility"))
+	product := strings.TrimSpace(mustString(cmd, "product"))
+	if name == "" || visibility == "" || product == "" {
+		return fmt.Errorf("--name, --visibility, and --product are required")
+	}
+	if visibility != "private" && visibility != "internal" && visibility != "public" {
+		return fmt.Errorf("--visibility must be private, internal, or public")
+	}
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/projects/bootstrap", map[string]string{"name": name, "visibility": visibility, "product": product}, &result); err != nil {
+		return fmt.Errorf("bootstrap project: %w", err)
+	}
+	output, _ := cmd.Flags().GetString("output")
+	if output == "table" {
+		project, _ := result["project"].(map[string]any)
+		cli.PrintTable(os.Stdout, []string{"STATE", "PROJECT", "REPOSITORY", "BRANCH", "TEMPLATE"}, [][]string{{strVal(result, "state"), strVal(project, "title"), strVal(result, "repository_url"), strVal(result, "branch"), strVal(result, "template_version")}})
+		return nil
+	}
 	return cli.PrintJSON(os.Stdout, result)
 }
 
