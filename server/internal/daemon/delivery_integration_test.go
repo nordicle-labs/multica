@@ -89,6 +89,33 @@ func TestCanonicalRepositoryDescriptorMatrix(t *testing.T) {
 	}
 }
 
+func TestAttachRepositoryDeliveryRejectsIncoherentIdentity(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	gitTestRun(t, "", "init", "-b", "delivery", repo)
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTestRun(t, repo, "add", "tracked.txt")
+	gitTestRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "delivery")
+
+	for _, tc := range []struct {
+		name   string
+		result TaskResult
+		want   string
+	}{
+		{name: "branch", result: TaskResult{BranchName: "other"}, want: "branch mismatch"},
+		{name: "head", result: TaskResult{CommitSHA: strings.Repeat("a", 40)}, want: "SHA mismatch"},
+		{name: "tree", result: TaskResult{TreeSHA: strings.Repeat("b", 40)}, want: "tree mismatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.result
+			if err := attachRepositoryDelivery(context.Background(), repo, &result); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("attachRepositoryDelivery error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func gitTestRun(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	if dir != "" {

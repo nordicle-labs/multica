@@ -24,9 +24,13 @@ var githubAPIBaseURL = "https://api.github.com"
 var githubRepositoryRemote = func(repository string) string { return "https://github.com/" + repository + ".git" }
 
 const githubPublicationAttempts = 3
+const githubCredentialRevocationAttempts = 3
 
 type githubCredentialSession struct {
-	credentials []GitHubCredential
+	credentials  []GitHubCredential
+	revoked      []bool
+	revokeClient *http.Client
+	revokeWait   func(context.Context, time.Duration) error
 }
 
 type githubPullRequest struct {
@@ -72,7 +76,21 @@ func startGitHubCredentialSession(credentials []GitHubCredential) (*githubCreden
 	if len(credentials) == 0 {
 		return nil, nil
 	}
-	session := &githubCredentialSession{credentials: append([]GitHubCredential(nil), credentials...)}
+	session := &githubCredentialSession{
+		credentials:  append([]GitHubCredential(nil), credentials...),
+		revoked:      make([]bool, len(credentials)),
+		revokeClient: &http.Client{Timeout: 10 * time.Second},
+		revokeWait: func(ctx context.Context, delay time.Duration) error {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		},
+	}
 	for _, credential := range session.credentials {
 		if credential.Token == "" || credential.Repository == "" {
 			_ = session.close(context.Background())
@@ -353,23 +371,51 @@ func (s *githubCredentialSession) close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
 	var revokeErr error
-	for _, credential := range s.credentials {
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, githubInstallationTokenURL, bytes.NewReader(nil))
-		if err == nil {
-			req.Header.Set("Authorization", "token "+credential.Token)
-			req.Header.Set("Accept", "application/vnd.github+json")
-			if resp, callErr := client.Do(req); callErr == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-					revokeErr = errors.Join(revokeErr, fmt.Errorf("github credential revocation returned status %d", resp.StatusCode))
-				}
-			} else {
-				revokeErr = errors.Join(revokeErr, fmt.Errorf("github credential revocation failed: %w", callErr))
+	for index, credential := range s.credentials {
+		if s.revoked[index] {
+			continue
+		}
+		var err error
+		for attempt := 1; attempt <= githubCredentialRevocationAttempts; attempt++ {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				err = ctxErr
+				break
 			}
-		} else {
-			revokeErr = errors.Join(revokeErr, fmt.Errorf("github credential revocation request failed: %w", err))
+			var req *http.Request
+			req, err = http.NewRequestWithContext(ctx, http.MethodDelete, githubInstallationTokenURL, bytes.NewReader(nil))
+			if err == nil {
+				req.Header.Set("Authorization", "token "+credential.Token)
+				req.Header.Set("Accept", "application/vnd.github+json")
+				var resp *http.Response
+				resp, err = s.revokeClient.Do(req)
+				if err == nil {
+					_ = resp.Body.Close()
+					if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+						s.revoked[index] = true
+						break
+					}
+					err = fmt.Errorf("github credential revocation returned status %d", resp.StatusCode)
+					if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < http.StatusInternalServerError {
+						break
+					}
+				}
+			}
+			if attempt < githubCredentialRevocationAttempts {
+				if waitErr := s.revokeWait(ctx, time.Duration(attempt)*25*time.Millisecond); waitErr != nil {
+					err = errors.Join(err, waitErr)
+					break
+				}
+			}
+		}
+		if !s.revoked[index] {
+			if err == nil {
+				err = errors.New("github credential revocation was not confirmed")
+			}
+			if !strings.Contains(err.Error(), "github credential revocation") {
+				err = fmt.Errorf("github credential revocation failed: %w", err)
+			}
+			revokeErr = errors.Join(revokeErr, err)
 		}
 	}
 	return revokeErr

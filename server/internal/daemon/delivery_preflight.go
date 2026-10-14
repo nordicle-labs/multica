@@ -76,10 +76,31 @@ func deriveRepositoryDescriptor(ctx context.Context, workDir string) deliverycon
 
 func finalizeRepositoryDelivery(ctx context.Context, workDir string, required bool) (deliverycontract.Repository, error) {
 	descriptor := deriveRepositoryDescriptor(ctx, workDir)
-	if required && (descriptor.Branch == "" || descriptor.CommitSHA == "") {
-		return descriptor, fmt.Errorf("required repository delivery is missing branch or SHA")
+	if required && (descriptor.GitRoot == "" || descriptor.Branch == "" || descriptor.CommitSHA == "" || descriptor.TreeSHA == "") {
+		return descriptor, fmt.Errorf("required repository delivery is missing branch or SHA, git root, or tree")
 	}
 	return descriptor, nil
+}
+
+func attachRepositoryDelivery(ctx context.Context, workDir string, result *TaskResult) error {
+	descriptor, err := finalizeRepositoryDelivery(ctx, workDir, true)
+	if err != nil {
+		return err
+	}
+	if result.BranchName != "" && result.BranchName != descriptor.Branch {
+		return fmt.Errorf("required repository delivery branch mismatch: got %s, want %s", descriptor.Branch, result.BranchName)
+	}
+	if result.CommitSHA != "" && result.CommitSHA != descriptor.CommitSHA {
+		return fmt.Errorf("required repository delivery SHA mismatch: got %s, want %s", descriptor.CommitSHA, result.CommitSHA)
+	}
+	if result.TreeSHA != "" && result.TreeSHA != descriptor.TreeSHA {
+		return fmt.Errorf("required repository delivery tree mismatch: got %s, want %s", descriptor.TreeSHA, result.TreeSHA)
+	}
+	result.DurableWorkDir = descriptor.GitRoot
+	result.BranchName = descriptor.Branch
+	result.CommitSHA = descriptor.CommitSHA
+	result.TreeSHA = descriptor.TreeSHA
+	return nil
 }
 
 func probeDeliveryServices(parent context.Context, databaseURL string) map[string]bool {

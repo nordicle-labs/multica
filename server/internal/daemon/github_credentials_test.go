@@ -3,8 +3,10 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,18 @@ import (
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "transient timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+var _ net.Error = timeoutError{}
 
 func TestGitHubCredentialSessionKeepsTokenOutOfProviderAndRevokes(t *testing.T) {
 	var revoked bool
@@ -79,18 +93,20 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 
 	d := &Daemon{client: NewClient(srv.URL), logger: slog.New(slog.NewTextHandler(io.Discard, nil)), workspaces: make(map[string]*workspaceState), runtimeIndex: map[string]Runtime{"runtime-1": {ID: "runtime-1", Provider: "claude"}}, activeEnvRoots: make(map[string]int), cancelPollInterval: time.Hour, cfg: Config{WorkspacesRoot: t.TempDir()}}
 	work := t.TempDir()
-	if out, err := exec.Command("git", "init", work).CombinedOutput(); err != nil {
-		t.Fatalf("git init: %s: %v", out, err)
+	gitTestRun(t, "", "init", "-b", "canonical", work)
+	gitTestRun(t, work, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	if err := os.WriteFile(filepath.Join(work, "delivery.txt"), []byte("delivery\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
-		t.Fatalf("git remote add: %s: %v", out, err)
-	}
+	gitTestRun(t, work, "add", "delivery.txt")
+	gitTestRun(t, work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "delivery")
+	descriptor := deriveRepositoryDescriptor(context.Background(), work)
 	d.runner = taskRunnerFunc(func(_ context.Context, task Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
 		record("run")
 		if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
 			t.Fatal("runner received GitHub credentials")
 		}
-		return TaskResult{BranchName: "canonical", CommitSHA: strings.Repeat("a", 40), DurableWorkDir: work}, nil
+		return TaskResult{BranchName: descriptor.Branch, CommitSHA: descriptor.CommitSHA, TreeSHA: descriptor.TreeSHA, DurableWorkDir: work}, nil
 	})
 	d.handleTask(context.Background(), Task{ID: "task-1", RuntimeID: "runtime-1", Agent: &AgentData{Name: "test-agent"}, Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}}, 0)
 
@@ -99,6 +115,195 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 	mu.Unlock()
 	if strings.Join(got, ",") != "run,acquire" {
 		t.Fatalf("credential lifecycle calls = %v, want [run acquire]", got)
+	}
+}
+
+func TestHandleTaskDerivesGitHubRepoDeliveryBeforeCredentialAcquisition(t *testing.T) {
+	t.Setenv("IS_SANDBOX", "1")
+	var acquired bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/github-credentials"):
+			acquired = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"credentials":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_, _ = w.Write([]byte(`{"status":"running"}`))
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	fakeBin := filepath.Join(t.TempDir(), "claude")
+	writeTestExecutable(t, fakeBin, []byte(`#!/bin/sh
+git init -b canonical . >/dev/null
+git config user.name test
+git config user.email test@example.com
+git remote add origin https://github.com/owner/repo.git
+printf 'delivery\n' > delivery.txt
+git add delivery.txt
+git commit -m delivery >/dev/null
+IFS= read -r _
+printf '%s\n' '{"type":"system","session_id":"session-delivery"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"session-delivery","result":"done"}'
+`))
+	d := &Daemon{
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"runtime-1": {ID: "runtime-1", Provider: "claude"}},
+		activeEnvRoots:     make(map[string]int),
+		cancelPollInterval: time.Hour,
+		cfg: Config{
+			WorkspacesRoot: t.TempDir(),
+			AgentTimeout:   5 * time.Second,
+			ServerBaseURL:  srv.URL,
+			Agents:         map[string]AgentEntry{"claude": {Path: fakeBin}},
+		},
+	}
+	d.runner = taskRunnerFunc(d.runTask)
+	d.handleTask(context.Background(), Task{
+		ID: "task-delivery", WorkspaceID: "workspace-1", RuntimeID: "runtime-1",
+		IssueID: "issue-1", AgentID: "agent-1", AuthToken: "mat_task", RemoteMCPDaemonToken: "claim-token",
+		Agent: &AgentData{ID: "agent-1", Name: "test-agent"},
+		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}},
+	}, 0)
+
+	if !acquired {
+		t.Fatal("handleTask did not acquire GitHub credentials after runTask completed a real repository delivery")
+	}
+}
+
+func TestGitHubCredentialSessionRetriesServerFailure(t *testing.T) {
+	attempts := 0
+	waits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	oldURL := githubInstallationTokenURL
+	githubInstallationTokenURL = server.URL
+	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "token"}})
+	session.revokeWait = func(context.Context, time.Duration) error { waits++; return nil }
+	if err := session.close(context.Background()); err != nil || attempts != 2 {
+		t.Fatalf("close error = %v, attempts = %d; want success after 2 attempts", err, attempts)
+	}
+	if waits != 1 {
+		t.Fatalf("backoff calls = %d, want 1 injectable wait", waits)
+	}
+}
+
+func TestGitHubCredentialSessionRetriesTransientTimeout(t *testing.T) {
+	attempts := 0
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, timeoutError{}
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "token"}})
+	session.revokeWait = func(context.Context, time.Duration) error { return nil }
+	if err := session.close(context.Background()); err != nil || attempts != 2 {
+		t.Fatalf("close error = %v, attempts = %d; want success after transient timeout", err, attempts)
+	}
+}
+
+func TestGitHubCredentialSessionStopsAfterBoundedAttempts(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+	oldURL := githubInstallationTokenURL
+	githubInstallationTokenURL = server.URL
+	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "token"}})
+	session.revokeWait = func(context.Context, time.Duration) error { return nil }
+	err := session.close(context.Background())
+	if err == nil || attempts != 3 {
+		t.Fatalf("close error = %v, attempts = %d; want explicit error after 3 attempts", err, attempts)
+	}
+}
+
+func TestGitHubCredentialSessionRetriesAgainAfterExhaustion(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		if attempts <= githubCredentialRevocationAttempts {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	oldURL := githubInstallationTokenURL
+	githubInstallationTokenURL = server.URL
+	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "token"}})
+	session.revokeWait = func(context.Context, time.Duration) error { return nil }
+	if err := session.close(context.Background()); err == nil {
+		t.Fatal("first close succeeded after every bounded attempt failed")
+	}
+	if err := session.close(context.Background()); err != nil || attempts != githubCredentialRevocationAttempts+1 {
+		t.Fatalf("fallback close error = %v, attempts = %d; want success on first fallback attempt", err, attempts)
+	}
+}
+
+func TestGitHubCredentialSessionStopsOnCancellation(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+	oldURL := githubInstallationTokenURL
+	githubInstallationTokenURL = server.URL
+	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "token"}})
+	err := session.close(ctx)
+	if !errors.Is(err, context.Canceled) || attempts != 0 {
+		t.Fatalf("close error = %v, attempts = %d; want context cancellation without request", err, attempts)
+	}
+}
+
+func TestGitHubCredentialSessionDoesNotRevokeTwiceAfterSuccess(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	oldURL := githubInstallationTokenURL
+	githubInstallationTokenURL = server.URL
+	t.Cleanup(func() { githubInstallationTokenURL = oldURL })
+
+	session, _ := startGitHubCredentialSession([]GitHubCredential{{Repository: "owner/repo", Token: "token"}})
+	if err := session.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("revocation attempts = %d, want exactly 1 after repeated close", attempts)
 	}
 }
 

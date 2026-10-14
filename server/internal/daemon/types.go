@@ -302,6 +302,7 @@ type TaskResult struct {
 	Comment    string `json:"comment"`
 	BranchName string `json:"branch_name,omitempty"`
 	CommitSHA  string `json:"-"`
+	TreeSHA    string `json:"-"`
 	EnvType    string `json:"env_type,omitempty"`
 	SessionID  string `json:"session_id,omitempty"` // Claude session ID for future resumption
 	WorkDir    string `json:"work_dir,omitempty"`   // working directory used during execution
