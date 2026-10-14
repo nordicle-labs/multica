@@ -1,6 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -11,6 +15,52 @@ import (
 // anything else with a message that lists the valid values. `project create`,
 // `project update`, and `project status` all share it (#3925: `--status active`
 // used to reach the server and 500 on the CHECK constraint).
+func TestRunProjectBootstrapSendsExplicitContract(t *testing.T) {
+	var body map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/projects/bootstrap" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"state":"created","repository_url":"https://github.com/nordicle-labs/widget","branch":"main","template_version":"v1","project":{"title":"Widget"}}`))
+	}))
+	defer server.Close()
+	t.Setenv("MULTICA_SERVER_URL", server.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "workspace-1")
+	t.Setenv("MULTICA_TOKEN", "mat_test-token")
+	cmd := &cobra.Command{Use: "bootstrap"}
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().String("visibility", "", "")
+	cmd.Flags().String("product", "", "")
+	cmd.Flags().String("output", "json", "")
+	_ = cmd.Flags().Set("name", "widget")
+	_ = cmd.Flags().Set("visibility", "private")
+	_ = cmd.Flags().Set("product", "Widget")
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	t.Cleanup(func() { os.Stdout = oldStdout })
+	if err := runProjectBootstrap(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = write.Close()
+	var result map[string]any
+	if err := json.NewDecoder(read).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if body["name"] != "widget" || body["visibility"] != "private" || body["product"] != "Widget" {
+		t.Fatalf("body = %#v", body)
+	}
+	if result["state"] != "created" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestValidateProjectStatus(t *testing.T) {
 	for _, s := range validProjectStatuses {
 		if err := validateProjectStatus(s); err != nil {

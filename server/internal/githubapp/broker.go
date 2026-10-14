@@ -112,6 +112,45 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 	return Credential{Repository: repository, Token: out.Token}, nil
 }
 
+// MintInstallation creates an installation token that is not narrowed to an
+// existing repository. Bootstrap needs this because the target does not exist.
+func (b Broker) MintInstallation(ctx context.Context, installationID int64, permissions Permissions) (string, error) {
+	if installationID <= 0 || len(permissions) == 0 {
+		return "", errors.New("github App installation and permissions are required")
+	}
+	appJWT, err := b.SignJWT()
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(map[string]any{"permissions": permissions})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(b.APIBase, "/")+fmt.Sprintf("/app/installations/%d/access_tokens", installationID), bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+appJWT)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("create installation token: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, responseLimit))
+		return "", fmt.Errorf("create installation token: github status %d", resp.StatusCode)
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, responseLimit)).Decode(&out); err != nil || out.Token == "" {
+		return "", errors.New("create installation token: malformed response")
+	}
+	return out.Token, nil
+}
+
 func (b Broker) Revoke(ctx context.Context, token string) error {
 	if token == "" {
 		return nil

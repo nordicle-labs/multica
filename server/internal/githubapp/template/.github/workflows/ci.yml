@@ -1,0 +1,26 @@
+name: canonical-ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps: [{uses: actions/checkout@v4}, {run: make build}]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{uses: actions/checkout@v4}, {run: make lint}]
+  test:
+    runs-on: ubuntu-latest
+    steps: [{uses: actions/checkout@v4}, {run: make test}]
+  smoke:
+    runs-on: ubuntu-latest
+    steps: [{uses: actions/checkout@v4}, {run: make smoke}]
+  preview:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps: [{run: make preview}]
+  release:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps: [{run: make release}, {run: make rollback}]
