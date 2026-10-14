@@ -109,6 +109,10 @@ test("renders assistant quick actions and sends the hidden prompt", async ({
     await page.goto(`/${workspace.slug}/chat?session=${sessionId}`, {
       waitUntil: "domcontentloaded",
     });
+    // Select through the rendered session list instead of relying on the
+    // persisted active-session hint. Session hydration may legitimately clear
+    // that hint before the freshly inserted session reaches the client cache.
+    await page.getByText("Plan a focused launch", { exact: true }).click();
 
     const primaryAction = page.getByRole("button", {
       name: "Draft the launch brief",

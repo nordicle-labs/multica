@@ -52,7 +52,10 @@ export async function loginAsDefault(page: Page): Promise<string> {
     localStorage.setItem("multica_token", t);
     localStorage.setItem("multica:chat:isOpen", "false");
   }, token);
-  await page.goto(`/${workspace.slug}/issues`, { waitUntil: "domcontentloaded" });
+  // Next App Router responses are streamed. Waiting for DOMContentLoaded can
+  // consume the whole test timeout even after the navigation has committed;
+  // the explicit UI readiness check below is the authoritative boundary.
+  await page.goto(`/${workspace.slug}/issues`, { waitUntil: "commit" });
   await waitForIssuesPage(page);
   return workspace.slug;
 }
