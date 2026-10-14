@@ -87,6 +87,40 @@ func TestCanonicalRepositoryDescriptorMatrix(t *testing.T) {
 	if _, err := finalizeRepositoryDelivery(context.Background(), inPlace, true); err == nil || !strings.Contains(err.Error(), "missing branch or SHA") {
 		t.Fatalf("detached required delivery error = %v", err)
 	}
+	nonRepo, err := os.MkdirTemp("/tmp", "multica-non-repo-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(nonRepo) })
+	if _, err := finalizeRepositoryDelivery(context.Background(), nonRepo, true); err == nil || !strings.Contains(err.Error(), "missing branch or SHA") {
+		t.Fatalf("non-repository required delivery error = %v", err)
+	}
+}
+
+func TestFinalizeRepositoryDeliveryRejectsTrackedChanges(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	gitTestRun(t, "", "init", "-b", "delivery", repo)
+	file := filepath.Join(repo, "tracked.txt")
+	if err := os.WriteFile(file, []byte("before\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTestRun(t, repo, "add", "tracked.txt")
+	gitTestRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "delivery")
+	if err := os.WriteFile(file, []byte("after\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := finalizeRepositoryDelivery(context.Background(), repo, true); err == nil || !strings.Contains(err.Error(), "tracked changes") {
+		t.Fatalf("dirty required delivery error = %v", err)
+	}
+}
+
+func TestGitHubRepositoryForTaskRejectsNonCanonicalRemote(t *testing.T) {
+	repo := t.TempDir()
+	gitTestRun(t, "", "init", repo)
+	gitTestRun(t, repo, "remote", "add", "origin", "https://github.com/owner/other.git")
+	if _, err := githubRepositoryForTask(repo, []RepoData{{URL: "https://github.com/owner/repo.git"}}); err == nil || !strings.Contains(err.Error(), "not a canonical task repository") {
+		t.Fatalf("non-canonical remote error = %v", err)
+	}
 }
 
 func TestAttachRepositoryDeliveryRejectsIncoherentIdentity(t *testing.T) {

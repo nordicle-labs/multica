@@ -175,6 +175,75 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 	}
 }
 
+func TestHandleTaskDerivesInPlaceDeliveryBeforeCredentialAcquisition(t *testing.T) {
+	t.Setenv("IS_SANDBOX", "1")
+	var acquired bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/github-credentials"):
+			acquired = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"credentials":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_, _ = w.Write([]byte(`{"status":"running"}`))
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	repo := t.TempDir()
+	gitTestRun(t, "", "init", "-b", "canonical", repo)
+	gitTestRun(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	if err := os.WriteFile(filepath.Join(repo, "delivery.txt"), []byte("delivery\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTestRun(t, repo, "add", "delivery.txt")
+	gitTestRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "delivery")
+	localRef, err := json.Marshal(localDirectoryRef{LocalPath: repo, DaemonID: "daemon-1", ExecutionMode: localDirectoryModeInPlace})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := filepath.Join(t.TempDir(), "claude")
+	writeTestExecutable(t, fakeBin, []byte(`#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{"type":"system","session_id":"session-delivery"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"session-delivery","result":"done"}'
+`))
+	d := &Daemon{
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"runtime-1": {ID: "runtime-1", Provider: "claude"}},
+		activeEnvRoots:     make(map[string]int),
+		localPathLocks:     NewLocalPathLocker(),
+		cancelPollInterval: time.Hour,
+		cfg: Config{
+			DaemonID:       "daemon-1",
+			WorkspacesRoot: t.TempDir(),
+			AgentTimeout:   5 * time.Second,
+			ServerBaseURL:  srv.URL,
+			Agents:         map[string]AgentEntry{"claude": {Path: fakeBin}},
+		},
+	}
+	d.runner = taskRunnerFunc(d.runTask)
+	d.handleTask(context.Background(), Task{
+		ID: "task-in-place", WorkspaceID: "workspace-1", RuntimeID: "runtime-1",
+		IssueID: "issue-1", AgentID: "agent-1", AuthToken: "mat_task", RemoteMCPDaemonToken: "claim-token",
+		Agent: &AgentData{ID: "agent-1", Name: "test-agent"},
+		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}},
+		ProjectResources: []ProjectResourceData{{
+			ID: "local-1", ResourceType: localDirectoryResourceType,
+			ResourceRef: localRef,
+		}},
+	}, 0)
+
+	if !acquired {
+		t.Fatal("handleTask did not acquire GitHub credentials after runTask completed a local_directory/in_place delivery")
+	}
+}
+
 func TestGitHubCredentialSessionRetriesServerFailure(t *testing.T) {
 	attempts := 0
 	waits := 0

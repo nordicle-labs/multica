@@ -72,6 +72,20 @@ func githubRepositoryForWorkDir(workDir string) (string, error) {
 	return repository, nil
 }
 
+func githubRepositoryForTask(workDir string, repos []RepoData) (string, error) {
+	repository, err := githubRepositoryForWorkDir(workDir)
+	if err != nil {
+		return "", err
+	}
+	for _, repo := range repos {
+		expected, parseErr := githubapp.ParseRepository(repo.URL)
+		if parseErr == nil && strings.EqualFold(repository, expected) {
+			return repository, nil
+		}
+	}
+	return "", fmt.Errorf("origin repository %s is not a canonical task repository", repository)
+}
+
 func startGitHubCredentialSession(credentials []GitHubCredential) (*githubCredentialSession, error) {
 	if len(credentials) == 0 {
 		return nil, nil

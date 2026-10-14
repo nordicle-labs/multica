@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -78,6 +79,14 @@ func finalizeRepositoryDelivery(ctx context.Context, workDir string, required bo
 	descriptor := deriveRepositoryDescriptor(ctx, workDir)
 	if required && (descriptor.GitRoot == "" || descriptor.Branch == "" || descriptor.CommitSHA == "" || descriptor.TreeSHA == "") {
 		return descriptor, fmt.Errorf("required repository delivery is missing branch or SHA, git root, or tree")
+	}
+	if required {
+		status := exec.CommandContext(ctx, "git", "-C", descriptor.GitRoot, "status", "--porcelain", "--untracked-files=no")
+		if out, err := status.Output(); err != nil {
+			return descriptor, fmt.Errorf("inspect required repository delivery: %w", err)
+		} else if strings.TrimSpace(string(out)) != "" {
+			return descriptor, errors.New("required repository delivery has tracked changes outside HEAD")
+		}
 	}
 	return descriptor, nil
 }

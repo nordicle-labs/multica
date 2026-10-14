@@ -5903,6 +5903,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			err = fmt.Errorf("host-side GitHub publication delivery identity changed before acquisition: %w", deliveryErr)
 		}
 		descriptor := deriveRepositoryDescriptor(ctx, result.DurableWorkDir)
+		repository, repositoryErr := githubRepositoryForTask(result.DurableWorkDir, task.Repos)
+		if err == nil && repositoryErr != nil {
+			err = fmt.Errorf("host-side GitHub publication remote changed before acquisition: %w", repositoryErr)
+		}
 		var journalErr error
 		if err == nil {
 			journalErr = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationPrepared, "", 0, "")
@@ -5917,9 +5921,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		if journalErr != nil {
 			err = fmt.Errorf("host-side GitHub publication failed (phase=prepared): %w", journalErr)
 		}
-		repository, acquireErr := githubRepositoryForWorkDir(result.DurableWorkDir)
 		var credentials []GitHubCredential
-		if err == nil && acquireErr == nil {
+		var acquireErr error
+		if err == nil {
 			credentials, acquireErr = d.client.AcquireGitHubCredentials(ctx, task, repository)
 		}
 		if err == nil && acquireErr != nil {
@@ -8403,7 +8407,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			}
 		}()
 	}
-	if len(task.Repos) > 0 && localAssignment == nil {
+	if len(task.Repos) > 0 && !localAssignment.UsesWorktree() {
 		defer func() {
 			if returnErr != nil || taskResult.Status != "completed" {
 				return
