@@ -77,6 +77,7 @@ echo "==> Checking E2E service ports..."
 bash scripts/check-e2e-preflight.sh || { EXIT_CODE=1; exit 1; }
 bash scripts/check-e2e-preflight.test.sh || { EXIT_CODE=1; exit 1; }
 bash scripts/check-e2e-process.test.sh || { EXIT_CODE=1; exit 1; }
+bash scripts/check-e2e-frontend-mode.test.sh || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
 # Step 0: Ensure DB
@@ -111,10 +112,13 @@ echo "==> Running database migrations..."
 bash scripts/test-go.sh || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
-# Step 4: Start services for E2E
+# Step 4: Build frontend and start services for E2E
 # --------------------------------------------------------------------------
 echo ""
-echo "==> [4/5] Starting services for E2E..."
+echo "==> [4/5] Building frontend and starting services for E2E..."
+
+echo "    Building frontend production bundle..."
+STANDALONE=false pnpm --filter @multica/web build || { EXIT_CODE=1; exit 1; }
 
 echo "    Starting backend..."
 (cd server && exec go run ./cmd/server) > /tmp/multica-check-backend.log 2>&1 &
@@ -123,7 +127,7 @@ STARTED_BACKEND=true
 wait_for_port "$PORT" "Backend" 90 "/health"
 
 echo "    Starting frontend..."
-(cd apps/web && exec ./node_modules/.bin/next dev --webpack --port "$FRONTEND_PORT") > /tmp/multica-check-frontend.log 2>&1 &
+(cd apps/web && exec ./node_modules/.bin/next start --port "$FRONTEND_PORT") > /tmp/multica-check-frontend.log 2>&1 &
 FRONTEND_PID=$!
 STARTED_FRONTEND=true
 wait_for_port "$FRONTEND_PORT" "Frontend" 120 "/"
