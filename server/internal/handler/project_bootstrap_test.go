@@ -147,6 +147,90 @@ func TestBootstrapInstallationRequiresOneExactOwner(t *testing.T) {
 	}
 }
 
+func TestBootstrapRepositoryRefMatchesCanonicalJSONB(t *testing.T) {
+	repoURL := "https://github.com/nordicle-labs/canonical-jsonb"
+	if !bootstrapRepositoryRefMatches([]byte(`{"default_branch_hint": "main", "url": "https://github.com/nordicle-labs/canonical-jsonb"}`), repoURL) {
+		t.Fatal("semantically identical canonical JSONB did not match")
+	}
+	for _, raw := range []string{
+		`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb","extra":"value"}`,
+		`{"url":"https://github.com/nordicle-labs/canonical-jsonb"}`,
+		`{"default_branch_hint":"main"}`,
+		`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/wrong","url":"https://github.com/nordicle-labs/canonical-jsonb"}`,
+		`{"default_branch_hint":"wrong","default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"}`,
+		`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"} {}`,
+	} {
+		if bootstrapRepositoryRefMatches([]byte(raw), repoURL) {
+			t.Fatalf("invalid repository ref was accepted: %s", raw)
+		}
+	}
+	ref, err := decodeBootstrapRepositoryRef([]byte(`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"}`))
+	if err != nil || ref.URL != repoURL || ref.DefaultBranchHint != githubapp.DefaultBranch {
+		t.Fatalf("repository ref = %+v, err = %v", ref, err)
+	}
+}
+
+func TestBootstrapProjectRejectsRepositoryRefWithUnknownField(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const (
+		name    = "unexpected-resource-field"
+		product = "Unexpected Resource Field"
+	)
+	projectID := dbfx.Project(t, product)
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo",
+		"resource_ref": `{"url":"https://github.com/nordicle-labs/unexpected-resource-field","default_branch_hint":"main","unexpected":true}`,
+	})
+	remote := &bootstrapTestRemote{repositories: map[string]bool{name: true}}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	checks, bootstraps, _ := remote.counts()
+	if checks != 0 || bootstraps != 0 {
+		t.Fatalf("remote calls = check %d, bootstrap %d", checks, bootstraps)
+	}
+}
+
+func TestBootstrapProjectCreatesAndReadsBackResource(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	const (
+		name    = "created-resource-readback"
+		product = "Created Resource Readback"
+	)
+	seedBootstrapInstallation(t)
+	cleanupBootstrapProducts(t, product)
+
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+	if got := dbfx.Count(t, `
+		SELECT count(*)
+		FROM project_resource r
+		JOIN project p ON p.id = r.project_id
+		WHERE p.workspace_id = $1 AND p.title = $2
+		  AND r.resource_type = 'github_repo'
+		  AND r.resource_ref = $3::jsonb`, testWorkspaceID, product,
+		`{"url":"https://github.com/nordicle-labs/created-resource-readback","default_branch_hint":"main"}`); got != 1 {
+		t.Fatalf("created repository resources = %d, want 1", got)
+	}
+	_, _, deletes := remote.counts()
+	if deletes != 0 {
+		t.Fatalf("repository deletes = %d, want 0", deletes)
+	}
+}
+
 func TestBootstrapProjectReadsBackAmbiguousCommitBeforeRollback(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -328,6 +412,42 @@ func TestBootstrapProjectRejectsEquivalentGitHubRepositoryURLs(t *testing.T) {
 				t.Fatalf("remote calls = check %d, bootstrap %d", checks, bootstraps)
 			}
 		})
+	}
+}
+
+func TestBootstrapProjectRejectsDuplicateEquivalentResourcesOnSameProject(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const (
+		name    = "duplicate-equivalent-resources"
+		product = "Duplicate Equivalent Resources"
+	)
+	projectID := dbfx.Project(t, product)
+	for _, repoURL := range []string{
+		"https://github.com/nordicle-labs/duplicate-equivalent-resources",
+		"git@github.com:nordicle-labs/duplicate-equivalent-resources.git",
+	} {
+		ref, err := json.Marshal(map[string]string{"url": repoURL, "default_branch_hint": "main"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbfx.Insert(t, "project_resource", testutil.Cols{
+			"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo", "resource_ref": string(ref),
+		})
+	}
+
+	remote := &bootstrapTestRemote{repositories: map[string]bool{name: true}}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	checks, bootstraps, _ := remote.counts()
+	if checks != 0 || bootstraps != 0 {
+		t.Fatalf("remote calls = check %d, bootstrap %d", checks, bootstraps)
 	}
 }
 

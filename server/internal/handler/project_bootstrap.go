@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,11 @@ type projectBootstrapRequest struct {
 type projectBootstrapResponse struct {
 	githubapp.BootstrapResult
 	Project ProjectResponse `json:"project"`
+}
+
+type bootstrapRepositoryRef struct {
+	URL               string `json:"url"`
+	DefaultBranchHint string `json:"default_branch_hint"`
 }
 
 type bootstrapCommitError struct{ err error }
@@ -183,6 +189,30 @@ func bootstrapLockKeys(workspaceID, product, repoURL string) []string {
 	return keys
 }
 
+func bootstrapRepositoryRefMatches(raw []byte, repoURL string) bool {
+	ref, err := decodeBootstrapRepositoryRef(raw)
+	if err != nil {
+		return false
+	}
+	return ref.URL == repoURL && ref.DefaultBranchHint == githubapp.DefaultBranch
+}
+
+func decodeBootstrapRepositoryRef(raw []byte) (bootstrapRepositoryRef, error) {
+	var ref bootstrapRepositoryRef
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return ref, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&ref); err != nil {
+		return ref, err
+	}
+	if ref.URL == "" || ref.DefaultBranchHint == "" {
+		return ref, errors.New("repository ref requires url and default_branch_hint")
+	}
+	return ref, nil
+}
+
 func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UUID, product, repoURL string) (db.Project, string, error) {
 	targetRepository, err := githubapp.RepositoryIdentity(repoURL)
 	if err != nil {
@@ -200,13 +230,14 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 			return db.Project{}, "", err
 		}
 		titleMatch := projects[i].Title == product
+		repoMatches := 0
 		repoMatch := false
 		for _, resource := range resources {
 			if resource.ResourceType != "github_repo" {
 				continue
 			}
-			var ref struct{ URL, DefaultBranchHint string }
-			if json.Unmarshal(resource.ResourceRef, &ref) != nil {
+			ref, err := decodeBootstrapRepositoryRef(resource.ResourceRef)
+			if err != nil {
 				collision = true
 				continue
 			}
@@ -216,11 +247,16 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 				continue
 			}
 			if identity == targetRepository {
+				repoMatches++
 				repoMatch = ref.DefaultBranchHint == githubapp.DefaultBranch
 				if !repoMatch {
 					collision = true
 				}
 			}
+		}
+		if repoMatches > 1 {
+			collision = true
+			repoMatch = false
 		}
 		if titleMatch && repoMatch {
 			if exact != nil {
@@ -256,7 +292,7 @@ func (h *Handler) createBootstrapProject(ctx context.Context, tx pgx.Tx, workspa
 		return db.Project{}, errors.New("project readback mismatch")
 	}
 	resources, err := qtx.ListProjectResourcesInWorkspace(ctx, db.ListProjectResourcesInWorkspaceParams{ProjectID: project.ID, WorkspaceID: workspaceID})
-	if err != nil || len(resources) != 1 || resources[0].ResourceType != "github_repo" || string(resources[0].ResourceRef) != string(ref) {
+	if err != nil || len(resources) != 1 || resources[0].ResourceType != "github_repo" || !bootstrapRepositoryRefMatches(resources[0].ResourceRef, repoURL) {
 		return db.Project{}, errors.New("project resource readback mismatch")
 	}
 	if err := tx.Commit(ctx); err != nil {
