@@ -331,6 +331,42 @@ func TestBootstrapProjectRejectsEquivalentGitHubRepositoryURLs(t *testing.T) {
 	}
 }
 
+func TestBootstrapProjectRejectsDuplicateEquivalentResourcesOnSameProject(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const (
+		name    = "duplicate-equivalent-resources"
+		product = "Duplicate Equivalent Resources"
+	)
+	projectID := dbfx.Project(t, product)
+	for _, repoURL := range []string{
+		"https://github.com/nordicle-labs/duplicate-equivalent-resources",
+		"git@github.com:nordicle-labs/duplicate-equivalent-resources.git",
+	} {
+		ref, err := json.Marshal(map[string]string{"url": repoURL, "default_branch_hint": "main"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbfx.Insert(t, "project_resource", testutil.Cols{
+			"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo", "resource_ref": string(ref),
+		})
+	}
+
+	remote := &bootstrapTestRemote{repositories: map[string]bool{name: true}}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	checks, bootstraps, _ := remote.counts()
+	if checks != 0 || bootstraps != 0 {
+		t.Fatalf("remote calls = check %d, bootstrap %d", checks, bootstraps)
+	}
+}
+
 func TestBootstrapProjectSerializesDuplicateSubmissions(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

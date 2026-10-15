@@ -200,6 +200,7 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 			return db.Project{}, "", err
 		}
 		titleMatch := projects[i].Title == product
+		repoMatches := 0
 		repoMatch := false
 		for _, resource := range resources {
 			if resource.ResourceType != "github_repo" {
@@ -216,11 +217,16 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 				continue
 			}
 			if identity == targetRepository {
+				repoMatches++
 				repoMatch = ref.DefaultBranchHint == githubapp.DefaultBranch
 				if !repoMatch {
 					collision = true
 				}
 			}
+		}
+		if repoMatches > 1 {
+			collision = true
+			repoMatch = false
 		}
 		if titleMatch && repoMatch {
 			if exact != nil {
