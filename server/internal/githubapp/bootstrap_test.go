@@ -34,6 +34,32 @@ type bootstrapGitHub struct {
 	disconnectCreate    bool
 }
 
+func TestRepositoryIdentity(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com/nordicle-labs/example",
+		"https://github.com/nordicle-labs/example/",
+		"https://github.com/nordicle-labs/example.git",
+		"git@github.com:nordicle-labs/example.git",
+	} {
+		got, err := RepositoryIdentity(raw)
+		if err != nil || got != "nordicle-labs/example" {
+			t.Errorf("RepositoryIdentity(%q) = %q, %v", raw, got, err)
+		}
+	}
+	for _, raw := range []string{
+		"https://gitlab.com/nordicle-labs/example",
+		"https://github.com/nordicle-labs",
+		"https://github.com/nordicle-labs/example/extra",
+		"https://github.com/nordicle-labs/example?ref=main",
+		"git@evil.example:nordicle-labs/example.git",
+		"not a repository",
+	} {
+		if _, err := RepositoryIdentity(raw); err == nil {
+			t.Errorf("RepositoryIdentity(%q) unexpectedly succeeded", raw)
+		}
+	}
+}
+
 func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

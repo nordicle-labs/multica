@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -294,6 +295,40 @@ func TestBootstrapProjectFailsClosedOnLocalCollisionsAndAdoption(t *testing.T) {
 			t.Fatalf("adopted repository created %d projects", got)
 		}
 	})
+}
+
+func TestBootstrapProjectRejectsEquivalentGitHubRepositoryURLs(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	for i, repoURL := range []string{
+		"https://github.com/nordicle-labs/equivalent-repository/",
+		"https://github.com/nordicle-labs/equivalent-repository.git",
+		"git@github.com:nordicle-labs/equivalent-repository.git",
+	} {
+		t.Run(repoURL, func(t *testing.T) {
+			projectID := dbfx.Project(t, fmt.Sprintf("Equivalent Repository %d", i))
+			ref, err := json.Marshal(map[string]string{"url": repoURL, "default_branch_hint": "main"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dbfx.Insert(t, "project_resource", testutil.Cols{
+				"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo", "resource_ref": string(ref),
+			})
+			remote := &bootstrapTestRemote{}
+			h := *testHandler
+			h.ProjectBootstrap = remote
+			response := callBootstrap(t, &h, testUserID, "equivalent-repository", fmt.Sprintf("New Product %d", i))
+			if response.Code != http.StatusConflict {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			checks, bootstraps, _ := remote.counts()
+			if checks != 0 || bootstraps != 0 {
+				t.Fatalf("remote calls = check %d, bootstrap %d", checks, bootstraps)
+			}
+		})
+	}
 }
 
 func TestBootstrapProjectSerializesDuplicateSubmissions(t *testing.T) {
