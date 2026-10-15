@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -95,9 +96,11 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer lockTx.Rollback(r.Context())
-	if _, err := lockTx.Exec(r.Context(), "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", workspaceID+":"+repoURL); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to serialize project bootstrap")
-		return
+	for _, key := range bootstrapLockKeys(workspaceID, req.Product, repoURL) {
+		if _, err := lockTx.Exec(r.Context(), "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", key); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to serialize project bootstrap")
+			return
+		}
 	}
 	existingProject, localState, err := h.bootstrapLocalState(r.Context(), wsUUID, req.Product, repoURL)
 	if err != nil {
@@ -132,6 +135,10 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	if remote.State != "created" {
+		writeError(w, http.StatusConflict, "GitHub repository appeared during bootstrap; refusing to adopt it")
+		return
+	}
 	project, err := h.createBootstrapProject(r.Context(), lockTx, wsUUID, requester.UserID, req.Product, repoURL)
 	if err != nil {
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -147,20 +154,16 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func bootstrapInstallation(installations []db.GithubInstallation) (db.GithubInstallation, error) {
-	var match *db.GithubInstallation
-	for i := range installations {
-		if strings.TrimSpace(installations[i].AccountLogin) != githubapp.BootstrapOwner || installations[i].AccountType != "Organization" || installations[i].InstallationID <= 0 {
-			continue
-		}
-		if match != nil {
-			return db.GithubInstallation{}, errors.New("multiple nordicle-labs GitHub App installations")
-		}
-		match = &installations[i]
+	if len(installations) != 1 || strings.TrimSpace(installations[0].AccountLogin) != githubapp.BootstrapOwner || installations[0].AccountType != "Organization" || installations[0].InstallationID <= 0 {
+		return db.GithubInstallation{}, errors.New("workspace must have exactly one nordicle-labs Organization GitHub App installation")
 	}
-	if match == nil {
-		return db.GithubInstallation{}, errors.New("nordicle-labs GitHub App installation not found")
-	}
-	return *match, nil
+	return installations[0], nil
+}
+
+func bootstrapLockKeys(workspaceID, product, repoURL string) []string {
+	keys := []string{workspaceID + ":product:" + product, workspaceID + ":repository:" + repoURL}
+	sort.Strings(keys)
+	return keys
 }
 
 func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UUID, product, repoURL string) (db.Project, string, error) {

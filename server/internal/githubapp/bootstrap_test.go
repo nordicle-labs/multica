@@ -16,14 +16,16 @@ import (
 )
 
 type bootstrapGitHub struct {
-	mu             sync.Mutex
-	repository     bool
-	visibility     string
-	files          map[string]string
-	protected      bool
-	createCount    int
-	deleteCount    int
-	failProtection bool
+	mu                  sync.Mutex
+	repository          bool
+	visibility          string
+	files               map[string]string
+	protected           bool
+	createCount         int
+	deleteCount         int
+	failProtection      bool
+	omitProtectionFlags bool
+	malformedCreate     bool
 }
 
 func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +56,10 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		g.visibility, _ = body["visibility"].(string)
 		w.WriteHeader(http.StatusCreated)
+		if g.malformedCreate {
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"id":123}`))
 		return
 	}
@@ -103,14 +109,17 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		protection := map[string]any{
 			"required_status_checks":        map[string]any{"strict": true, "contexts": RequiredChecks},
 			"enforce_admins":                map[string]bool{"enabled": true},
 			"required_pull_request_reviews": map[string]int{"required_approving_review_count": 1},
 			"restrictions":                  nil,
-			"allow_force_pushes":            map[string]bool{"enabled": false},
-			"allow_deletions":               map[string]bool{"enabled": false},
-		})
+		}
+		if !g.omitProtectionFlags {
+			protection["allow_force_pushes"] = map[string]bool{"enabled": false}
+			protection["allow_deletions"] = map[string]bool{"enabled": false}
+		}
+		_ = json.NewEncoder(w).Encode(protection)
 		return
 	}
 	if strings.HasSuffix(path, "/git/ref/heads/main") {
@@ -119,6 +128,15 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/git/commits/head-sha") {
 		_ = json.NewEncoder(w).Encode(map[string]any{"tree": map[string]string{"sha": "tree-sha"}})
+		return
+	}
+	if strings.HasSuffix(path, "/git/trees/tree-sha") {
+		tree := expectedTreeEntries(g.files)
+		entries := make([]map[string]string, 0, len(tree))
+		for path, entryType := range tree {
+			entries = append(entries, map[string]string{"path": path, "type": entryType})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"truncated": false, "tree": entries})
 		return
 	}
 	http.Error(w, fmt.Sprintf("unexpected %s %s", r.Method, path), http.StatusNotFound)
@@ -171,6 +189,42 @@ func TestBootstrapRejectsExistingRepositoryWithChangedTemplateFile(t *testing.T)
 	state.files["README.md"] = base64.StdEncoding.EncodeToString([]byte("changed\n"))
 	if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product"); err == nil {
 		t.Fatal("changed template file was accepted as unchanged")
+	}
+}
+
+func TestBootstrapRejectsUnexpectedRemoteFile(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}}
+	bootstrapper := testBootstrapper(t, state)
+	if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product"); err != nil {
+		t.Fatal(err)
+	}
+	state.files["UNEXPECTED.txt"] = base64.StdEncoding.EncodeToString([]byte("unexpected\n"))
+	if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product"); err == nil || !strings.Contains(err.Error(), "tree inventory") {
+		t.Fatalf("unexpected remote file error = %v", err)
+	}
+}
+
+func TestBootstrapRejectsIncompleteProtectionReadback(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}}
+	bootstrapper := testBootstrapper(t, state)
+	if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product"); err != nil {
+		t.Fatal(err)
+	}
+	state.omitProtectionFlags = true
+	if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product"); err == nil || !strings.Contains(err.Error(), "protection mismatch") {
+		t.Fatalf("incomplete protection error = %v", err)
+	}
+}
+
+func TestBootstrapReportsReconciliationAfterMalformedCreatedResponse(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}, malformedCreate: true}
+	bootstrapper := testBootstrapper(t, state)
+	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err == nil || !strings.Contains(err.Error(), "rollback incomplete; reconcile repository nordicle-labs/widget") {
+		t.Fatalf("malformed create error = %v", err)
+	}
+	if !state.repository || state.deleteCount != 0 {
+		t.Fatalf("repository=%v deletes=%d", state.repository, state.deleteCount)
 	}
 }
 

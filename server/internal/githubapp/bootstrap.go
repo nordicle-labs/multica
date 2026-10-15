@@ -177,11 +177,12 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 			err = fmt.Errorf("%w; rollback incomplete; reconcile repository %s/%s", err, BootstrapOwner, name)
 		}
 	}()
-	result.RepositoryID, err = b.createRepository(ctx, token, name, visibility)
+	var possiblyCreated bool
+	result.RepositoryID, possiblyCreated, err = b.createRepository(ctx, token, name, visibility)
+	created = possiblyCreated
 	if err != nil {
 		return result, err
 	}
-	created = true
 	if err = b.attestRepository(ctx, token, name, result.RepositoryID); err != nil {
 		return result, err
 	}
@@ -245,18 +246,18 @@ func (b Bootstrapper) repositoryExists(ctx context.Context, token, name string) 
 	}
 }
 
-func (b Bootstrapper) createRepository(ctx context.Context, token, name, visibility string) (int64, error) {
+func (b Bootstrapper) createRepository(ctx context.Context, token, name, visibility string) (int64, bool, error) {
 	status, raw, err := b.request(ctx, token, http.MethodPost, "/orgs/"+BootstrapOwner+"/repos", map[string]any{"name": name, "visibility": visibility, "private": visibility == "private", "auto_init": false})
 	if err != nil || status != http.StatusCreated {
-		return 0, fmt.Errorf("create repository: github status %d: %w", status, err)
+		return 0, status == http.StatusCreated, fmt.Errorf("create repository: github status %d: %w", status, err)
 	}
 	var repo struct {
 		ID int64 `json:"id"`
 	}
 	if json.Unmarshal(raw, &repo) != nil || repo.ID <= 0 {
-		return 0, errors.New("create repository: immutable repository ID missing")
+		return 0, true, errors.New("create repository: immutable repository ID missing")
 	}
-	return repo.ID, nil
+	return repo.ID, true, nil
 }
 
 func (b Bootstrapper) attestRepository(ctx context.Context, token, name string, expectedID int64) error {
@@ -338,31 +339,32 @@ func (b Bootstrapper) verify(ctx context.Context, token, name, visibility, produ
 		return errors.New("branch protection readback failed")
 	}
 	var protection struct {
-		RequiredStatusChecks struct {
+		RequiredStatusChecks *struct {
 			Contexts []string `json:"contexts"`
-			Strict   bool     `json:"strict"`
+			Strict   *bool    `json:"strict"`
 		} `json:"required_status_checks"`
-		EnforceAdmins struct {
-			Enabled bool `json:"enabled"`
+		EnforceAdmins *struct {
+			Enabled *bool `json:"enabled"`
 		} `json:"enforce_admins"`
-		RequiredPullRequestReviews struct {
-			RequiredApprovingReviewCount int `json:"required_approving_review_count"`
+		RequiredPullRequestReviews *struct {
+			RequiredApprovingReviewCount *int `json:"required_approving_review_count"`
 		} `json:"required_pull_request_reviews"`
 		Restrictions     json.RawMessage `json:"restrictions"`
-		AllowForcePushes struct {
-			Enabled bool `json:"enabled"`
+		AllowForcePushes *struct {
+			Enabled *bool `json:"enabled"`
 		} `json:"allow_force_pushes"`
-		AllowDeletions struct {
-			Enabled bool `json:"enabled"`
+		AllowDeletions *struct {
+			Enabled *bool `json:"enabled"`
 		} `json:"allow_deletions"`
 	}
 	if json.Unmarshal(raw, &protection) != nil ||
-		!protection.RequiredStatusChecks.Strict ||
+		protection.RequiredStatusChecks == nil || protection.RequiredStatusChecks.Strict == nil || !*protection.RequiredStatusChecks.Strict ||
 		strings.Join(protection.RequiredStatusChecks.Contexts, ",") != strings.Join(RequiredChecks, ",") ||
-		!protection.EnforceAdmins.Enabled ||
-		protection.RequiredPullRequestReviews.RequiredApprovingReviewCount != 1 ||
+		protection.EnforceAdmins == nil || protection.EnforceAdmins.Enabled == nil || !*protection.EnforceAdmins.Enabled ||
+		protection.RequiredPullRequestReviews == nil || protection.RequiredPullRequestReviews.RequiredApprovingReviewCount == nil || *protection.RequiredPullRequestReviews.RequiredApprovingReviewCount != 1 ||
 		string(protection.Restrictions) != "null" ||
-		protection.AllowForcePushes.Enabled || protection.AllowDeletions.Enabled {
+		protection.AllowForcePushes == nil || protection.AllowForcePushes.Enabled == nil || *protection.AllowForcePushes.Enabled ||
+		protection.AllowDeletions == nil || protection.AllowDeletions.Enabled == nil || *protection.AllowDeletions.Enabled {
 		return errors.New("branch protection mismatch")
 	}
 	status, raw, err = b.request(ctx, token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name+"/git/ref/heads/"+DefaultBranch, nil)
@@ -388,6 +390,28 @@ func (b Bootstrapper) verify(ctx context.Context, token, name, visibility, produ
 		return errors.New("tree SHA readback failed")
 	}
 	result.TreeSHA = commit.Tree.SHA
+	status, raw, err = b.request(ctx, token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name+"/git/trees/"+commit.Tree.SHA+"?recursive=1", nil)
+	var tree struct {
+		Truncated bool `json:"truncated"`
+		Tree      []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+		} `json:"tree"`
+	}
+	expectedTree := expectedTreeEntries(expectedFiles)
+	if err != nil || status != http.StatusOK || json.Unmarshal(raw, &tree) != nil || tree.Truncated || len(tree.Tree) != len(expectedTree) {
+		return errors.New("repository tree inventory mismatch")
+	}
+	seen := make(map[string]struct{}, len(tree.Tree))
+	for _, entry := range tree.Tree {
+		if expectedTree[entry.Path] != entry.Type {
+			return errors.New("repository tree inventory mismatch")
+		}
+		seen[entry.Path] = struct{}{}
+	}
+	if len(seen) != len(expectedTree) {
+		return errors.New("repository tree inventory mismatch")
+	}
 	return nil
 }
 
@@ -469,4 +493,16 @@ func sortedKeys[V any](values map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func expectedTreeEntries[V any](files map[string]V) map[string]string {
+	entries := make(map[string]string, len(files))
+	for path := range files {
+		parts := strings.Split(path, "/")
+		for i := 1; i < len(parts); i++ {
+			entries[strings.Join(parts[:i], "/")] = "tree"
+		}
+		entries[path] = "blob"
+	}
+	return entries
 }
