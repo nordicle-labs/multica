@@ -102,6 +102,7 @@ type Task struct {
 	Agent                         *AgentData             `json:"agent,omitempty"`
 	ConnectedApps                 []ConnectedAppData     `json:"connected_apps,omitempty"` // per-run app capabilities mounted through runtime MCP overlays
 	Repos                         []RepoData             `json:"repos,omitempty"`
+	DeliveryIntent                string                 `json:"delivery_intent,omitempty"`     // allowlisted server-persisted policy; absent/unknown fails closed
 	ProjectID                     string                 `json:"project_id,omitempty"`          // active project for this task, when present
 	ProjectTitle                  string                 `json:"project_title,omitempty"`       // human-readable project title for context injection
 	ProjectDescription            string                 `json:"project_description,omitempty"` // durable project-level context injected into the brief

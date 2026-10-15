@@ -150,6 +150,27 @@ func TestAttachRepositoryDeliveryRejectsIncoherentIdentity(t *testing.T) {
 	}
 }
 
+func TestPreserveRepositoryArtifactCreatesVerifiedBundle(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	gitTestRun(t, "", "init", "-b", "delivery", repo)
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTestRun(t, repo, "add", "tracked.txt")
+	gitTestRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "delivery")
+	result := TaskResult{DurableWorkDir: repo}
+	recoveryRoot := t.TempDir()
+	if err := preserveRepositoryArtifact(context.Background(), recoveryRoot, "task-artifact", &result, nil); err != nil {
+		t.Fatal(err)
+	}
+	if result.BranchName != "delivery" || result.CommitSHA == "" || result.TreeSHA == "" {
+		t.Fatalf("result = %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(recoveryRoot, "task-artifact", "recovery.bundle")); err != nil {
+		t.Fatalf("verified recovery bundle missing: %v", err)
+	}
+}
+
 func gitTestRun(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	if dir != "" {

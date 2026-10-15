@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -109,6 +110,19 @@ func attachRepositoryDelivery(ctx context.Context, workDir string, result *TaskR
 	result.BranchName = descriptor.Branch
 	result.CommitSHA = descriptor.CommitSHA
 	result.TreeSHA = descriptor.TreeSHA
+	return nil
+}
+
+func preserveRepositoryArtifact(ctx context.Context, recoveryRoot, taskID string, result *TaskResult, logger *slog.Logger) error {
+	if err := attachRepositoryDelivery(ctx, result.DurableWorkDir, result); err != nil {
+		return err
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if _, err := execenv.CreateRecoveryArtifact(result.DurableWorkDir, recoveryRoot, taskID, result.CommitSHA, logger); err != nil {
+		return fmt.Errorf("preserve repository delivery artifact: %w", err)
+	}
 	return nil
 }
 

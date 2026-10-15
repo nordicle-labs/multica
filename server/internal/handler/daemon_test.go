@@ -2698,6 +2698,25 @@ func TestClaimResponseAgentIdentityMatches(t *testing.T) {
 	}
 }
 
+func TestTaskToResponseReadsPersistedDeliveryIntentFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		context string
+		want    string
+	}{
+		{name: "artifact", context: `{"delivery_intent":"artifact"}`, want: "artifact"},
+		{name: "legacy", context: `{}`},
+		{name: "unknown", context: `{"delivery_intent":"publish"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taskToResponse(db.AgentTaskQueue{Context: []byte(tc.context)}, "").DeliveryIntent
+			if got != tc.want {
+				t.Fatalf("delivery intent = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 type claimRuntimeGuardTask struct {
 	GitHubCredentialAck           string          `json:"github_credential_ack"`
 	PriorSessionID                string          `json:"prior_session_id"`

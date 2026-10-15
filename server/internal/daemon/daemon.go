@@ -5893,82 +5893,13 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	default:
 	}
 
-	var credentialSession *githubCredentialSession
-	publicationRecoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
-	if err == nil && len(task.Repos) > 0 && (result.DurableWorkDir == "" || result.BranchName == "" || result.CommitSHA == "" || result.TreeSHA == "") {
-		err = errors.New("host-side GitHub publication required but finalized delivery is missing workdir, branch, SHA, or tree")
-	}
-	if err == nil && len(task.Repos) > 0 {
-		if deliveryErr := attachRepositoryDelivery(ctx, result.DurableWorkDir, &result); deliveryErr != nil {
-			err = fmt.Errorf("host-side GitHub publication delivery identity changed before acquisition: %w", deliveryErr)
-		}
-		descriptor := deriveRepositoryDescriptor(ctx, result.DurableWorkDir)
-		repository, repositoryErr := githubRepositoryForTask(result.DurableWorkDir, task.Repos)
-		if err == nil && repositoryErr != nil {
-			err = fmt.Errorf("host-side GitHub publication remote changed before acquisition: %w", repositoryErr)
-		}
-		var journalErr error
-		if err == nil {
-			journalErr = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationPrepared, "", 0, "")
-			if errors.Is(journalErr, os.ErrNotExist) {
-				journalErr = execenv.WriteRecoveryManifest(publicationRecoveryRoot, execenv.RecoveryManifest{
-					TaskID: task.ID, RuntimeID: task.RuntimeID, GitRoot: descriptor.GitRoot,
-					CanonicalBranch: result.BranchName, BaseSHA: descriptor.CommitSHA,
-					ExpectedRefSHA: descriptor.CommitSHA, HeadSHA: result.CommitSHA,
-				})
-			}
-		}
-		if journalErr != nil {
-			err = fmt.Errorf("host-side GitHub publication failed (phase=prepared): %w", journalErr)
-		}
-		var credentials []GitHubCredential
-		var acquireErr error
-		if err == nil {
-			credentials, acquireErr = d.client.AcquireGitHubCredentials(ctx, task, repository)
-		}
-		if err == nil && acquireErr != nil {
-			err = fmt.Errorf("host-side GitHub publication failed (phase=acquire canonical_branch=%s head_sha=%s runtime_id=%s): %w",
-				result.BranchName, result.CommitSHA, task.RuntimeID, acquireErr)
-		} else if err == nil {
-			credentialSession, err = startGitHubCredentialSession(credentials)
-			if err == nil && credentialSession == nil {
-				err = errors.New("host-side GitHub publication returned no credential")
-			} else if err == nil {
-				err = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationCredentialMinted, "", 0, "")
-			}
-		}
-	}
-	if credentialSession != nil {
-		defer func() {
-			if revokeErr := credentialSession.close(context.Background()); revokeErr != nil {
-				d.logger.Error("github credential revocation not confirmed", "task", task.ID, "phase", "revoke", "error", revokeErr)
-			}
-		}()
-	}
-	if err == nil && credentialSession != nil {
-		remoteSHA, pullRequest, publishErr := credentialSession.finalizePublicationWithProgress(ctx, result.DurableWorkDir, result.BranchName, result.CommitSHA,
-			func(phase, remoteSHA string, pr githubPullRequest) error {
-				return execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, phase, remoteSHA, pr.Number, pr.URL)
-			})
-		revokeErr := credentialSession.close(context.Background())
-		if revokeErr == nil {
-			credentialSession = nil
-			revokeErr = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationCredentialRevoked, remoteSHA, pullRequest.Number, pullRequest.URL)
-		}
-		if publishErr != nil {
-			err = fmt.Errorf("host-side GitHub publication failed (phase=publish canonical_branch=%s head_sha=%s remote_sha=%s runtime_id=%s): %w",
-				result.BranchName, result.CommitSHA, remoteSHA, task.RuntimeID, publishErr)
-		} else if revokeErr != nil {
-			err = fmt.Errorf("host-side GitHub publication failed (phase=revoke canonical_branch=%s head_sha=%s remote_sha=%s runtime_id=%s): %w",
-				result.BranchName, result.CommitSHA, remoteSHA, task.RuntimeID, revokeErr)
-		} else {
-			taskLog.Info("host-side GitHub publication verified", "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "remote_sha", remoteSHA, "pull_request", pullRequest.Number, "pull_request_url", pullRequest.URL)
-		}
-	}
-	if err == nil {
-		if manifestErr := execenv.RemoveRecoveryManifest(filepath.Join(d.cfg.WorkspacesRoot, "recovery"), task.ID); manifestErr != nil {
-			err = fmt.Errorf("remove completed recovery manifest (phase=finalize canonical_branch=%s head_sha=%s runtime_id=%s): %w",
-				result.BranchName, result.CommitSHA, task.RuntimeID, manifestErr)
+	if err == nil && task.DeliveryIntent == "artifact" {
+		if len(task.Repos) == 0 {
+			err = errors.New("repository artifact delivery requires an authorized task repository")
+		} else if _, repositoryErr := githubRepositoryForTask(result.DurableWorkDir, task.Repos); repositoryErr != nil {
+			err = fmt.Errorf("repository artifact scope validation failed: %w", repositoryErr)
+		} else if artifactErr := preserveRepositoryArtifact(ctx, filepath.Join(d.cfg.WorkspacesRoot, "recovery"), task.ID, &result, taskLog); artifactErr != nil {
+			err = artifactErr
 		}
 	}
 

@@ -64,7 +64,7 @@ func TestGitHubCredentialSessionKeepsTokenOutOfProviderAndRevokes(t *testing.T) 
 	}
 }
 
-func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.T) {
+func TestHandleTaskDoesNotPublishWithoutExplicitDeliveryIntent(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
 	record := func(call string) { mu.Lock(); calls = append(calls, call); mu.Unlock() }
@@ -113,12 +113,12 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 	mu.Lock()
 	got := append([]string(nil), calls...)
 	mu.Unlock()
-	if strings.Join(got, ",") != "run,acquire" {
-		t.Fatalf("credential lifecycle calls = %v, want [run acquire]", got)
+	if strings.Join(got, ",") != "run" {
+		t.Fatalf("credential lifecycle calls = %v, want [run]", got)
 	}
 }
 
-func TestHandleTaskDerivesGitHubRepoDeliveryBeforeCredentialAcquisition(t *testing.T) {
+func TestHandleTaskPreservesGitHubRepoArtifactWithoutPublishing(t *testing.T) {
 	t.Setenv("IS_SANDBOX", "1")
 	var acquired bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -148,6 +148,7 @@ IFS= read -r _
 printf '%s\n' '{"type":"system","session_id":"session-delivery"}'
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"session-delivery","result":"done"}'
 `))
+	workspacesRoot := t.TempDir()
 	d := &Daemon{
 		client:             NewClient(srv.URL),
 		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -156,7 +157,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 		activeEnvRoots:     make(map[string]int),
 		cancelPollInterval: time.Hour,
 		cfg: Config{
-			WorkspacesRoot: t.TempDir(),
+			WorkspacesRoot: workspacesRoot,
 			AgentTimeout:   5 * time.Second,
 			ServerBaseURL:  srv.URL,
 			Agents:         map[string]AgentEntry{"claude": {Path: fakeBin}},
@@ -167,15 +168,18 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 		ID: "task-delivery", WorkspaceID: "workspace-1", RuntimeID: "runtime-1",
 		IssueID: "issue-1", AgentID: "agent-1", AuthToken: "mat_task", RemoteMCPDaemonToken: "claim-token",
 		Agent: &AgentData{ID: "agent-1", Name: "test-agent"},
-		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}},
+		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}, DeliveryIntent: "artifact",
 	}, 0)
 
-	if !acquired {
-		t.Fatal("handleTask did not acquire GitHub credentials after runTask completed a real repository delivery")
+	if acquired {
+		t.Fatal("handleTask acquired GitHub credentials for artifact-only delivery")
+	}
+	if _, err := os.Stat(filepath.Join(workspacesRoot, "recovery", "task-delivery", "recovery.bundle")); err != nil {
+		t.Fatalf("artifact-only delivery bundle missing: %v", err)
 	}
 }
 
-func TestHandleTaskDerivesInPlaceDeliveryBeforeCredentialAcquisition(t *testing.T) {
+func TestHandleTaskDoesNotImplicitlyPublishInPlaceDelivery(t *testing.T) {
 	t.Setenv("IS_SANDBOX", "1")
 	realGit, err := exec.LookPath("git")
 	if err != nil {
@@ -254,8 +258,8 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 		}},
 	}, 0)
 
-	if !acquired {
-		t.Fatal("handleTask did not acquire GitHub credentials after runTask completed a local_directory/in_place delivery")
+	if acquired {
+		t.Fatal("handleTask acquired GitHub credentials without an explicit delivery intent")
 	}
 }
 
