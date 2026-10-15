@@ -197,8 +197,6 @@ func TestWSHeartbeatFreshnessSuppressesHTTP(t *testing.T) {
 }
 
 func TestReadTaskWakeupMessagesAcceptsLargeRPCResponse(t *testing.T) {
-	overrideTaskWakeupTimings(t, time.Second, 100*time.Millisecond, taskWakeupBackoffResetAfter)
-
 	requestIDs := make(chan string, 1)
 	clientReceived := make(chan struct{})
 	largeInstructions := strings.Repeat("x", 128*1024)
@@ -282,6 +280,11 @@ func TestReadTaskWakeupMessagesAcceptsLargeRPCResponse(t *testing.T) {
 	defer conn.Close()
 
 	d := New(Config{}, slog.Default())
+	d.taskWakeupTimings = taskWakeupTimings{
+		pongWait:          time.Second,
+		writeWait:         100 * time.Millisecond,
+		backoffResetAfter: defaultTaskWakeupTimings.backoffResetAfter,
+	}
 	d.wsRPC = newWSRPCClient(100 * time.Millisecond)
 	d.wsRPC.attach(func(frame []byte) (*wsOutbound, error) {
 		var msg protocol.Message
@@ -349,19 +352,14 @@ func TestReadTaskWakeupMessagesAcceptsLargeRPCResponse(t *testing.T) {
 }
 
 func TestShouldResetTaskWakeupBackoffRequiresStableConnection(t *testing.T) {
-	old := taskWakeupBackoffResetAfter
-	taskWakeupBackoffResetAfter = 10 * time.Second
-	t.Cleanup(func() {
-		taskWakeupBackoffResetAfter = old
-	})
-
-	if shouldResetTaskWakeupBackoff(0) {
+	const resetAfter = 10 * time.Second
+	if shouldResetTaskWakeupBackoff(0, resetAfter) {
 		t.Fatal("zero connection uptime reset backoff")
 	}
-	if shouldResetTaskWakeupBackoff(9 * time.Second) {
+	if shouldResetTaskWakeupBackoff(9*time.Second, resetAfter) {
 		t.Fatal("short connection uptime reset backoff")
 	}
-	if !shouldResetTaskWakeupBackoff(10 * time.Second) {
+	if !shouldResetTaskWakeupBackoff(10*time.Second, resetAfter) {
 		t.Fatal("stable connection uptime did not reset backoff")
 	}
 }
@@ -421,21 +419,6 @@ func (t *closeCountingTransport) CloseIdleConnections() {
 	t.closeCount.Add(1)
 }
 
-func overrideTaskWakeupTimings(t *testing.T, pongWait, writeWait, backoffResetAfter time.Duration) {
-	t.Helper()
-	oldPongWait := taskWakeupPongWait
-	oldWriteWait := taskWakeupWriteWait
-	oldBackoffResetAfter := taskWakeupBackoffResetAfter
-	taskWakeupPongWait = pongWait
-	taskWakeupWriteWait = writeWait
-	taskWakeupBackoffResetAfter = backoffResetAfter
-	t.Cleanup(func() {
-		taskWakeupPongWait = oldPongWait
-		taskWakeupWriteWait = oldWriteWait
-		taskWakeupBackoffResetAfter = oldBackoffResetAfter
-	})
-}
-
 func taskWakeupTestWSURL(httpURL string) string {
 	return strings.Replace(httpURL, "http", "ws", 1)
 }
@@ -481,11 +464,7 @@ func waitForClientWakeup(t *testing.T, clientReceived <-chan struct{}) {
 // frame arrives and readTaskWakeupMessages returns early — which is exactly
 // the failure a daemon would see in production as a wakeup socket that dies
 // every pongWait and silently falls back to polling for work.
-//
-// Deliberately serial: overrideTaskWakeupTimings writes package globals.
 func TestReadTaskWakeupMessagesExtendsReadDeadlineOnPeerTraffic(t *testing.T) {
-	overrideTaskWakeupTimings(t, 120*time.Millisecond, 50*time.Millisecond, taskWakeupBackoffResetAfter)
-
 	for _, tc := range []struct {
 		name string
 		run  func(*testing.T)
@@ -497,6 +476,13 @@ func TestReadTaskWakeupMessagesExtendsReadDeadlineOnPeerTraffic(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { tc.run(t) })
 	}
 }
+
+func newTaskWakeupLivenessTestDaemon() *Daemon {
+	d := New(Config{}, slog.Default())
+	d.taskWakeupTimings = taskWakeupTimings{pongWait: 120 * time.Millisecond, writeWait: 50 * time.Millisecond}
+	return d
+}
+
 func readTaskWakeupMessagesExtendsDeadlineOnServerPing(t *testing.T) {
 	clientReceived := make(chan struct{})
 	taskFrame := mustProtocolFrame(t, protocol.Message{
@@ -536,7 +522,7 @@ func readTaskWakeupMessagesExtendsDeadlineOnServerPing(t *testing.T) {
 	}
 	defer conn.Close()
 
-	d := New(Config{}, slog.Default())
+	d := newTaskWakeupLivenessTestDaemon()
 	taskWakeups := make(chan taskWakeup, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -600,7 +586,7 @@ func readTaskWakeupMessagesExtendsDeadlineOnApplicationMessage(t *testing.T) {
 	}
 	defer conn.Close()
 
-	d := New(Config{}, slog.Default())
+	d := newTaskWakeupLivenessTestDaemon()
 	taskWakeups := make(chan taskWakeup, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -658,7 +644,7 @@ func readTaskWakeupMessagesExtendsDeadlineOnPong(t *testing.T) {
 	}
 	defer conn.Close()
 
-	d := New(Config{}, slog.Default())
+	d := newTaskWakeupLivenessTestDaemon()
 	taskWakeups := make(chan taskWakeup, 1)
 	errCh := make(chan error, 1)
 	go func() {
