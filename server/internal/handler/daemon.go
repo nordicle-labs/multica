@@ -4007,6 +4007,148 @@ func (h *Handler) AcquireTaskGitHubCredentials(w http.ResponseWriter, r *http.Re
 	}
 }
 
+type publicationRecoveryRequest struct {
+	DaemonID   string `json:"daemon_id"`
+	Repository string `json:"repository"`
+	ClaimID    string `json:"claim_id,omitempty"`
+}
+
+// ClaimTaskGitHubPublicationRecovery leases one publication-only retry. The
+// control-plane credential never reaches git; only short-lived App tokens do.
+func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *http.Request) {
+	if middleware.DaemonAuthPathFromContext(r.Context()) != middleware.DaemonAuthPathDaemonToken || strings.TrimSpace(middleware.DaemonIDFromContext(r.Context())) == "" {
+		writeError(w, http.StatusForbidden, "daemon authentication is required")
+		return
+	}
+	runtimeID := chi.URLParam(r, "runtimeId")
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID)
+	if !ok {
+		return
+	}
+	var req publicationRecoveryRequest
+	if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req) != nil {
+		writeError(w, http.StatusBadRequest, "invalid recovery claim")
+		return
+	}
+	req.DaemonID, req.Repository = strings.TrimSpace(req.DaemonID), strings.TrimSpace(req.Repository)
+	if !runtime.DaemonID.Valid || req.DaemonID == "" || runtime.DaemonID.String != req.DaemonID || middleware.DaemonIDFromContext(r.Context()) != req.DaemonID {
+		writeError(w, http.StatusForbidden, "runtime is not assigned to this daemon")
+		return
+	}
+	taskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "taskId")
+	if !ok {
+		return
+	}
+	task, err := h.Queries.GetAgentTask(r.Context(), taskID)
+	if err != nil || task.RuntimeID != runtime.ID || task.Status != "completed" {
+		writeError(w, http.StatusConflict, "task is not recoverable on this runtime")
+		return
+	}
+	project, err := h.taskPublicationProject(r.Context(), task, runtime.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "failed to resolve task repositories")
+		return
+	}
+	repository, err := publicationRepository(project.Repos, req.Repository)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "repository is not authorized for this task")
+		return
+	}
+	req.Repository, err = githubapp.ParseRepository(repository.URL)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "repository is not authorized for this task")
+		return
+	}
+	claimID := dbid.NewV7()
+	var claimedID pgtype.UUID
+	err = h.DB.QueryRow(r.Context(), `
+UPDATE agent_task_queue
+SET context = context || jsonb_build_object('publication_recovery', jsonb_build_object(
+  'state','claimed','claim_id',$4::text,'daemon_id',$5::text,
+  'attempts',COALESCE((context->'publication_recovery'->>'attempts')::int,0)+1,
+  'claim_expires_at',(clock_timestamp()+interval '2 minutes')::text))
+WHERE id=$1 AND runtime_id=$2 AND status='completed'
+  AND context->>'delivery_intent'='publish'
+  AND result->>'recovery_repository'=$3
+  AND result->>'recovery_bundle_verified'='true'
+  AND COALESCE(context->'publication_recovery'->>'state','pending') <> 'completed'
+  AND COALESCE((context->'publication_recovery'->>'attempts')::int,0) < 5
+  AND (context->'publication_recovery'->>'claim_expires_at' IS NULL
+       OR (context->'publication_recovery'->>'claim_expires_at')::timestamptz < clock_timestamp())
+RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.DaemonID).Scan(&claimedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, getErr := h.Queries.GetAgentTask(r.Context(), taskID)
+		if getErr == nil {
+			var state struct {
+				PublicationRecovery struct {
+					State string `json:"state"`
+				} `json:"publication_recovery"`
+			}
+			_ = json.Unmarshal(existing.Context, &state)
+			if state.PublicationRecovery.State == "completed" {
+				writeJSON(w, http.StatusOK, map[string]any{"completed": true})
+				return
+			}
+		}
+		writeError(w, http.StatusConflict, "publication recovery is not claimable")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to claim publication recovery")
+		return
+	}
+	credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, uuidToString(runtime.WorkspaceID), []RepoData{repository})
+	if err != nil {
+		_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=context #- '{publication_recovery,claim_expires_at}' WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID))
+		writeError(w, http.StatusForbidden, "GitHub App authorization failed")
+		return
+	}
+	if err := writeJSONAndFlush(w, http.StatusOK, map[string]any{"claim_id": uuidToString(claimID), "credentials": credentials}); err != nil {
+		revokeGitHubClaimCredentials(githubAppBroker(), credentials)
+	}
+}
+
+func (h *Handler) CompleteTaskGitHubPublicationRecovery(w http.ResponseWriter, r *http.Request) {
+	if middleware.DaemonAuthPathFromContext(r.Context()) != middleware.DaemonAuthPathDaemonToken || strings.TrimSpace(middleware.DaemonIDFromContext(r.Context())) == "" {
+		writeError(w, http.StatusForbidden, "daemon authentication is required")
+		return
+	}
+	runtimeID := chi.URLParam(r, "runtimeId")
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID)
+	if !ok {
+		return
+	}
+	var req publicationRecoveryRequest
+	if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req) != nil {
+		writeError(w, http.StatusBadRequest, "invalid recovery completion")
+		return
+	}
+	if !runtime.DaemonID.Valid || runtime.DaemonID.String != strings.TrimSpace(req.DaemonID) || middleware.DaemonIDFromContext(r.Context()) != strings.TrimSpace(req.DaemonID) {
+		writeError(w, http.StatusForbidden, "runtime is not assigned to this daemon")
+		return
+	}
+	taskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "taskId")
+	if !ok {
+		return
+	}
+	tag, err := h.DB.Exec(r.Context(), `
+UPDATE agent_task_queue
+SET context=jsonb_set(context,'{publication_recovery,state}','"completed"'::jsonb,true)
+WHERE id=$1 AND runtime_id=$2 AND result->>'recovery_repository'=$3
+  AND context->'publication_recovery'->>'claim_id'=$4
+  AND context->'publication_recovery'->>'daemon_id'=$5
+  AND context->'publication_recovery'->>'state'='claimed'`, taskID, runtime.ID, strings.TrimSpace(req.Repository), strings.TrimSpace(req.ClaimID), strings.TrimSpace(req.DaemonID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to complete publication recovery")
+		return
+	}
+	if tag.RowsAffected() != 1 {
+		writeError(w, http.StatusConflict, "stale publication recovery completion")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"completed": true})
+}
+
 func githubInstallationForRepository(installations []db.GithubInstallation, repository string) (db.GithubInstallation, error) {
 	parts := strings.Split(repository, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -4651,6 +4793,7 @@ type TaskCompleteRequest struct {
 	RecoveryRef            string `json:"recovery_ref,omitempty"`
 	RecoveryBundlePath     string `json:"recovery_bundle_path,omitempty"`
 	RecoveryBundleVerified bool   `json:"recovery_bundle_verified,omitempty"`
+	RecoveryRepository     string `json:"recovery_repository,omitempty"`
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -4678,6 +4821,7 @@ func sanitizeTaskCompleteRequest(req *TaskCompleteRequest) {
 	req.BranchName = util.SanitizeTextForPostgres(req.BranchName)
 	req.RecoveryRef = util.SanitizeTextForPostgres(req.RecoveryRef)
 	req.RecoveryBundlePath = util.SanitizeTextForPostgres(req.RecoveryBundlePath)
+	req.RecoveryRepository = util.SanitizeTextForPostgres(req.RecoveryRepository)
 	req.RetiredSessionID = util.SanitizeTextForPostgres(req.RetiredSessionID)
 }
 

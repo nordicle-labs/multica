@@ -299,6 +299,26 @@ func (c *Client) AcquireGitHubCredentials(ctx context.Context, task Task, reposi
 	return response.Credentials, nil
 }
 
+type publicationRecoveryClaim struct {
+	ClaimID     string             `json:"claim_id"`
+	Credentials []GitHubCredential `json:"credentials"`
+	Completed   bool               `json:"completed"`
+}
+
+func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository string) (publicationRecoveryClaim, error) {
+	var response publicationRecoveryClaim
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/claim", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	if err := c.postJSON(ctx, path, map[string]string{"daemon_id": daemonID, "repository": repository}, &response); err != nil {
+		return response, fmt.Errorf("claim GitHub publication recovery: %w", err)
+	}
+	return response, nil
+}
+
+func (c *Client) CompleteGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository, claimID string) error {
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/complete", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	return c.postJSON(ctx, path, map[string]string{"daemon_id": daemonID, "repository": repository, "claim_id": claimID}, nil)
+}
+
 func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, taskID, contributionID string) (http.Header, error) {
 	var response struct {
 		CredentialHeader string `json:"credential_header"`
@@ -693,10 +713,10 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 }
 
 func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", "", false, defaultTerminalRetrySchedule)
+	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", "", false, "", defaultTerminalRetrySchedule)
 }
 
-func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, recoveryRef, recoveryBundlePath string, recoveryBundleVerified bool, schedule []time.Duration) error {
+func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, recoveryRef, recoveryBundlePath string, recoveryBundleVerified bool, recoveryRepository string, schedule []time.Duration) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -714,6 +734,7 @@ func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, outp
 		body["recovery_ref"] = recoveryRef
 		body["recovery_bundle_path"] = recoveryBundlePath
 		body["recovery_bundle_verified"] = recoveryBundleVerified
+		body["recovery_repository"] = recoveryRepository
 	}
 	if sessionRolloutMissing {
 		body["session_rollout_missing"] = true

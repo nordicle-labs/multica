@@ -313,6 +313,7 @@ type TaskResult struct {
 	RecoveryRef            string `json:"recovery_ref,omitempty"`
 	RecoveryBundlePath     string `json:"recovery_bundle_path,omitempty"`
 	RecoveryBundleVerified bool   `json:"recovery_bundle_verified,omitempty"`
+	RecoveryRepository     string `json:"recovery_repository,omitempty"`
 	EnvRoot                string `json:"-"` // env root dir for writing GC metadata (not sent to server)
 	FailureReason          string `json:"-"` // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
 	// SessionRolloutMissing is set when the daemon withheld this task's Codex

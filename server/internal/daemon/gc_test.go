@@ -2422,6 +2422,11 @@ func createGCGitRepo(t *testing.T) string {
 
 func runGitForGC(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	if len(args) == 3 && args[0] == "init" && args[1] == "-b" {
+		branch := args[2]
+		runGitForGC(t, dir, "init")
+		return runGitForGC(t, dir, "symbolic-ref", "HEAD", "refs/heads/"+branch)
+	}
 
 	fullArgs := args
 	if dir != "" {
@@ -2461,10 +2466,16 @@ func TestReconcileRecoveryManifestRetriesWithDaemonIdentityAndPreservesArtifact(
 	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
 	requests := 0
-	d := newGCTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	d := newGCTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
+		var body map[string]string
+		if r.Header.Get("Authorization") != "Bearer test-token" || json.NewDecoder(r.Body).Decode(&body) != nil || body["daemon_id"] != "daemon-1" {
+			http.Error(w, "invalid daemon identity", http.StatusForbidden)
+			return
+		}
 		http.Error(w, "claim token required", http.StatusUnauthorized)
 	}))
+	d.cfg.DaemonID = "daemon-1"
 	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
 	manifest := execenv.RecoveryManifest{
 		TaskID: "restart-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", GitRoot: repo,
@@ -2513,13 +2524,22 @@ func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
 	head := runGitForGC(t, repo, "rev-parse", "HEAD")
 	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
-	var credentials, creates, revocations atomic.Int32
-	var created atomic.Bool
+	var credentials, creates, revocations, completions atomic.Int32
+	var created, serverCompleted atomic.Bool
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/concurrent-task/github-credentials", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/concurrent-task/github-publication-recovery/claim", func(w http.ResponseWriter, _ *http.Request) {
+		if serverCompleted.Load() {
+			_, _ = w.Write([]byte(`{"completed":true}`))
+			return
+		}
 		credentials.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+		_, _ = w.Write([]byte(`{"claim_id":"claim-1","credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+	})
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/concurrent-task/github-publication-recovery/complete", func(w http.ResponseWriter, _ *http.Request) {
+		completions.Add(1)
+		serverCompleted.Store(true)
+		http.Error(w, "response lost after commit", http.StatusInternalServerError)
 	})
 	mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2544,6 +2564,7 @@ func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	d := newGCTestDaemon(t, mux)
+	d.cfg.DaemonID = "daemon-1"
 	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
 	manifest := execenv.RecoveryManifest{
 		TaskID: "concurrent-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", GitRoot: repo,
@@ -2574,13 +2595,20 @@ func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
 	close(start)
 	wg.Wait()
 	close(errs)
+	failed := 0
 	for err := range errs {
 		if err != nil {
-			t.Fatal(err)
+			failed++
 		}
 	}
-	if credentials.Load() != 1 || creates.Load() != 1 || revocations.Load() != 1 {
-		t.Fatalf("credentials=%d PR creates=%d revocations=%d, want one each", credentials.Load(), creates.Load(), revocations.Load())
+	if failed != 1 {
+		t.Fatalf("concurrent recovery errors=%d, want one lost completion response", failed)
+	}
+	if err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, manifest); err != nil {
+		t.Fatalf("read back completed recovery: %v", err)
+	}
+	if credentials.Load() != 1 || creates.Load() != 1 || revocations.Load() != 1 || completions.Load() != 1 {
+		t.Fatalf("credentials=%d PR creates=%d revocations=%d completions=%d, want one each", credentials.Load(), creates.Load(), revocations.Load(), completions.Load())
 	}
 	if _, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID); err != nil || exists {
 		t.Fatalf("completed publication manifest exists=%v err=%v", exists, err)

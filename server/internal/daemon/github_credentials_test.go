@@ -467,11 +467,8 @@ func TestGitHubCredentialSessionRevokesTokenWhenCredentialIsInvalid(t *testing.T
 func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T) {
 	remote := filepath.Join(t.TempDir(), "remote.git")
 	work := filepath.Join(t.TempDir(), "work")
-	for _, cmd := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
-		if out, err := exec.Command("git", cmd...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %s: %v", cmd, out, err)
-		}
-	}
+	gitTestRun(t, "", "init", "--bare", remote)
+	gitTestRun(t, "", "init", "-b", "main", work)
 	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
 		t.Fatalf("git remote add: %s: %v", out, err)
 	}
@@ -532,11 +529,8 @@ func TestGitHubCredentialSessionCreatesAndVerifiesPullRequest(t *testing.T) {
 	const branch = "agent/engineering-developer/herm-959"
 	remote := filepath.Join(t.TempDir(), "remote.git")
 	work := filepath.Join(t.TempDir(), "work")
-	for _, cmd := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
-		if out, err := exec.Command("git", cmd...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %s: %v", cmd, out, err)
-		}
-	}
+	gitTestRun(t, "", "init", "--bare", remote)
+	gitTestRun(t, "", "init", "-b", "main", work)
 	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
 		t.Fatalf("git remote add: %s: %v", out, err)
 	}

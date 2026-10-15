@@ -239,6 +239,7 @@ type terminalTaskReport struct {
 	recoveryRef            string
 	recoveryBundlePath     string
 	recoveryBundleVerified bool
+	recoveryRepository     string
 	failureReason          string
 	// sessionRolloutMissing is true when the daemon withheld this task's Codex
 	// session because its rollout was not in the store (MUL-5305). The server
@@ -5905,10 +5906,12 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		err = errors.New("repository delivery required but finalized delivery is missing workdir, branch, or SHA")
 	}
 	if err == nil && len(task.Repos) > 0 && task.DeliveryIntent != "none" {
-		if _, repositoryErr := githubRepositoryForTask(result.DurableWorkDir, task.Repos); repositoryErr != nil {
+		if repository, repositoryErr := githubRepositoryForTask(result.DurableWorkDir, task.Repos); repositoryErr != nil {
 			err = fmt.Errorf("repository delivery scope validation failed: %w", repositoryErr)
 		} else if artifactErr := preserveRepositoryArtifact(ctx, publicationRecoveryRoot, task.ID, &result, taskLog); artifactErr != nil {
 			err = artifactErr
+		} else {
+			result.RecoveryRepository = repository
 		}
 	}
 	if err == nil && len(task.Repos) > 0 && task.DeliveryIntent == "publish" {
@@ -5983,6 +5986,12 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 
 	if err != nil {
 		d.recoverTaskArtifact(task, result, "finalize", taskLog)
+		if task.DeliveryIntent == "publish" && result.RecoveryBundleVerified && result.RecoveryRepository != "" {
+			taskLog.Error("publication deferred to durable recovery", "error", err, "repository", result.RecoveryRepository)
+			result.Status = "completed"
+			d.reportTaskResult(ctx, task.ID, result, taskLog)
+			return
+		}
 		taskLog.Error("task failed", "error", err)
 		// runTask may have reached worktree finalization before returning the
 		// error. Preserve any delivery metadata that defer attached to the named
@@ -6380,6 +6389,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			recoveryRef:            result.RecoveryRef,
 			recoveryBundlePath:     result.RecoveryBundlePath,
 			recoveryBundleVerified: result.RecoveryBundleVerified,
+			recoveryRepository:     result.RecoveryRepository,
 			sessionRolloutMissing:  result.SessionRolloutMissing,
 			retiredSessionID:       result.RetiredSessionID,
 		})
@@ -6525,7 +6535,7 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	}
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.recoveryRef, report.recoveryBundlePath, report.recoveryBundleVerified, schedule)
+		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.recoveryRef, report.recoveryBundlePath, report.recoveryBundleVerified, report.recoveryRepository, schedule)
 	case terminalTaskReportFail:
 		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	default:

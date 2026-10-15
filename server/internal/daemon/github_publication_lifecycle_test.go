@@ -26,11 +26,8 @@ func TestGitHubPublicationRetryExhaustionAndCancellation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			remote := filepath.Join(t.TempDir(), "remote.git")
 			work := filepath.Join(t.TempDir(), "work")
-			for _, args := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
-				if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-					t.Fatalf("git %v: %s: %v", args, out, err)
-				}
-			}
+			gitTestRun(t, "", "init", "--bare", remote)
+			gitTestRun(t, "", "init", "-b", "main", work)
 			if err := os.WriteFile(filepath.Join(work, "file"), []byte("content"), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -73,11 +70,8 @@ func TestGitHubPublicationRetryExhaustionAndCancellation(t *testing.T) {
 func TestGitHubPublicationRejectsEmptyPullRequest(t *testing.T) {
 	remote := filepath.Join(t.TempDir(), "remote.git")
 	work := filepath.Join(t.TempDir(), "work")
-	for _, args := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
-		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %s: %v", args, out, err)
-		}
-	}
+	gitTestRun(t, "", "init", "--bare", remote)
+	gitTestRun(t, "", "init", "-b", "main", work)
 	if err := os.WriteFile(filepath.Join(work, "file"), []byte("content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
