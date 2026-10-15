@@ -152,12 +152,48 @@ func TestBootstrapRepositoryRefMatchesCanonicalJSONB(t *testing.T) {
 	if !bootstrapRepositoryRefMatches([]byte(`{"default_branch_hint": "main", "url": "https://github.com/nordicle-labs/canonical-jsonb"}`), repoURL) {
 		t.Fatal("semantically identical canonical JSONB did not match")
 	}
-	if bootstrapRepositoryRefMatches([]byte(`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb","extra":"value"}`), repoURL) {
-		t.Fatal("unexpected repository fields were accepted")
+	for _, raw := range []string{
+		`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb","extra":"value"}`,
+		`{"url":"https://github.com/nordicle-labs/canonical-jsonb"}`,
+		`{"default_branch_hint":"main"}`,
+		`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/wrong","url":"https://github.com/nordicle-labs/canonical-jsonb"}`,
+		`{"default_branch_hint":"wrong","default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"}`,
+		`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"} {}`,
+	} {
+		if bootstrapRepositoryRefMatches([]byte(raw), repoURL) {
+			t.Fatalf("invalid repository ref was accepted: %s", raw)
+		}
 	}
-	var ref bootstrapRepositoryRef
-	if err := json.Unmarshal([]byte(`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"}`), &ref); err != nil || ref.URL != repoURL || ref.DefaultBranchHint != githubapp.DefaultBranch {
+	ref, err := decodeBootstrapRepositoryRef([]byte(`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"}`))
+	if err != nil || ref.URL != repoURL || ref.DefaultBranchHint != githubapp.DefaultBranch {
 		t.Fatalf("repository ref = %+v, err = %v", ref, err)
+	}
+}
+
+func TestBootstrapProjectRejectsRepositoryRefWithUnknownField(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const (
+		name    = "unexpected-resource-field"
+		product = "Unexpected Resource Field"
+	)
+	projectID := dbfx.Project(t, product)
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo",
+		"resource_ref": `{"url":"https://github.com/nordicle-labs/unexpected-resource-field","default_branch_hint":"main","unexpected":true}`,
+	})
+	remote := &bootstrapTestRemote{repositories: map[string]bool{name: true}}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	checks, bootstraps, _ := remote.counts()
+	if checks != 0 || bootstraps != 0 {
+		t.Fatalf("remote calls = check %d, bootstrap %d", checks, bootstraps)
 	}
 }
 

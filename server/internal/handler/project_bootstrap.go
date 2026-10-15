@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -189,11 +190,27 @@ func bootstrapLockKeys(workspaceID, product, repoURL string) []string {
 }
 
 func bootstrapRepositoryRefMatches(raw []byte, repoURL string) bool {
-	var ref map[string]string
-	if json.Unmarshal(raw, &ref) != nil || len(ref) != 2 {
+	ref, err := decodeBootstrapRepositoryRef(raw)
+	if err != nil {
 		return false
 	}
-	return ref["url"] == repoURL && ref["default_branch_hint"] == githubapp.DefaultBranch
+	return ref.URL == repoURL && ref.DefaultBranchHint == githubapp.DefaultBranch
+}
+
+func decodeBootstrapRepositoryRef(raw []byte) (bootstrapRepositoryRef, error) {
+	var ref bootstrapRepositoryRef
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return ref, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&ref); err != nil {
+		return ref, err
+	}
+	if ref.URL == "" || ref.DefaultBranchHint == "" {
+		return ref, errors.New("repository ref requires url and default_branch_hint")
+	}
+	return ref, nil
 }
 
 func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UUID, product, repoURL string) (db.Project, string, error) {
@@ -219,8 +236,8 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 			if resource.ResourceType != "github_repo" {
 				continue
 			}
-			var ref bootstrapRepositoryRef
-			if json.Unmarshal(resource.ResourceRef, &ref) != nil {
+			ref, err := decodeBootstrapRepositoryRef(resource.ResourceRef)
+			if err != nil {
 				collision = true
 				continue
 			}
