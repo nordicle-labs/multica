@@ -147,6 +147,50 @@ func TestBootstrapInstallationRequiresOneExactOwner(t *testing.T) {
 	}
 }
 
+func TestBootstrapRepositoryRefMatchesCanonicalJSONB(t *testing.T) {
+	repoURL := "https://github.com/nordicle-labs/canonical-jsonb"
+	if !bootstrapRepositoryRefMatches([]byte(`{"default_branch_hint": "main", "url": "https://github.com/nordicle-labs/canonical-jsonb"}`), repoURL) {
+		t.Fatal("semantically identical canonical JSONB did not match")
+	}
+	if bootstrapRepositoryRefMatches([]byte(`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb","extra":"value"}`), repoURL) {
+		t.Fatal("unexpected repository fields were accepted")
+	}
+}
+
+func TestBootstrapProjectCreatesAndReadsBackResource(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	const (
+		name    = "created-resource-readback"
+		product = "Created Resource Readback"
+	)
+	seedBootstrapInstallation(t)
+	cleanupBootstrapProducts(t, product)
+
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+	if got := dbfx.Count(t, `
+		SELECT count(*)
+		FROM project_resource r
+		JOIN project p ON p.id = r.project_id
+		WHERE p.workspace_id = $1 AND p.title = $2
+		  AND r.resource_type = 'github_repo'
+		  AND r.resource_ref = $3::jsonb`, testWorkspaceID, product,
+		`{"url":"https://github.com/nordicle-labs/created-resource-readback","default_branch_hint":"main"}`); got != 1 {
+		t.Fatalf("created repository resources = %d, want 1", got)
+	}
+	_, _, deletes := remote.counts()
+	if deletes != 0 {
+		t.Fatalf("repository deletes = %d, want 0", deletes)
+	}
+}
+
 func TestBootstrapProjectReadsBackAmbiguousCommitBeforeRollback(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
