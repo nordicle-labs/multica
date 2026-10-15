@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -2433,7 +2434,7 @@ func runGitForGC(t *testing.T, dir string, args ...string) string {
 		fullArgs = append([]string{"-C", dir}, args...)
 	}
 	cmd := exec.Command("git", fullArgs...)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = isolatedGitTestEnv(
 		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
 		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
 	)
@@ -2612,6 +2613,66 @@ func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
 	}
 	if _, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID); err != nil || exists {
 		t.Fatalf("completed publication manifest exists=%v err=%v", exists, err)
+	}
+}
+
+func TestReconcileRecoveryManifestPersistsRevocationFailure(t *testing.T) {
+	repo := createGCGitRepo(t)
+	base := runGitForGC(t, repo, "rev-parse", "HEAD")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runGitForGC(t, "", "init", "--bare", remote)
+	runGitForGC(t, repo, "push", remote, "HEAD:refs/heads/main")
+	runGitForGC(t, repo, "checkout", "-b", "delivery")
+	runGitForGC(t, repo, "commit", "--allow-empty", "-m", "delivery")
+	head := runGitForGC(t, repo, "rev-parse", "HEAD")
+	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/revoke-task/github-publication-recovery/claim", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"claim_id":"claim-1","credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(`{"number":42}`))
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls/42", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"number":42,"html_url":"https://github.test/pull/42","head":{"ref":"delivery","sha":%q},"base":{"ref":"main"}}`, head)
+	})
+	mux.HandleFunc("/installation/token", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	})
+	d := newGCTestDaemon(t, mux)
+	d.cfg.DaemonID = "daemon-1"
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	manifest := execenv.RecoveryManifest{
+		TaskID: "revoke-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", Repository: "owner/repo", GitRoot: repo,
+		CanonicalBranch: "delivery", BaseSHA: base, ExpectedRefSHA: base, HeadSHA: head,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	oldAPI, oldRemote, oldRevoke := githubAPIBaseURL, githubRepositoryRemote, githubInstallationTokenURL
+	githubAPIBaseURL = d.client.baseURL
+	githubRepositoryRemote = func(string) string { return remote }
+	githubInstallationTokenURL = d.client.baseURL + "/installation/token"
+	t.Cleanup(func() {
+		githubAPIBaseURL, githubRepositoryRemote, githubInstallationTokenURL = oldAPI, oldRemote, oldRevoke
+	})
+
+	err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, manifest)
+	if err == nil || !strings.Contains(err.Error(), "revoke recovered task") {
+		t.Fatalf("reconcile error = %v, want durable revocation failure", err)
+	}
+	got, exists, readErr := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID)
+	if readErr != nil || !exists || got.RecoveryAttempts != 1 || !strings.Contains(got.LastError, "revocation") {
+		t.Fatalf("recovery journal exists=%v err=%v manifest=%+v", exists, readErr, got)
+	}
+	data, readErr := os.ReadFile(filepath.Join(recoveryRoot, manifest.TaskID, "manifest.json"))
+	if readErr != nil || bytes.Contains(data, []byte("installation-secret")) {
+		t.Fatalf("manifest persisted credential: err=%v data=%s", readErr, data)
 	}
 }
 

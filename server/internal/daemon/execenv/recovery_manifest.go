@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -20,6 +21,8 @@ const (
 	PublicationBranchPublished   = "branch_published"
 	PublicationPRReadBack        = "PR_read_back"
 	PublicationCredentialRevoked = "credential_revoked"
+	PublicationBlocked           = "blocked"
+	maxRecoveryAttempts          = 5
 )
 
 // ClaimRecoveryPublication serializes publication attempts for one durable
@@ -47,18 +50,81 @@ func ClaimRecoveryPublication(root, taskID string) (release func(), claimed bool
 // launch. A restart can preserve a finalized commit even if publication never
 // ran.
 type RecoveryManifest struct {
-	TaskID            string `json:"task_id"`
-	RuntimeID         string `json:"runtime_id,omitempty"`
-	DeliveryIntent    string `json:"delivery_intent"`
-	GitRoot           string `json:"git_root"`
-	CanonicalBranch   string `json:"canonical_branch"`
-	BaseSHA           string `json:"base_sha"`
-	ExpectedRefSHA    string `json:"expected_ref_sha"`
-	HeadSHA           string `json:"head_sha,omitempty"`
-	PublicationPhase  string `json:"publication_phase"`
-	RemoteSHA         string `json:"remote_sha,omitempty"`
-	PullRequestNumber int    `json:"pull_request_number,omitempty"`
-	PullRequestURL    string `json:"pull_request_url,omitempty"`
+	TaskID            string    `json:"task_id"`
+	RuntimeID         string    `json:"runtime_id,omitempty"`
+	DeliveryIntent    string    `json:"delivery_intent"`
+	Repository        string    `json:"repository,omitempty"`
+	GitRoot           string    `json:"git_root"`
+	CanonicalBranch   string    `json:"canonical_branch"`
+	BaseSHA           string    `json:"base_sha"`
+	ExpectedRefSHA    string    `json:"expected_ref_sha"`
+	HeadSHA           string    `json:"head_sha,omitempty"`
+	PublicationPhase  string    `json:"publication_phase"`
+	RemoteSHA         string    `json:"remote_sha,omitempty"`
+	PullRequestNumber int       `json:"pull_request_number,omitempty"`
+	PullRequestURL    string    `json:"pull_request_url,omitempty"`
+	RecoveryAttempts  int       `json:"recovery_attempts,omitempty"`
+	NextAttemptAt     time.Time `json:"next_attempt_at,omitempty"`
+	LastError         string    `json:"last_error,omitempty"`
+}
+
+// RecordRecoveryFailure persists bounded retry state without storing a token.
+func RecordRecoveryFailure(root, taskID string, failure error) error {
+	manifest, exists, err := ReadRecoveryManifest(root, taskID)
+	if err != nil || !exists {
+		return err
+	}
+	manifest.RecoveryAttempts++
+	manifest.LastError = failure.Error()
+	if len(manifest.LastError) > 1024 {
+		manifest.LastError = manifest.LastError[:1024]
+	}
+	if manifest.RecoveryAttempts >= maxRecoveryAttempts {
+		manifest.PublicationPhase = PublicationBlocked
+		manifest.NextAttemptAt = time.Time{}
+	} else {
+		manifest.NextAttemptAt = time.Now().UTC().Add(time.Duration(manifest.RecoveryAttempts) * time.Minute)
+	}
+	return WriteRecoveryManifest(root, manifest)
+}
+
+func RecoveryRetryReady(manifest RecoveryManifest, now time.Time) bool {
+	return manifest.PublicationPhase != PublicationBlocked && (manifest.NextAttemptAt.IsZero() || !now.Before(manifest.NextAttemptAt))
+}
+
+// MaterializeRecoveryRepository reconstructs an immutable publication checkout
+// from the verified bundle, so retry does not depend on the mutable source tree.
+func MaterializeRecoveryRepository(root string, manifest RecoveryManifest) (string, error) {
+	dir, err := recoveryTaskDir(root, manifest.TaskID)
+	if err != nil {
+		return "", err
+	}
+	bundle := filepath.Join(dir, "recovery.bundle")
+	if _, err := os.Stat(bundle); err != nil {
+		return "", fmt.Errorf("recovery bundle unavailable: %w", err)
+	}
+	checkout := filepath.Join(dir, "repository")
+	if err := os.RemoveAll(checkout); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(checkout, 0o700); err != nil {
+		return "", err
+	}
+	if out, err := runGit(checkout, "init"); err != nil {
+		return "", fmt.Errorf("initialize recovery repository: %s: %w", strings.TrimSpace(out), err)
+	}
+	if out, err := runGit(checkout, "fetch", bundle, "refs/multica/recovery/"+manifest.TaskID); err != nil {
+		return "", fmt.Errorf("fetch recovery bundle: %s: %w", strings.TrimSpace(out), err)
+	}
+	if out, err := runGit(checkout, "checkout", "-B", manifest.CanonicalBranch, manifest.HeadSHA); err != nil {
+		return "", fmt.Errorf("checkout recovery bundle: %s: %w", strings.TrimSpace(out), err)
+	}
+	if manifest.Repository != "" {
+		if out, err := runGit(checkout, "remote", "add", "origin", "https://github.com/"+manifest.Repository+".git"); err != nil {
+			return "", fmt.Errorf("configure recovery repository: %s: %w", strings.TrimSpace(out), err)
+		}
+	}
+	return checkout, nil
 }
 
 func recoveryTaskDir(root, taskID string) (string, error) {
@@ -143,6 +209,9 @@ func WriteFinalizedRecoveryManifest(root string, finalized RecoveryManifest) err
 	existing.HeadSHA = finalized.HeadSHA
 	if existing.RuntimeID == "" {
 		existing.RuntimeID = finalized.RuntimeID
+	}
+	if existing.Repository == "" {
+		existing.Repository = finalized.Repository
 	}
 	return WriteRecoveryManifest(root, existing)
 }

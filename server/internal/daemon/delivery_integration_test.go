@@ -251,7 +251,7 @@ func gitTestRun(t *testing.T, dir string, args ...string) string {
 		args = append([]string{"-C", dir}, args...)
 	}
 	cmd := exec.Command("git", args...)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = isolatedGitTestEnv("GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %s: %v", args, out, err)

@@ -4008,9 +4008,24 @@ func (h *Handler) AcquireTaskGitHubCredentials(w http.ResponseWriter, r *http.Re
 }
 
 type publicationRecoveryRequest struct {
-	DaemonID   string `json:"daemon_id"`
-	Repository string `json:"repository"`
-	ClaimID    string `json:"claim_id,omitempty"`
+	DaemonID            string `json:"daemon_id"`
+	Repository          string `json:"repository"`
+	ClaimID             string `json:"claim_id,omitempty"`
+	RemoteSHA           string `json:"remote_sha,omitempty"`
+	PullRequestNumber   int    `json:"pull_request_number,omitempty"`
+	PullRequestURL      string `json:"pull_request_url,omitempty"`
+	ReadBackHeadSHA     string `json:"readback_head_sha,omitempty"`
+	RevocationConfirmed bool   `json:"revocation_confirmed,omitempty"`
+}
+
+func publicationCredentialFailureState(err error) string {
+	message := strings.ToLower(err.Error())
+	for _, transient := range []string{"github status 429", "github status 5", "timeout", "temporarily unavailable", "connection reset", "connection refused"} {
+		if strings.Contains(message, transient) {
+			return "pending"
+		}
+	}
+	return "blocked"
 }
 
 // ClaimTaskGitHubPublicationRecovery leases one publication-only retry. The
@@ -4065,14 +4080,14 @@ func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *h
 UPDATE agent_task_queue
 SET context = context || jsonb_build_object('publication_recovery', jsonb_build_object(
   'state','claimed','claim_id',$4::text,'daemon_id',$5::text,
-  'attempts',COALESCE((context->'publication_recovery'->>'attempts')::int,0)+1,
+  'claims',COALESCE((context->'publication_recovery'->>'claims')::int,0)+1,
   'claim_expires_at',(clock_timestamp()+interval '2 minutes')::text))
 WHERE id=$1 AND runtime_id=$2 AND status='completed'
   AND context->>'delivery_intent'='publish'
   AND result->>'recovery_repository'=$3
   AND result->>'recovery_bundle_verified'='true'
   AND COALESCE(context->'publication_recovery'->>'state','pending') <> 'completed'
-  AND COALESCE((context->'publication_recovery'->>'attempts')::int,0) < 5
+  AND COALESCE(context->'publication_recovery'->>'state','pending') <> 'blocked'
   AND (context->'publication_recovery'->>'claim_expires_at' IS NULL
        OR (context->'publication_recovery'->>'claim_expires_at')::timestamptz < clock_timestamp())
 RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.DaemonID).Scan(&claimedID)
@@ -4099,12 +4114,19 @@ RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.Da
 	}
 	credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, uuidToString(runtime.WorkspaceID), []RepoData{repository})
 	if err != nil {
-		_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=context #- '{publication_recovery,claim_expires_at}' WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID))
+		state := publicationCredentialFailureState(err)
+		_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context #- '{publication_recovery,claim_expires_at}','{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), state, util.SanitizeTextForPostgres(err.Error()))
 		writeError(w, http.StatusForbidden, "GitHub App authorization failed")
 		return
 	}
 	if err := writeJSONAndFlush(w, http.StatusOK, map[string]any{"claim_id": uuidToString(claimID), "credentials": credentials}); err != nil {
-		revokeGitHubClaimCredentials(githubAppBroker(), credentials)
+		revokeErr := revokeGitHubClaimCredentials(githubAppBroker(), credentials)
+		state := "pending"
+		if revokeErr != nil {
+			state = "revocation_unconfirmed"
+		}
+		_, _ = h.DB.Exec(context.Background(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), state, "credential response lost; revocation confirmed="+strconv.FormatBool(revokeErr == nil))
+		logGitHubCredentialDeliveryFailure(slog.Default(), runtimeID, taskID, revokeErr)
 	}
 }
 
@@ -4127,17 +4149,26 @@ func (h *Handler) CompleteTaskGitHubPublicationRecovery(w http.ResponseWriter, r
 		writeError(w, http.StatusForbidden, "runtime is not assigned to this daemon")
 		return
 	}
+	remoteBytes, shaErr := hex.DecodeString(strings.TrimSpace(req.RemoteSHA))
+	if shaErr != nil || len(remoteBytes) != sha256.Size || req.ReadBackHeadSHA != req.RemoteSHA || req.PullRequestNumber <= 0 || strings.TrimSpace(req.PullRequestURL) == "" || !req.RevocationConfirmed {
+		writeError(w, http.StatusBadRequest, "verified publication evidence is required")
+		return
+	}
 	taskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "taskId")
 	if !ok {
 		return
 	}
 	tag, err := h.DB.Exec(r.Context(), `
 UPDATE agent_task_queue
-SET context=jsonb_set(context,'{publication_recovery,state}','"completed"'::jsonb,true)
+SET context=jsonb_set(context,'{publication_recovery}',jsonb_build_object(
+  'state','completed','claim_id',$4::text,'daemon_id',$5::text,
+  'remote_sha',$6::text,'pull_request_number',$7::int,'pull_request_url',$8::text,
+  'readback_head_sha',$9::text,'revocation_confirmed',true),true)
 WHERE id=$1 AND runtime_id=$2 AND result->>'recovery_repository'=$3
+	  AND result->>'recovery_head_sha'=$6
   AND context->'publication_recovery'->>'claim_id'=$4
   AND context->'publication_recovery'->>'daemon_id'=$5
-  AND context->'publication_recovery'->>'state'='claimed'`, taskID, runtime.ID, strings.TrimSpace(req.Repository), strings.TrimSpace(req.ClaimID), strings.TrimSpace(req.DaemonID))
+	  AND context->'publication_recovery'->>'state'='claimed'`, taskID, runtime.ID, strings.TrimSpace(req.Repository), strings.TrimSpace(req.ClaimID), strings.TrimSpace(req.DaemonID), strings.TrimSpace(req.RemoteSHA), req.PullRequestNumber, strings.TrimSpace(req.PullRequestURL), strings.TrimSpace(req.ReadBackHeadSHA))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to complete publication recovery")
 		return
@@ -4794,6 +4825,7 @@ type TaskCompleteRequest struct {
 	RecoveryBundlePath     string `json:"recovery_bundle_path,omitempty"`
 	RecoveryBundleVerified bool   `json:"recovery_bundle_verified,omitempty"`
 	RecoveryRepository     string `json:"recovery_repository,omitempty"`
+	RecoveryHeadSHA        string `json:"recovery_head_sha,omitempty"`
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -4822,6 +4854,7 @@ func sanitizeTaskCompleteRequest(req *TaskCompleteRequest) {
 	req.RecoveryRef = util.SanitizeTextForPostgres(req.RecoveryRef)
 	req.RecoveryBundlePath = util.SanitizeTextForPostgres(req.RecoveryBundlePath)
 	req.RecoveryRepository = util.SanitizeTextForPostgres(req.RecoveryRepository)
+	req.RecoveryHeadSHA = util.SanitizeTextForPostgres(req.RecoveryHeadSHA)
 	req.RetiredSessionID = util.SanitizeTextForPostgres(req.RetiredSessionID)
 }
 

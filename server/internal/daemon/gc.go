@@ -79,7 +79,7 @@ func (d *Daemon) reconcileRecoveryManifests(ctx context.Context, recoveryRoot st
 	manifests, reconcileErr := execenv.LoadRecoveryManifests(recoveryRoot)
 	resumed := 0
 	for _, manifest := range manifests {
-		if manifest.HeadSHA == "" {
+		if manifest.HeadSHA == "" || !execenv.RecoveryRetryReady(manifest, time.Now()) {
 			continue
 		}
 		if err := d.reconcileRecoveryManifest(ctx, recoveryRoot, manifest); err != nil {
@@ -91,7 +91,7 @@ func (d *Daemon) reconcileRecoveryManifests(ctx context.Context, recoveryRoot st
 	return resumed, reconcileErr
 }
 
-func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot string, manifest execenv.RecoveryManifest) error {
+func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot string, manifest execenv.RecoveryManifest) (returnErr error) {
 	release, claimed, err := execenv.ClaimRecoveryPublication(recoveryRoot, manifest.TaskID)
 	if err != nil {
 		return err
@@ -100,15 +100,25 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 		return nil
 	}
 	defer release()
+	defer func() {
+		if returnErr != nil {
+			returnErr = errors.Join(returnErr, execenv.RecordRecoveryFailure(recoveryRoot, manifest.TaskID, returnErr))
+		}
+	}()
 	manifest, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID)
 	if err != nil || !exists {
 		return err
 	}
-	if err := execenv.VerifyRecoveryManifest(manifest); err != nil {
-		return err
-	}
-	if _, err := execenv.CreateRecoveryArtifact(manifest.GitRoot, recoveryRoot, manifest.TaskID, manifest.HeadSHA, d.logger); err != nil {
-		return err
+	bundle := filepath.Join(recoveryRoot, manifest.TaskID, "recovery.bundle")
+	if _, statErr := os.Stat(bundle); errors.Is(statErr, os.ErrNotExist) {
+		if err := execenv.VerifyRecoveryManifest(manifest); err != nil {
+			return err
+		}
+		if _, err := execenv.CreateRecoveryArtifact(manifest.GitRoot, recoveryRoot, manifest.TaskID, manifest.HeadSHA, d.logger); err != nil {
+			return err
+		}
+	} else if statErr != nil {
+		return statErr
 	}
 	if manifest.DeliveryIntent != "artifact" && manifest.DeliveryIntent != "publish" {
 		return fmt.Errorf("task %s recovery has invalid delivery intent %q", manifest.TaskID, manifest.DeliveryIntent)
@@ -117,9 +127,16 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 		if manifest.RuntimeID == "" {
 			return fmt.Errorf("task %s recovery publication has no runtime identity", manifest.TaskID)
 		}
-		repository, err := githubRepositoryForWorkDir(manifest.GitRoot)
-		if err != nil {
-			return fmt.Errorf("resolve recovery repository for task %s: %w", manifest.TaskID, err)
+		repository := manifest.Repository
+		if repository == "" {
+			repository, err = githubRepositoryForWorkDir(manifest.GitRoot)
+			if err != nil {
+				return fmt.Errorf("resolve recovery repository for task %s: %w", manifest.TaskID, err)
+			}
+			manifest.Repository = repository
+			if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+				return err
+			}
 		}
 		claim, err := d.client.ClaimGitHubPublicationRecovery(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, repository)
 		if err != nil {
@@ -138,11 +155,16 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 		if session == nil {
 			return fmt.Errorf("task %s recovery publication returned no credential", manifest.TaskID)
 		}
+		publicationRepo, err := execenv.MaterializeRecoveryRepository(recoveryRoot, manifest)
+		if err != nil {
+			_ = session.close(context.Background())
+			return fmt.Errorf("materialize recovery bundle for task %s: %w", manifest.TaskID, err)
+		}
 		if err := execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, execenv.PublicationCredentialMinted, "", 0, ""); err != nil {
 			_ = session.close(context.Background())
 			return err
 		}
-		remoteSHA, pullRequest, publishErr := session.finalizePublicationWithProgress(ctx, manifest.GitRoot, manifest.CanonicalBranch, manifest.HeadSHA,
+		remoteSHA, pullRequest, publishErr := session.finalizePublicationWithProgress(ctx, publicationRepo, manifest.CanonicalBranch, manifest.HeadSHA,
 			func(phase, remoteSHA string, pr githubPullRequest) error {
 				return execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, phase, remoteSHA, pr.Number, pr.URL)
 			})
@@ -156,7 +178,7 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 		if err := execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, execenv.PublicationCredentialRevoked, remoteSHA, pullRequest.Number, pullRequest.URL); err != nil {
 			return err
 		}
-		if err := d.client.CompleteGitHubPublicationRecovery(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, repository, claim.ClaimID); err != nil {
+		if err := d.client.CompleteGitHubPublicationRecovery(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, repository, claim.ClaimID, remoteSHA, pullRequest); err != nil {
 			return fmt.Errorf("complete recovered task %s publication claim: %w", manifest.TaskID, err)
 		}
 	}

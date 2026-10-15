@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,55 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+func TestRecoveryJournalUsesBundleAfterOriginalRepositoryDisappears(t *testing.T) {
+	repo := newTestRepo(t)
+	sha := gitRun(t, repo, "rev-parse", "HEAD")
+	root := t.TempDir()
+	manifest := RecoveryManifest{
+		TaskID: "bundle-only", DeliveryIntent: "publish", Repository: "owner/repo",
+		GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha, HeadSHA: sha,
+	}
+	if err := WriteRecoveryManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateRecoveryArtifact(repo, root, manifest.TaskID, sha, worktreeTestLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repo); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := MaterializeRecoveryRepository(root, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gitRun(t, recovered, "rev-parse", "HEAD"); got != sha {
+		t.Fatalf("recovered HEAD = %s, want %s", got, sha)
+	}
+}
+
+func TestRecoveryJournalBoundsTransientFailures(t *testing.T) {
+	repo := newTestRepo(t)
+	sha := gitRun(t, repo, "rev-parse", "HEAD")
+	root := t.TempDir()
+	manifest := RecoveryManifest{TaskID: "failing", DeliveryIntent: "publish", Repository: "owner/repo", GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha, HeadSHA: sha}
+	if err := WriteRecoveryManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	for range maxRecoveryAttempts {
+		if err := RecordRecoveryFailure(root, manifest.TaskID, errors.New("temporary outage")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, exists, err := ReadRecoveryManifest(root, manifest.TaskID)
+	if err != nil || !exists {
+		t.Fatalf("read journal exists=%v err=%v", exists, err)
+	}
+	if got.PublicationPhase != PublicationBlocked || got.RecoveryAttempts != maxRecoveryAttempts || got.LastError == "" {
+		t.Fatalf("bounded recovery journal = %+v", got)
+	}
+}
 
 func TestPublicationJournalPersistsDurableLifecycleWithoutCredential(t *testing.T) {
 	repo := newTestRepo(t)

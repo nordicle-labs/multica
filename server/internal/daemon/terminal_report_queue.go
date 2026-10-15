@@ -57,6 +57,7 @@ type persistedTerminalTaskReport struct {
 	RecoveryBundlePath     string    `json:"recovery_bundle_path,omitempty"`
 	RecoveryBundleVerified bool      `json:"recovery_bundle_verified,omitempty"`
 	RecoveryRepository     string    `json:"recovery_repository,omitempty"`
+	RecoveryHeadSHA        string    `json:"recovery_head_sha,omitempty"`
 	FailureReason          string    `json:"failure_reason,omitempty"`
 	SessionRolloutMissing  bool      `json:"session_rollout_missing,omitempty"`
 	RetiredSessionID       string    `json:"retired_session_id,omitempty"`
@@ -151,6 +152,7 @@ func persistedTerminalReport(report terminalTaskReport, createdAt time.Time) (pe
 		RecoveryBundlePath:     report.recoveryBundlePath,
 		RecoveryBundleVerified: report.recoveryBundleVerified,
 		RecoveryRepository:     report.recoveryRepository,
+		RecoveryHeadSHA:        report.recoveryHeadSHA,
 		FailureReason:          report.failureReason,
 		SessionRolloutMissing:  report.sessionRolloutMissing,
 		RetiredSessionID:       report.retiredSessionID,
@@ -186,6 +188,7 @@ func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, 
 		recoveryBundlePath:     record.RecoveryBundlePath,
 		recoveryBundleVerified: record.RecoveryBundleVerified,
 		recoveryRepository:     record.RecoveryRepository,
+		recoveryHeadSHA:        record.RecoveryHeadSHA,
 		failureReason:          record.FailureReason,
 		sessionRolloutMissing:  record.SessionRolloutMissing,
 		retiredSessionID:       record.RetiredSessionID,

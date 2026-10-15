@@ -240,6 +240,7 @@ type terminalTaskReport struct {
 	recoveryBundlePath     string
 	recoveryBundleVerified bool
 	recoveryRepository     string
+	recoveryHeadSHA        string
 	failureReason          string
 	// sessionRolloutMissing is true when the daemon withheld this task's Codex
 	// session because its rollout was not in the store (MUL-5305). The server
@@ -5922,7 +5923,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		}
 		if err == nil {
 			err = execenv.WriteFinalizedRecoveryManifest(publicationRecoveryRoot, execenv.RecoveryManifest{
-				TaskID: task.ID, RuntimeID: task.RuntimeID, DeliveryIntent: task.DeliveryIntent, GitRoot: descriptor.GitRoot,
+				TaskID: task.ID, RuntimeID: task.RuntimeID, DeliveryIntent: task.DeliveryIntent, Repository: repository, GitRoot: descriptor.GitRoot,
 				CanonicalBranch: result.BranchName, BaseSHA: result.CommitSHA,
 				ExpectedRefSHA: result.CommitSHA, HeadSHA: result.CommitSHA,
 			})
@@ -6390,6 +6391,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			recoveryBundlePath:     result.RecoveryBundlePath,
 			recoveryBundleVerified: result.RecoveryBundleVerified,
 			recoveryRepository:     result.RecoveryRepository,
+			recoveryHeadSHA:        result.CommitSHA,
 			sessionRolloutMissing:  result.SessionRolloutMissing,
 			retiredSessionID:       result.RetiredSessionID,
 		})
@@ -6535,7 +6537,7 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	}
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.recoveryRef, report.recoveryBundlePath, report.recoveryBundleVerified, report.recoveryRepository, schedule)
+		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.recoveryRef, report.recoveryBundlePath, report.recoveryBundleVerified, report.recoveryRepository, report.recoveryHeadSHA, schedule)
 	case terminalTaskReportFail:
 		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	default:

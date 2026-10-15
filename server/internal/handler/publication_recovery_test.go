@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,22 @@ import (
 	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
+func TestPublicationCredentialFailureState(t *testing.T) {
+	for _, tc := range []struct {
+		err  string
+		want string
+	}{
+		{"create installation token: github status 503", "pending"},
+		{"create installation token: connection reset", "pending"},
+		{"create installation token: repository scope mismatch", "blocked"},
+		{"github App installation and permissions are required", "blocked"},
+	} {
+		if got := publicationCredentialFailureState(errors.New(tc.err)); got != tc.want {
+			t.Errorf("state for %q = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
 func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -26,7 +43,7 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id=$2 WHERE id=$1`, runtimeID, daemonID)
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Publication recovery agent")
 	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
-	dbfx.Exec(t, `UPDATE agent_task_queue SET status='completed', completed_at=now(), context='{"delivery_intent":"publish"}', result='{"recovery_repository":"test-owner/test-repo","recovery_bundle_verified":true}' WHERE id=$1`, taskID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status='completed', completed_at=now(), context='{"delivery_intent":"publish"}', result='{"recovery_repository":"test-owner/test-repo","recovery_bundle_verified":true,"recovery_head_sha":"0123456789012345678901234567890123456789"}' WHERE id=$1`, taskID)
 	minted, revoked := setupGitHubClaimRevocation(t, issueID)
 
 	pat := "mul_publication_recovery"
@@ -88,7 +105,8 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	default:
 		t.Fatal("recovery credential was not revoked")
 	}
-	completeBody := []byte(`{"daemon_id":"` + daemonID + `","repository":"test-owner/test-repo","claim_id":"` + claimed.ClaimID + `"}`)
+	const publishedSHA = "0123456789012345678901234567890123456789"
+	completeBody := []byte(`{"daemon_id":"` + daemonID + `","repository":"test-owner/test-repo","claim_id":"` + claimed.ClaimID + `","remote_sha":"` + publishedSHA + `","pull_request_number":42,"pull_request_url":"https://github.test/pull/42","readback_head_sha":"` + publishedSHA + `","revocation_confirmed":true}`)
 	completePath := "/api/daemon/runtimes/" + runtimeID + "/tasks/" + taskID + "/github-publication-recovery/complete"
 	request := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, completePath, bytes.NewReader(completeBody))
@@ -99,6 +117,11 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	}
 	if w := request(); w.Code != http.StatusOK {
 		t.Fatalf("complete status=%d body=%s", w.Code, w.Body.String())
+	}
+	var persisted string
+	dbfx.QueryRow(t, `SELECT context->'publication_recovery'->>'remote_sha' FROM agent_task_queue WHERE id=$1`, taskID).Scan(&persisted)
+	if persisted != publishedSHA {
+		t.Fatalf("persisted publication SHA = %q", persisted)
 	}
 	if w := request(); w.Code != http.StatusConflict {
 		t.Fatalf("stale complete status=%d body=%s", w.Code, w.Body.String())

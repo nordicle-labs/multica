@@ -20,12 +20,12 @@ func TestCompleteTaskCarriesRecoveryDescriptor(t *testing.T) {
 
 	err := NewClient(srv.URL).completeTaskWithRetrySchedule(
 		context.Background(), "task-1", "done", "branch", "", "/work", false, "", "/durable",
-		"refs/multica/recovery/task-1", "/recovery/task-1/recovery.bundle", true, "owner/repo", nil,
+		"refs/multica/recovery/task-1", "/recovery/task-1/recovery.bundle", true, "owner/repo", "0123456789012345678901234567890123456789", nil,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if body["recovery_ref"] != "refs/multica/recovery/task-1" || body["recovery_bundle_verified"] != true || body["recovery_repository"] != "owner/repo" {
+	if body["recovery_ref"] != "refs/multica/recovery/task-1" || body["recovery_bundle_verified"] != true || body["recovery_repository"] != "owner/repo" || body["recovery_head_sha"] != "0123456789012345678901234567890123456789" {
 		t.Fatalf("recovery descriptor = %#v", body)
 	}
 }

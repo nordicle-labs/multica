@@ -314,9 +314,14 @@ func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, r
 	return response, nil
 }
 
-func (c *Client) CompleteGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository, claimID string) error {
+func (c *Client) CompleteGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository, claimID, remoteSHA string, pullRequest githubPullRequest) error {
 	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/complete", url.PathEscape(runtimeID), url.PathEscape(taskID))
-	return c.postJSON(ctx, path, map[string]string{"daemon_id": daemonID, "repository": repository, "claim_id": claimID}, nil)
+	return c.postJSON(ctx, path, map[string]any{
+		"daemon_id": daemonID, "repository": repository, "claim_id": claimID,
+		"remote_sha": remoteSHA, "pull_request_number": pullRequest.Number,
+		"pull_request_url": pullRequest.URL, "readback_head_sha": pullRequest.HeadSHA,
+		"revocation_confirmed": true,
+	}, nil)
 }
 
 func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, taskID, contributionID string) (http.Header, error) {
@@ -713,10 +718,10 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 }
 
 func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", "", false, "", defaultTerminalRetrySchedule)
+	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", "", false, "", "", defaultTerminalRetrySchedule)
 }
 
-func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, recoveryRef, recoveryBundlePath string, recoveryBundleVerified bool, recoveryRepository string, schedule []time.Duration) error {
+func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, recoveryRef, recoveryBundlePath string, recoveryBundleVerified bool, recoveryRepository, recoveryHeadSHA string, schedule []time.Duration) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -735,6 +740,7 @@ func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, outp
 		body["recovery_bundle_path"] = recoveryBundlePath
 		body["recovery_bundle_verified"] = recoveryBundleVerified
 		body["recovery_repository"] = recoveryRepository
+		body["recovery_head_sha"] = recoveryHeadSHA
 	}
 	if sessionRolloutMissing {
 		body["session_rollout_missing"] = true
