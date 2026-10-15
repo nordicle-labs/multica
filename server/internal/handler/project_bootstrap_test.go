@@ -2,31 +2,77 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/githubapp"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-type bootstrapTestRemote struct{ deletes int }
+type bootstrapTestRemote struct {
+	mu             sync.Mutex
+	repositories   map[string]bool
+	checks         int
+	bootstraps     int
+	deletes        int
+	checkErr       error
+	bootstrapErr   error
+	deleteErr      error
+	bootstrapState string
+}
 
-func (r *bootstrapTestRemote) Check(context.Context, int64, string, string, string) (bool, githubapp.BootstrapResult, error) {
-	return false, githubapp.BootstrapResult{}, nil
+func (r *bootstrapTestRemote) Check(_ context.Context, _ int64, name, _, _ string) (bool, githubapp.BootstrapResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.checks++
+	return r.repositories[name], githubapp.BootstrapResult{State: "unchanged", RepositoryID: 123, RepositoryURL: "https://github.com/nordicle-labs/" + name, Branch: "main"}, r.checkErr
 }
 
 func (r *bootstrapTestRemote) Bootstrap(_ context.Context, _ int64, name, _, _ string) (githubapp.BootstrapResult, error) {
-	return githubapp.BootstrapResult{State: "created", RepositoryID: 123, RepositoryURL: "https://github.com/nordicle-labs/" + name, Branch: "main"}, nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bootstraps++
+	if r.bootstrapErr != nil {
+		return githubapp.BootstrapResult{}, r.bootstrapErr
+	}
+	state := r.bootstrapState
+	if state == "" {
+		state = "created"
+	}
+	if r.repositories[name] {
+		state = "unchanged"
+	} else if state == "created" {
+		if r.repositories == nil {
+			r.repositories = map[string]bool{}
+		}
+		r.repositories[name] = true
+	}
+	return githubapp.BootstrapResult{State: state, RepositoryID: 123, RepositoryURL: "https://github.com/nordicle-labs/" + name, Branch: "main"}, nil
 }
 
-func (r *bootstrapTestRemote) Delete(context.Context, int64, string, int64) error {
+func (r *bootstrapTestRemote) Delete(_ context.Context, _ int64, name string, _ int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.deletes++
-	return nil
+	if r.deleteErr == nil {
+		delete(r.repositories, name)
+	}
+	return r.deleteErr
+}
+
+func (r *bootstrapTestRemote) counts() (checks, bootstraps, deletes int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.checks, r.bootstraps, r.deletes
 }
 
 type bootstrapCommitTx struct {
@@ -56,6 +102,18 @@ func TestBootstrapProjectRequiresHumanActor(t *testing.T) {
 	(&Handler{}).BootstrapProject(response, req)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("status = %d", response.Code)
+	}
+}
+
+func TestBootstrapProjectRouteRequiresHumanActor(t *testing.T) {
+	router := chi.NewRouter()
+	router.With(RequireHumanActor).Post("/api/projects/bootstrap", (&Handler{}).BootstrapProject)
+	req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", strings.NewReader(`{}`))
+	req.Header.Set("X-Actor-Source", "task_token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", response.Code)
 	}
 }
 
@@ -113,8 +171,9 @@ func TestBootstrapProjectReadsBackAmbiguousCommitBeforeRollback(t *testing.T) {
 		"X-Workspace-ID", testWorkspaceID,
 	)
 	testutil.Call(t, h.BootstrapProject, req).Want(http.StatusCreated)
-	if remote.deletes != 0 {
-		t.Fatalf("deleted committed repository %d times", remote.deletes)
+	_, _, deletes := remote.counts()
+	if deletes != 0 {
+		t.Fatalf("deleted committed repository %d times", deletes)
 	}
 }
 
@@ -140,9 +199,212 @@ func TestBootstrapProjectDeletesRepositoryAfterCommitReadbackProvesAbsent(t *tes
 		"X-Workspace-ID", testWorkspaceID,
 	)
 	testutil.Call(t, h.BootstrapProject, req).Want(http.StatusInternalServerError)
-	if remote.deletes != 1 {
-		t.Fatalf("repository deletes = %d, want 1 after absent DB readback", remote.deletes)
+	_, _, deletes := remote.counts()
+	if deletes != 1 {
+		t.Fatalf("repository deletes = %d, want 1 after absent DB readback", deletes)
 	}
+}
+
+func TestBootstrapProjectAllowsOwnerAndAdminButRejectsMember(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	adminID := dbfx.User(t, "Bootstrap Admin", "bootstrap-admin@multica.test")
+	dbfx.Member(t, testWorkspaceID, adminID, "admin")
+	memberID := dbfx.User(t, "Bootstrap Member", "bootstrap-member@multica.test")
+	dbfx.Member(t, testWorkspaceID, memberID, "member")
+
+	for _, tc := range []struct {
+		role, userID, name, product string
+		want                        int
+	}{
+		{"owner", testUserID, "role-owner", "Bootstrap Role Owner", http.StatusCreated},
+		{"admin", adminID, "role-admin", "Bootstrap Role Admin", http.StatusCreated},
+		{"member", memberID, "role-member", "Bootstrap Role Member", http.StatusForbidden},
+	} {
+		t.Run(tc.role, func(t *testing.T) {
+			remote := &bootstrapTestRemote{}
+			h := *testHandler
+			h.ProjectBootstrap = remote
+			response := callBootstrap(t, &h, tc.userID, tc.name, tc.product)
+			if response.Code != tc.want {
+				t.Fatalf("status = %d, want %d: %s", response.Code, tc.want, response.Body.String())
+			}
+			if tc.want == http.StatusCreated {
+				var out projectBootstrapResponse
+				if err := json.NewDecoder(response.Body).Decode(&out); err != nil || out.State != "created" || out.Project.ID == "" {
+					t.Fatalf("malformed bootstrap response: %+v, %v", out, err)
+				}
+			}
+			_, bootstraps, _ := remote.counts()
+			if bootstraps != boolInt(tc.want == http.StatusCreated) {
+				t.Fatalf("GitHub bootstraps = %d", bootstraps)
+			}
+		})
+	}
+	cleanupBootstrapProducts(t, "Bootstrap Role Owner", "Bootstrap Role Admin")
+}
+
+func TestBootstrapProjectFailsClosedOnLocalCollisionsAndAdoption(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+
+	t.Run("product collision", func(t *testing.T) {
+		dbfx.Project(t, "Bootstrap Product Collision")
+		remote := &bootstrapTestRemote{}
+		h := *testHandler
+		h.ProjectBootstrap = remote
+		response := callBootstrap(t, &h, testUserID, "product-collision", "Bootstrap Product Collision")
+		if response.Code != http.StatusConflict {
+			t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+		}
+		checks, bootstraps, _ := remote.counts()
+		if checks != 0 || bootstraps != 0 {
+			t.Fatalf("remote called before local collision check: checks=%d bootstraps=%d", checks, bootstraps)
+		}
+	})
+
+	t.Run("resource collision", func(t *testing.T) {
+		projectID := dbfx.Project(t, "Other Bootstrap Product")
+		dbfx.Insert(t, "project_resource", testutil.Cols{
+			"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo",
+			"resource_ref": `{"url":"https://github.com/nordicle-labs/resource-collision","default_branch_hint":"main"}`,
+		})
+		remote := &bootstrapTestRemote{}
+		h := *testHandler
+		h.ProjectBootstrap = remote
+		response := callBootstrap(t, &h, testUserID, "resource-collision", "Bootstrap Resource Collision")
+		if response.Code != http.StatusConflict {
+			t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("repository appears after preflight", func(t *testing.T) {
+		remote := &bootstrapTestRemote{bootstrapState: "unchanged"}
+		h := *testHandler
+		h.ProjectBootstrap = remote
+		response := callBootstrap(t, &h, testUserID, "appeared", "Bootstrap Appeared")
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "refusing to adopt") {
+			t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+		}
+		if got := dbfx.Count(t, `SELECT count(*) FROM project WHERE workspace_id = $1 AND title = $2`, testWorkspaceID, "Bootstrap Appeared"); got != 0 {
+			t.Fatalf("adopted repository created %d projects", got)
+		}
+	})
+}
+
+func TestBootstrapProjectSerializesDuplicateSubmissions(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const product = "Bootstrap Concurrent Product"
+	cleanupBootstrapProducts(t, product)
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	for range 2 {
+		go func() {
+			<-start
+			statuses <- callBootstrap(t, &h, testUserID, "concurrent-bootstrap", product).Code
+		}()
+	}
+	close(start)
+	got := []int{<-statuses, <-statuses}
+	slices.Sort(got)
+	if !slices.Equal(got, []int{http.StatusOK, http.StatusCreated}) {
+		t.Fatalf("statuses = %v", got)
+	}
+	_, bootstraps, _ := remote.counts()
+	if bootstraps != 1 || dbfx.Count(t, `SELECT count(*) FROM project WHERE workspace_id = $1 AND title = $2`, testWorkspaceID, product) != 1 {
+		t.Fatalf("bootstraps = %d; duplicate local project created", bootstraps)
+	}
+}
+
+func TestBootstrapProjectSerializesSameProductAcrossRepositories(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const product = "Bootstrap Concurrent Product Collision"
+	cleanupBootstrapProducts(t, product)
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	for _, name := range []string{"concurrent-product-one", "concurrent-product-two"} {
+		go func() {
+			<-start
+			statuses <- callBootstrap(t, &h, testUserID, name, product).Code
+		}()
+	}
+	close(start)
+	got := []int{<-statuses, <-statuses}
+	slices.Sort(got)
+	if !slices.Equal(got, []int{http.StatusCreated, http.StatusConflict}) {
+		t.Fatalf("statuses = %v", got)
+	}
+	_, bootstraps, _ := remote.counts()
+	if bootstraps != 1 || dbfx.Count(t, `SELECT count(*) FROM project WHERE workspace_id = $1 AND title = $2`, testWorkspaceID, product) != 1 {
+		t.Fatalf("bootstraps = %d; product collision created duplicates", bootstraps)
+	}
+}
+
+func TestBootstrapProjectReportsIncompleteRollback(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	remote := &bootstrapTestRemote{deleteErr: errors.New("injected delete failure")}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	h.TxStarter = bootstrapTxStarter{txStarter: testHandler.TxStarter, commit: func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.Rollback(ctx); err != nil {
+			return err
+		}
+		return pgx.ErrTxCommitRollback
+	}}
+	response := callBootstrap(t, &h, testUserID, "rollback-incomplete", "Bootstrap Rollback Incomplete")
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "rollback incomplete; reconcile repository") {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	_, _, deletes := remote.counts()
+	if deletes != 1 {
+		t.Fatalf("deletes = %d, want 1", deletes)
+	}
+}
+
+func callBootstrap(t *testing.T, h *Handler, userID, name, product string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := testutil.WithHeaders(
+		testutil.JSONRequest(http.MethodPost, "/api/projects/bootstrap", map[string]string{"name": name, "visibility": "private", "product": product}),
+		"X-User-ID", userID,
+		"X-Workspace-ID", testWorkspaceID,
+	)
+	response := httptest.NewRecorder()
+	h.BootstrapProject(response, req)
+	return response
+}
+
+func cleanupBootstrapProducts(t *testing.T, products ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM project_resource WHERE project_id IN (SELECT id FROM project WHERE workspace_id = $1 AND title = ANY($2))`, testWorkspaceID, products)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM project WHERE workspace_id = $1 AND title = ANY($2)`, testWorkspaceID, products)
+	})
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func seedBootstrapInstallation(t *testing.T) {

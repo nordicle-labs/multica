@@ -177,12 +177,17 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 			err = fmt.Errorf("%w; rollback incomplete; reconcile repository %s/%s", err, BootstrapOwner, name)
 		}
 	}()
-	var possiblyCreated bool
-	result.RepositoryID, possiblyCreated, err = b.createRepository(ctx, token, name, visibility)
-	created = possiblyCreated
+	var creationAmbiguous bool
+	result.RepositoryID, creationAmbiguous, err = b.createRepository(ctx, token, name, visibility)
 	if err != nil {
+		if creationAmbiguous {
+			readbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			err = b.reconcileAmbiguousCreate(readbackCtx, token, name, err)
+		}
 		return result, err
 	}
+	created = true
 	if err = b.attestRepository(ctx, token, name, result.RepositoryID); err != nil {
 		return result, err
 	}
@@ -249,7 +254,7 @@ func (b Bootstrapper) repositoryExists(ctx context.Context, token, name string) 
 func (b Bootstrapper) createRepository(ctx context.Context, token, name, visibility string) (int64, bool, error) {
 	status, raw, err := b.request(ctx, token, http.MethodPost, "/orgs/"+BootstrapOwner+"/repos", map[string]any{"name": name, "visibility": visibility, "private": visibility == "private", "auto_init": false})
 	if err != nil || status != http.StatusCreated {
-		return 0, status == http.StatusCreated, fmt.Errorf("create repository: github status %d: %w", status, err)
+		return 0, err != nil || status == http.StatusCreated, fmt.Errorf("create repository: github status %d: %w", status, err)
 	}
 	var repo struct {
 		ID int64 `json:"id"`
@@ -258,6 +263,23 @@ func (b Bootstrapper) createRepository(ctx context.Context, token, name, visibil
 		return 0, true, errors.New("create repository: immutable repository ID missing")
 	}
 	return repo.ID, true, nil
+}
+
+func (b Bootstrapper) reconcileAmbiguousCreate(ctx context.Context, token, name string, createErr error) error {
+	status, raw, err := b.request(ctx, token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name, nil)
+	if err == nil && status == http.StatusNotFound {
+		return fmt.Errorf("%w; repository creation readback confirmed absent", createErr)
+	}
+	if err == nil && status == http.StatusOK {
+		var repo struct {
+			ID       int64  `json:"id"`
+			FullName string `json:"full_name"`
+		}
+		if json.Unmarshal(raw, &repo) == nil && repo.ID > 0 && repo.FullName == BootstrapOwner+"/"+name {
+			return fmt.Errorf("%w; creation outcome is ambiguous; reconcile repository %s/%s (immutable ID %d)", createErr, BootstrapOwner, name, repo.ID)
+		}
+	}
+	return fmt.Errorf("%w; creation outcome readback failed; reconcile repository %s/%s", createErr, BootstrapOwner, name)
 }
 
 func (b Bootstrapper) attestRepository(ctx context.Context, token, name string, expectedID int64) error {
