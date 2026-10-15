@@ -1,14 +1,14 @@
 .PHONY: build test lint smoke rollback preview release
 build:
-	@mkdir -p artifacts && printf 'build\n' > artifacts/build
+	@mkdir -p artifacts && go build -trimpath -o artifacts/build .
 test:
-	@test -f .multica/environment.json
+	@mkdir -p artifacts && go test ./... > artifacts/test
 lint:
-	@test -f AGENTS.md
-smoke:
-	@mkdir -p artifacts && printf 'smoke\n' > artifacts/smoke
+	@go vet ./...
+smoke: build
+	@mkdir -p artifacts && ./artifacts/build --smoke > artifacts/smoke
 rollback:
-	@printf 'rollback hook (non-production)\n'
+	@rm -rf artifacts
 preview:
 	@printf 'preview disabled by default\n'
 release:

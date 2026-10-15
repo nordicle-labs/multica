@@ -1,5 +1,5 @@
 {
-  "image": "golang:1.26.6@sha256:8f395b595758a42f4a89d540f39c9930900f72b29d0df83657959c2406b90824",
+  "image": "golang:1.24.6@sha256:5dd5ee67fcaefe857e0e5885ecd6b9b570dea93fa70ff90b559a21eda3d9b912",
   "commands": {
     "build": "make build",
     "test": "make test",

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -87,6 +88,19 @@ func TestMintRejectsTokenScopedToDifferentOwner(t *testing.T) {
 	}
 	if !revoked {
 		t.Fatal("Mint did not revoke the mismatched token")
+	}
+}
+
+func TestMintInstallationRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"token":"must-not-be-accepted"}` + strings.Repeat(" ", responseLimit)))
+	}))
+	defer server.Close()
+
+	broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client()}
+	if _, err := broker.MintInstallation(context.Background(), 42, Permissions{"metadata": "read"}); err == nil {
+		t.Fatal("MintInstallation accepted a response larger than the limit")
 	}
 }
 

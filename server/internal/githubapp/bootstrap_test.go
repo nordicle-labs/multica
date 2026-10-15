@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -28,8 +31,16 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	defer g.mu.Unlock()
 	path := r.URL.Path
 	if strings.HasPrefix(path, "/app/installations/") && strings.HasSuffix(path, "/access_tokens") {
+		var body struct {
+			Repositories []string `json:"repositories"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"token":"test-installation-token"}`))
+		if len(body.Repositories) == 1 {
+			_, _ = w.Write([]byte(`{"token":"test-installation-token","repositories":[{"full_name":"nordicle-labs/widget"}]}`))
+		} else {
+			_, _ = w.Write([]byte(`{"token":"test-installation-token"}`))
+		}
 		return
 	}
 	if path == "/installation/token" {
@@ -43,6 +54,7 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		g.visibility, _ = body["visibility"].(string)
 		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":123}`))
 		return
 	}
 	if path == "/repos/nordicle-labs/widget" && r.Method == http.MethodDelete {
@@ -56,7 +68,7 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"full_name": "nordicle-labs/widget", "visibility": g.visibility, "default_branch": "main"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 123, "full_name": "nordicle-labs/widget", "visibility": g.visibility, "default_branch": "main"})
 		return
 	}
 	const contents = "/repos/nordicle-labs/widget/contents/"
@@ -91,7 +103,14 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"required_status_checks": map[string]any{"contexts": RequiredChecks}})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"required_status_checks":        map[string]any{"strict": true, "contexts": RequiredChecks},
+			"enforce_admins":                map[string]bool{"enabled": true},
+			"required_pull_request_reviews": map[string]int{"required_approving_review_count": 1},
+			"restrictions":                  nil,
+			"allow_force_pushes":            map[string]bool{"enabled": false},
+			"allow_deletions":               map[string]bool{"enabled": false},
+		})
 		return
 	}
 	if strings.HasSuffix(path, "/git/ref/heads/main") {
@@ -143,6 +162,18 @@ func TestBootstrapCreatesCanonicalRepositoryAndSecondPassIsUnchanged(t *testing.
 	}
 }
 
+func TestBootstrapRejectsExistingRepositoryWithChangedTemplateFile(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}}
+	bootstrapper := testBootstrapper(t, state)
+	if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product"); err != nil {
+		t.Fatal(err)
+	}
+	state.files["README.md"] = base64.StdEncoding.EncodeToString([]byte("changed\n"))
+	if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product"); err == nil {
+		t.Fatal("changed template file was accepted as unchanged")
+	}
+}
+
 func TestBootstrapRollsBackOnlyRepositoryCreatedByCall(t *testing.T) {
 	state := &bootstrapGitHub{files: map[string]string{}, failProtection: true}
 	bootstrapper := testBootstrapper(t, state)
@@ -151,6 +182,17 @@ func TestBootstrapRollsBackOnlyRepositoryCreatedByCall(t *testing.T) {
 		t.Fatal("expected injected protection failure")
 	}
 	if state.repository || state.deleteCount != 1 {
+		t.Fatalf("repository=%v deletes=%d", state.repository, state.deleteCount)
+	}
+}
+
+func TestDeleteRefusesRepositoryIdentityMismatch(t *testing.T) {
+	state := &bootstrapGitHub{repository: true, visibility: "private", files: map[string]string{}}
+	bootstrapper := testBootstrapper(t, state)
+	if err := bootstrapper.Delete(context.Background(), 42, "widget", 999); err == nil {
+		t.Fatal("Delete accepted a different immutable repository ID")
+	}
+	if !state.repository || state.deleteCount != 0 {
 		t.Fatalf("repository=%v deletes=%d", state.repository, state.deleteCount)
 	}
 }
@@ -181,6 +223,37 @@ func TestCanonicalTemplateIsDeterministicAndContainsNoSecrets(t *testing.T) {
 		if !strings.Contains(joined, command) {
 			t.Errorf("template missing %q", command)
 		}
+	}
+}
+
+func TestCanonicalTemplateCommandsExecute(t *testing.T) {
+	fingerprint, err := TemplateFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := canonicalTemplateFiles("Widget", fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	for path, data := range files {
+		fullPath := filepath.Join(dir, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, target := range []string{"build", "test", "lint", "smoke", "rollback"} {
+		cmd := exec.Command("make", target)
+		cmd.Dir = dir
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("make %s: %v\n%s", target, err, output)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "artifacts")); !os.IsNotExist(err) {
+		t.Fatalf("rollback left artifacts: %v", err)
 	}
 }
 

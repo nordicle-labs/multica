@@ -6,16 +6,20 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps: [{uses: actions/checkout@v4}, {run: make build}]
+    container: golang:1.24.6@sha256:5dd5ee67fcaefe857e0e5885ecd6b9b570dea93fa70ff90b559a21eda3d9b912
+    steps: [{uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683}, {run: make build}]
   lint:
     runs-on: ubuntu-latest
-    steps: [{uses: actions/checkout@v4}, {run: make lint}]
+    container: golang:1.24.6@sha256:5dd5ee67fcaefe857e0e5885ecd6b9b570dea93fa70ff90b559a21eda3d9b912
+    steps: [{uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683}, {run: make lint}]
   test:
     runs-on: ubuntu-latest
-    steps: [{uses: actions/checkout@v4}, {run: make test}]
+    container: golang:1.24.6@sha256:5dd5ee67fcaefe857e0e5885ecd6b9b570dea93fa70ff90b559a21eda3d9b912
+    steps: [{uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683}, {run: make test}]
   smoke:
     runs-on: ubuntu-latest
-    steps: [{uses: actions/checkout@v4}, {run: make smoke}]
+    container: golang:1.24.6@sha256:5dd5ee67fcaefe857e0e5885ecd6b9b570dea93fa70ff90b559a21eda3d9b912
+    steps: [{uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683}, {run: make smoke}]
   preview:
     if: ${{ false }}
     runs-on: ubuntu-latest
