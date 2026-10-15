@@ -26,6 +26,17 @@ type Credential struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 }
 
+// MintFailure records what the broker knows about a failed token request.
+// NoCredential is true only when GitHub proved that no token was created.
+type MintFailure struct {
+	Err          error
+	NoCredential bool
+	Retryable    bool
+}
+
+func (e *MintFailure) Error() string { return e.Err.Error() }
+func (e *MintFailure) Unwrap() error { return e.Err }
+
 type Broker struct {
 	AppID      string
 	PrivateKey string
@@ -87,12 +98,16 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client().Do(req)
 	if err != nil {
-		return Credential{}, fmt.Errorf("create installation token: %w", err)
+		return Credential{}, &MintFailure{Err: fmt.Errorf("create installation token: %w", err), Retryable: true}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, responseLimit))
-		return Credential{}, fmt.Errorf("create installation token: github status %d", resp.StatusCode)
+		return Credential{}, &MintFailure{
+			Err:          fmt.Errorf("create installation token: github status %d", resp.StatusCode),
+			NoCredential: true,
+			Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError,
+		}
 	}
 	var out struct {
 		Token        string    `json:"token"`
@@ -102,17 +117,17 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 		} `json:"repositories"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, responseLimit)).Decode(&out); err != nil {
-		return Credential{}, errors.New("create installation token: malformed response")
+		return Credential{}, &MintFailure{Err: errors.New("create installation token: malformed response"), Retryable: true}
 	}
 	if out.Token == "" {
-		return Credential{}, errors.New("create installation token: empty token")
+		return Credential{}, &MintFailure{Err: errors.New("create installation token: empty token"), Retryable: true}
 	}
 	if out.ExpiresAt.IsZero() {
 		out.ExpiresAt = time.Now().Add(time.Hour)
 	}
 	if len(out.Repositories) != 1 || !strings.EqualFold(out.Repositories[0].FullName, repository) {
-		_ = b.Revoke(context.Background(), out.Token)
-		return Credential{}, errors.New("create installation token: repository scope mismatch")
+		revokeErr := b.Revoke(context.Background(), out.Token)
+		return Credential{}, &MintFailure{Err: errors.Join(errors.New("create installation token: repository scope mismatch"), revokeErr), NoCredential: revokeErr == nil}
 	}
 	return Credential{Repository: repository, Token: out.Token, ExpiresAt: out.ExpiresAt}, nil
 }

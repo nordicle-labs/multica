@@ -10,8 +10,6 @@ import (
 	"strings"
 )
 
-const identityConfigInclude = "# Multica identity defaults; explicit worktree settings below take precedence.\n[include]\n\tpath = multica-identity.config\n"
-
 // isolateWorktreeIdentityContext masks identity inherited from the shared cache
 // without rewriting it: other, possibly running, worktrees must not change.
 // The user's system/global config (including conditional includes evaluated in
@@ -40,9 +38,6 @@ func isolateWorktreeIdentityContext(ctx context.Context, barePath, checkoutPath 
 	if !sameResolvedPath(commonDir, barePath) {
 		return fmt.Errorf("linked worktree common dir %s does not match cache %s", commonDir, barePath)
 	}
-	if err := enableWorktreeConfigContext(ctx, barePath); err != nil {
-		return err
-	}
 	out, err = runGitOutputContext(ctx, "-C", checkoutPath, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return fmt.Errorf("resolve worktree config directory: %w", err)
@@ -67,74 +62,51 @@ func isolateWorktreeIdentityContext(ctx context.Context, barePath, checkoutPath 
 		fmt.Fprintf(&config, "[%s]\n", section)
 		for _, field := range []string{"name", "email"} {
 			// Empty author/committer fields fall back to user.* in Git.
-			fmt.Fprintf(&config, "\t%s = %s\n", field, quoteGitConfig(values[section+"."+field]))
+			fmt.Fprintf(&config, "	%s = %s\n", field, quoteGitConfig(values[section+"."+field]))
 		}
 	}
-	if err := editGitConfigFile(filepath.Join(gitDir, "multica-identity.config"), func(_ []byte, _ string) ([]byte, error) {
+	config.WriteString("[include]\n	path = multica-identity.override.config\n")
+	identityPath := filepath.Join(gitDir, "multica-identity.config")
+	if err := editGitConfigFile(identityPath, func(_ []byte, _ string) ([]byte, error) {
 		return []byte(config.String()), nil
 	}); err != nil {
 		return err
 	}
-	return editGitConfigFile(filepath.Join(gitDir, "config.worktree"), func(contents []byte, _ string) ([]byte, error) {
-		if strings.HasPrefix(string(contents), identityConfigInclude) {
+	// Conditional includes have been available since Git 2.13. They provide a
+	// private identity to linked worktrees on Git 2.15, where config.worktree and
+	// `git config --worktree` do not exist. Shared files contain only routing;
+	// identity values remain private to each checkout.
+	include := fmt.Sprintf("\n# Multica identity for %s\n[includeIf \"gitdir:%s\"]\n	path = %s\n", filepath.Base(gitDir), quoteGitConfigValue(filepath.ToSlash(gitDir)), quoteGitConfigValue(filepath.ToSlash(identityPath)))
+	identityMapPath := filepath.Join(barePath, "multica-worktree-identities.config")
+	if err := editGitConfigFile(identityMapPath, func(contents []byte, _ string) ([]byte, error) {
+		if strings.Contains(string(contents), include) {
 			return contents, nil
 		}
-		return append([]byte(identityConfigInclude), contents...), nil
+		return append(contents, include...), nil
+	}); err != nil {
+		return err
+	}
+	mapInclude := fmt.Sprintf("\n# Multica worktree identities\n[include]\n	path = %s\n", quoteGitConfigValue(filepath.ToSlash(identityMapPath)))
+	configPath := filepath.Join(barePath, "config")
+	if contents, readErr := os.ReadFile(configPath); readErr == nil && strings.HasSuffix(string(contents), mapInclude) {
+		return nil
+	}
+	return editGitConfigFile(configPath, func(contents []byte, _ string) ([]byte, error) {
+		if strings.HasSuffix(string(contents), mapInclude) {
+			return contents, nil
+		}
+		contents = []byte(strings.ReplaceAll(string(contents), mapInclude, ""))
+		return append(contents, mapInclude...), nil
 	})
 }
 
 func quoteGitConfig(value string) string {
-	replacer := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\n", "\\n", "\t", "\\t", "\b", "\\b")
-	return "\"" + replacer.Replace(value) + "\""
+	return "\"" + quoteGitConfigValue(value) + "\""
 }
 
-// Git requires core.bare/core.worktree to move to the main worktree's config
-// when enabling worktreeConfig. Publish the extension and removal together so
-// existing linked worktrees never see the bare cache's core.bare=true applied
-// to themselves. No shared identity keys are removed or rewritten.
-func enableWorktreeConfigContext(ctx context.Context, barePath string) error {
-	configPath := filepath.Join(barePath, "config")
-	// Once migrated, identity setup only needs private worktree files. Do not
-	// compete with agent-side git config writers for the common config lock.
-	if enabled, err := worktreeConfigEnabledContext(ctx, configPath); err != nil || enabled {
-		return err
-	}
-	return editGitConfigFile(configPath, func(contents []byte, lockPath string) ([]byte, error) {
-		// Another writer may have enabled it before we acquired the lock.
-		if enabled, err := worktreeConfigEnabledContext(ctx, lockPath); err != nil || enabled {
-			return contents, err
-		}
-		for _, key := range []string{"core.bare", "core.worktree"} {
-			out, err := runGitOutputContext(ctx, "config", "--file", lockPath, "--get", key)
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-				continue
-			}
-			if err != nil {
-				return nil, err
-			}
-			value := strings.TrimSuffix(string(out), "\n")
-			if err := runGitContext(ctx, "config", "--file", filepath.Join(barePath, "config.worktree"), key, value); err != nil {
-				return nil, err
-			}
-			if err := runGitContext(ctx, "config", "--file", lockPath, "--unset-all", key); err != nil {
-				return nil, err
-			}
-		}
-		if err := runGitContext(ctx, "config", "--file", lockPath, "extensions.worktreeConfig", "true"); err != nil {
-			return nil, err
-		}
-		return os.ReadFile(lockPath)
-	})
-}
-
-func worktreeConfigEnabledContext(ctx context.Context, path string) (bool, error) {
-	out, err := runGitOutputContext(ctx, "config", "--file", path, "--bool", "--get", "extensions.worktreeConfig")
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return false, nil
-	}
-	return strings.TrimSpace(string(out)) == "true", err
+func quoteGitConfigValue(value string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "	", `	`, "\b", `\b`)
+	return replacer.Replace(value)
 }
 
 // Follow Git's lockfile protocol and atomically publish a complete config.

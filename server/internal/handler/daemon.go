@@ -4074,11 +4074,12 @@ func revokePublicationRecoveryCredential(handle string) (bool, error) {
 }
 
 func publicationCredentialFailureState(err error) string {
-	message := strings.ToLower(err.Error())
-	for _, transient := range []string{"github status 429", "github status 5", "timeout", "temporarily unavailable", "connection reset", "connection refused"} {
-		if strings.Contains(message, transient) {
+	var failure *githubapp.MintFailure
+	if errors.As(err, &failure) && failure.Retryable {
+		if failure.NoCredential {
 			return "pending"
 		}
+		return "credential_unknown"
 	}
 	return "blocked"
 }
@@ -4130,7 +4131,7 @@ func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *h
 		return
 	}
 	state := taskPublicationRecoveryState(task)
-	if state.CredentialHandle != "" && slices.Contains([]string{"credential_minting", "credential_issued", "credential_received", "revocation_pending"}, state.State) {
+	if state.CredentialHandle != "" && slices.Contains([]string{"credential_minting", "credential_unknown", "credential_issued", "credential_received", "revocation_pending"}, state.State) {
 		mayRevoke := state.State == "revocation_pending" || (state.State == "credential_issued" && publicationRecoveryTimeExpired(state.ClaimExpiresAt, time.Now()))
 		found := false
 		var revokeErr error
@@ -4176,6 +4177,9 @@ WHERE id=$1 AND runtime_id=$2 AND status='completed'
   AND COALESCE(context->'publication_recovery'->>'state','pending') <> 'completed'
   AND COALESCE(context->'publication_recovery'->>'state','pending') <> 'blocked'
   AND COALESCE((context->'publication_recovery'->>'claims')::int,0) < $7
+	AND (context->'publication_recovery'->>'state' <> 'pending'
+	     OR context->'publication_recovery'->>'retry_after' IS NULL
+	     OR (context->'publication_recovery'->>'retry_after')::timestamptz <= clock_timestamp())
   AND (context->'publication_recovery'->>'credential_handle' IS NULL
        OR context->'publication_recovery'->>'state' IN ('credential_revoked','credential_expired','pending')
        OR (context->'publication_recovery'->>'credential_expires_at')::timestamptz <= clock_timestamp())
@@ -4205,10 +4209,15 @@ RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.Da
 	if err != nil {
 		state := publicationCredentialFailureState(err)
 		if state == "pending" {
-			state = "credential_minting"
+			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery}',context->'publication_recovery' || jsonb_build_object('state','pending','credential_handle',null,'credential_expires_at',null,'retry_after',(clock_timestamp()+interval '5 seconds')::text),true) || jsonb_build_object('publication_recovery_error',$3::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), util.SanitizeTextForPostgres(err.Error()))
+		} else {
+			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), state, util.SanitizeTextForPostgres(err.Error()))
 		}
-		_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), state, util.SanitizeTextForPostgres(err.Error()))
-		writeError(w, http.StatusForbidden, "GitHub App authorization failed")
+		status := http.StatusForbidden
+		if state != "blocked" {
+			status = http.StatusServiceUnavailable
+		}
+		writeError(w, status, "GitHub App authorization failed")
 		return
 	}
 	publicationRecoveryCredentials.Store(credentialHandle, credentials)
@@ -4308,7 +4317,7 @@ func (h *Handler) CompleteTaskGitHubPublicationRecovery(w http.ResponseWriter, r
 		return
 	}
 	remoteSHA := strings.TrimSpace(req.RemoteSHA)
-	if req.RemoteSHA != remoteSHA || !validGitObjectID(remoteSHA) || req.ReadBackHeadSHA != remoteSHA || req.PullRequestNumber <= 0 || strings.TrimSpace(req.PullRequestURL) == "" || !req.RevocationConfirmed {
+	if req.RemoteSHA != remoteSHA || !validGitObjectID(remoteSHA) || req.ReadBackHeadSHA != remoteSHA || !validGitHubPullRequestURL(req.PullRequestURL, strings.TrimSpace(req.Repository), req.PullRequestNumber) || !req.RevocationConfirmed {
 		writeError(w, http.StatusBadRequest, "verified publication evidence is required")
 		return
 	}
@@ -4343,6 +4352,11 @@ WHERE id=$1 AND runtime_id=$2 AND result->>'recovery_repository'=$3
 func validGitObjectID(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && (len(decoded) == 20 || len(decoded) == sha256.Size)
+}
+
+func validGitHubPullRequestURL(raw, repository string, number int) bool {
+	parts := strings.Split(repository, "/")
+	return number > 0 && len(parts) == 2 && parts[0] != "" && parts[1] != "" && raw == "https://github.com/"+repository+"/pull/"+strconv.Itoa(number)
 }
 
 func githubInstallationForRepository(installations []db.GithubInstallation, repository string) (db.GithubInstallation, error) {

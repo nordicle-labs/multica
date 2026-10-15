@@ -172,33 +172,38 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 			_, _ = d.client.UpdateGitHubPublicationCredential(context.Background(), d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, claim.ClaimID, claim.CredentialHandle, action)
 			return errors.Join(fmt.Errorf("acknowledge recovered task %s credential: %w", manifest.TaskID, err), closeErr)
 		}
+		finishCredential := func() error {
+			closeErr := session.close(context.Background())
+			action := "revoked"
+			if closeErr != nil {
+				action = "revoke"
+			}
+			revocationConfirmed, reportErr := d.client.UpdateGitHubPublicationCredential(context.Background(), d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, claim.ClaimID, claim.CredentialHandle, action)
+			if closeErr != nil && (!revocationConfirmed || reportErr != nil) {
+				return errors.Join(fmt.Errorf("revoke recovered task %s credential: %w", manifest.TaskID, closeErr), reportErr)
+			}
+			if reportErr != nil {
+				return fmt.Errorf("record recovered task %s credential revocation: %w", manifest.TaskID, reportErr)
+			}
+			return nil
+		}
 		publicationRepo, err := execenv.MaterializeRecoveryRepository(recoveryRoot, manifest)
 		if err != nil {
-			_ = session.close(context.Background())
-			return fmt.Errorf("materialize recovery bundle for task %s: %w", manifest.TaskID, err)
+			return errors.Join(fmt.Errorf("materialize recovery bundle for task %s: %w", manifest.TaskID, err), finishCredential())
 		}
 		if err := execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, execenv.PublicationCredentialMinted, "", 0, ""); err != nil {
-			_ = session.close(context.Background())
-			return err
+			return errors.Join(err, finishCredential())
 		}
 		remoteSHA, pullRequest, publishErr := session.finalizePublicationWithProgress(ctx, publicationRepo, manifest.CanonicalBranch, manifest.HeadSHA,
 			func(phase, remoteSHA string, pr githubPullRequest) error {
 				return execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, phase, remoteSHA, pr.Number, pr.URL)
 			})
-		closeErr := session.close(context.Background())
-		if publishErr != nil {
-			return fmt.Errorf("publish recovered task %s: %w", manifest.TaskID, publishErr)
-		}
-		action := "revoked"
-		if closeErr != nil {
-			action = "revoke"
-		}
-		revocationConfirmed, reportErr := d.client.UpdateGitHubPublicationCredential(context.Background(), d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, claim.ClaimID, claim.CredentialHandle, action)
-		if closeErr != nil && (!revocationConfirmed || reportErr != nil) {
-			return errors.Join(fmt.Errorf("revoke recovered task %s credential: %w", manifest.TaskID, closeErr), reportErr)
-		}
-		if reportErr != nil {
-			return fmt.Errorf("record recovered task %s credential revocation: %w", manifest.TaskID, reportErr)
+		revocationErr := finishCredential()
+		if publishErr != nil || revocationErr != nil {
+			if publishErr != nil {
+				publishErr = fmt.Errorf("publish recovered task %s: %w", manifest.TaskID, publishErr)
+			}
+			return errors.Join(publishErr, revocationErr)
 		}
 		if err := execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, execenv.PublicationCredentialRevoked, remoteSHA, pullRequest.Number, pullRequest.URL); err != nil {
 			return err

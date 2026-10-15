@@ -7,12 +7,17 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func testPrivateKey(t *testing.T) string {
 	t.Helper()
@@ -87,6 +92,29 @@ func TestMintRejectsTokenScopedToDifferentOwner(t *testing.T) {
 	}
 	if !revoked {
 		t.Fatal("Mint did not revoke the mismatched token")
+	}
+}
+
+func TestMintFailureDistinguishesRejectedAndUncertainRequests(t *testing.T) {
+	permissions, _ := PermissionsForRole("member")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client()}
+	_, err := broker.Mint(context.Background(), 42, "owner/repo", permissions)
+	var failure *MintFailure
+	if !errors.As(err, &failure) || !failure.NoCredential || !failure.Retryable {
+		t.Fatalf("HTTP rejection failure = %#v, %v", failure, err)
+	}
+
+	broker.Client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("response lost")
+	})}
+	_, err = broker.Mint(context.Background(), 42, "owner/repo", permissions)
+	failure = nil
+	if !errors.As(err, &failure) || failure.NoCredential || !failure.Retryable {
+		t.Fatalf("uncertain network failure = %#v, %v", failure, err)
 	}
 }
 

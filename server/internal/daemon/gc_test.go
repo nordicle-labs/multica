@@ -2701,6 +2701,50 @@ func TestReconcileRecoveryManifestPersistsRevocationFailure(t *testing.T) {
 	}
 }
 
+func TestReconcileRecoveryManifestReportsRevocationAfterPostACKFailure(t *testing.T) {
+	repo := createGCGitRepo(t)
+	head := runGitForGC(t, repo, "rev-parse", "HEAD")
+	var actions []string
+	var recoveryRoot string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/post-ack-task/github-publication-recovery/claim", func(w http.ResponseWriter, _ *http.Request) {
+		if err := os.Remove(filepath.Join(recoveryRoot, "post-ack-task", "recovery.bundle")); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"claim_id":"claim-1","credential_handle":"credential-1","credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+	})
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/post-ack-task/github-publication-recovery/credential", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		actions = append(actions, body["credential_action"])
+		_, _ = w.Write([]byte(`{"revocation_confirmed":false}`))
+	})
+	mux.HandleFunc("/installation/token", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	})
+	d := newGCTestDaemon(t, mux)
+	d.cfg.DaemonID = "daemon-1"
+	recoveryRoot = filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	manifest := execenv.RecoveryManifest{
+		TaskID: "post-ack-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", Repository: "owner/repo", GitRoot: repo,
+		CanonicalBranch: "main", BaseSHA: head, ExpectedRefSHA: head, HeadSHA: head,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	oldRevoke := githubInstallationTokenURL
+	githubInstallationTokenURL = d.client.baseURL + "/installation/token"
+	t.Cleanup(func() { githubInstallationTokenURL = oldRevoke })
+
+	err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, manifest)
+	if err == nil || !strings.Contains(err.Error(), "materialize recovery bundle") || !strings.Contains(err.Error(), "revoke recovered task") {
+		t.Fatalf("reconcile error = %v, want materialization and durable revocation failures", err)
+	}
+	if got := strings.Join(actions, ","); got != "ack,revoke" {
+		t.Fatalf("credential actions = [%s], want [ack,revoke]", got)
+	}
+}
+
 func TestReconcileRecoveryManifestHonorsPersistedIntent(t *testing.T) {
 	repo := createGCGitRepo(t)
 	sha := runGitForGC(t, repo, "rev-parse", "HEAD")
