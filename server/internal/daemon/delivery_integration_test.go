@@ -2,11 +2,14 @@ package daemon
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
 
 func TestTaskEnvironmentIsolationAcrossDistinctTasks(t *testing.T) {
@@ -171,6 +174,69 @@ func TestPreserveRepositoryArtifactCreatesVerifiedBundle(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(recoveryRoot, "task-artifact", "recovery.bundle")); err != nil {
 		t.Fatalf("verified recovery bundle missing: %v", err)
+	}
+}
+
+func TestLocalDirectoryWorktreeProducesRecoverableServerResult(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	gitTestRun(t, "", "init", "-b", "main", repo)
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTestRun(t, repo, "add", "base.txt")
+	gitTestRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+	gitTestRun(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	worktree, err := execenv.PrepareLocalWorktree(execenv.LocalWorktreeParams{
+		LocalPath: repo, EnvRoot: t.TempDir(), AgentName: "developer", TaskID: "task-worktree",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.WorkDir, "delivered.txt"), []byte("delivered\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := worktree.Finalize(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := TaskResult{DurableWorkDir: worktree.GitRoot, BranchName: outcome.Branch, CommitSHA: outcome.HeadSHA}
+	recoveryRoot := t.TempDir()
+	if err := preserveRepositoryArtifact(context.Background(), recoveryRoot, "task-worktree", &result, nil); err != nil {
+		t.Fatal(err)
+	}
+	if result.TreeSHA == "" || result.RecoveryBundlePath == "" || !result.RecoveryBundleVerified {
+		t.Fatalf("worktree delivery result = %+v", result)
+	}
+	if got := gitTestRun(t, repo, "rev-parse", "refs/heads/"+result.BranchName); got != result.CommitSHA {
+		t.Fatalf("durable branch = %s, want %s", got, result.CommitSHA)
+	}
+}
+
+func TestRecoveryArtifactKeepsPublishJournalForPublicationOnlyRetry(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	gitTestRun(t, "", "init", "-b", "delivery", repo)
+	if err := os.WriteFile(filepath.Join(repo, "delivery.txt"), []byte("delivery\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTestRun(t, repo, "add", "delivery.txt")
+	gitTestRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "delivery")
+	sha := gitTestRun(t, repo, "rev-parse", "HEAD")
+	root := t.TempDir()
+	recoveryRoot := filepath.Join(root, "recovery")
+	manifest := execenv.RecoveryManifest{
+		TaskID: "publish-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", GitRoot: repo,
+		CanonicalBranch: "delivery", BaseSHA: sha, ExpectedRefSHA: sha, HeadSHA: sha,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{cfg: Config{WorkspacesRoot: root}}
+	d.recoverTaskArtifact(Task{ID: manifest.TaskID, RuntimeID: manifest.RuntimeID, DeliveryIntent: "publish"}, TaskResult{
+		DurableWorkDir: repo, BranchName: "delivery", CommitSHA: sha,
+	}, "finalize", slog.Default())
+	if _, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID); err != nil || !exists {
+		t.Fatalf("publish retry manifest exists=%v err=%v", exists, err)
 	}
 }
 

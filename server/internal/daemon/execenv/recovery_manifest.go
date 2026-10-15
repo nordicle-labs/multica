@@ -13,6 +13,7 @@ import (
 
 const (
 	recoveryManifestName         = "manifest.json"
+	recoveryPublicationLockName  = ".publication.lock"
 	maxRecoveryManifests         = 100
 	PublicationPrepared          = "prepared"
 	PublicationCredentialMinted  = "credential_minted"
@@ -21,12 +22,34 @@ const (
 	PublicationCredentialRevoked = "credential_revoked"
 )
 
+// ClaimRecoveryPublication serializes publication attempts for one durable
+// artifact. The advisory lock is released automatically if the daemon exits.
+func ClaimRecoveryPublication(root, taskID string) (release func(), claimed bool, err error) {
+	if _, err := recoveryTaskDir(root, taskID); err != nil {
+		return nil, false, err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, false, err
+	}
+	lock, err := openLockFile(filepath.Join(root, "."+taskID+recoveryPublicationLockName))
+	if err != nil {
+		return nil, false, err
+	}
+	claimed, err = lockFileExclusiveNonBlocking(lock)
+	if err != nil || !claimed {
+		_ = lock.Close()
+		return nil, claimed, err
+	}
+	return func() { releaseLockFile(lock) }, true, nil
+}
+
 // RecoveryManifest is the non-secret durable journal written before provider
 // launch. A restart can preserve a finalized commit even if publication never
 // ran.
 type RecoveryManifest struct {
 	TaskID            string `json:"task_id"`
 	RuntimeID         string `json:"runtime_id,omitempty"`
+	DeliveryIntent    string `json:"delivery_intent"`
 	GitRoot           string `json:"git_root"`
 	CanonicalBranch   string `json:"canonical_branch"`
 	BaseSHA           string `json:"base_sha"`
@@ -74,8 +97,14 @@ func AdvanceRecoveryManifest(root, taskID, phase, remoteSHA string, prNumber int
 	if current == "" {
 		current = PublicationPrepared
 	}
-	if _, ok := order[phase]; !ok || order[phase] < order[current] || order[phase] > order[current]+1 {
+	if _, ok := order[phase]; !ok || order[phase] > order[current]+1 {
 		return fmt.Errorf("invalid publication phase transition %s -> %s", current, phase)
+	}
+	if order[phase] < order[current] {
+		if remoteSHA != "" && manifest.RemoteSHA != "" && remoteSHA != manifest.RemoteSHA {
+			return fmt.Errorf("publication remote SHA changed from %s to %s", manifest.RemoteSHA, remoteSHA)
+		}
+		return nil
 	}
 	manifest.PublicationPhase = phase
 	if remoteSHA != "" {
@@ -85,6 +114,37 @@ func AdvanceRecoveryManifest(root, taskID, phase, remoteSHA string, prNumber int
 		manifest.PullRequestNumber, manifest.PullRequestURL = prNumber, prURL
 	}
 	return WriteRecoveryManifest(root, manifest)
+}
+
+// WriteFinalizedRecoveryManifest keeps the pre-launch base/ref evidence when a
+// local worktree is finalized, while creating the journal for other sources.
+func WriteFinalizedRecoveryManifest(root string, finalized RecoveryManifest) error {
+	dir, err := recoveryTaskDir(root, finalized.TaskID)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, recoveryManifestName))
+	if errors.Is(err, os.ErrNotExist) {
+		return WriteRecoveryManifest(root, finalized)
+	}
+	if err != nil {
+		return err
+	}
+	var existing RecoveryManifest
+	if err := json.Unmarshal(data, &existing); err != nil {
+		return err
+	}
+	if existing.TaskID != finalized.TaskID || existing.DeliveryIntent != finalized.DeliveryIntent || existing.GitRoot != finalized.GitRoot || existing.CanonicalBranch != finalized.CanonicalBranch {
+		return errors.New("finalized recovery manifest does not match prepared artifact")
+	}
+	if existing.HeadSHA != "" && existing.HeadSHA != finalized.HeadSHA {
+		return errors.New("finalized recovery manifest head changed")
+	}
+	existing.HeadSHA = finalized.HeadSHA
+	if existing.RuntimeID == "" {
+		existing.RuntimeID = finalized.RuntimeID
+	}
+	return WriteRecoveryManifest(root, existing)
 }
 
 func writeRecoveryManifest(root string, manifest RecoveryManifest, syncFile func(*os.File) error) error {
@@ -188,6 +248,25 @@ func LoadRecoveryManifests(root string) ([]RecoveryManifest, error) {
 		manifests = append(manifests, manifest)
 	}
 	return manifests, loadErr
+}
+
+func ReadRecoveryManifest(root, taskID string) (RecoveryManifest, bool, error) {
+	dir, err := recoveryTaskDir(root, taskID)
+	if err != nil {
+		return RecoveryManifest{}, false, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, recoveryManifestName))
+	if errors.Is(err, os.ErrNotExist) {
+		return RecoveryManifest{}, false, nil
+	}
+	if err != nil {
+		return RecoveryManifest{}, false, err
+	}
+	var manifest RecoveryManifest
+	if err := json.Unmarshal(data, &manifest); err != nil || manifest.TaskID != taskID {
+		return RecoveryManifest{}, false, fmt.Errorf("invalid recovery manifest for %s", taskID)
+	}
+	return manifest, true, nil
 }
 
 // VerifyRecoveryManifest proves the finalized branch still names the recorded

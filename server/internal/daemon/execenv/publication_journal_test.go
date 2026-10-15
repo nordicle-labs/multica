@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -11,7 +13,7 @@ func TestPublicationJournalPersistsDurableLifecycleWithoutCredential(t *testing.
 	repo := newTestRepo(t)
 	sha := gitRun(t, repo, "rev-parse", "HEAD")
 	root := t.TempDir()
-	manifest := RecoveryManifest{TaskID: "publish-task", GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha, HeadSHA: sha}
+	manifest := RecoveryManifest{TaskID: "publish-task", DeliveryIntent: "publish", GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha, HeadSHA: sha}
 	if err := WriteRecoveryManifest(root, manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -45,5 +47,45 @@ func TestPublicationJournalPersistsDurableLifecycleWithoutCredential(t *testing.
 	}
 	if strings.Contains(string(data), "ghs_") || strings.Contains(string(data), "installation-secret") {
 		t.Fatalf("journal persisted credential: %s", data)
+	}
+}
+
+func TestRecoveryPublicationClaimIsExclusive(t *testing.T) {
+	root := t.TempDir()
+	const taskID = "concurrent-publication"
+	if err := os.MkdirAll(filepath.Join(root, taskID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var claimed atomic.Int32
+	var attempted atomic.Int32
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			release, ok, err := ClaimRecoveryPublication(root, taskID)
+			attempted.Add(1)
+			if err != nil {
+				t.Errorf("claim: %v", err)
+				return
+			}
+			if !ok {
+				return
+			}
+			claimed.Add(1)
+			<-releaseFirst
+			release()
+		}()
+	}
+	close(start)
+	for attempted.Load() < 2 {
+	}
+	close(releaseFirst)
+	wg.Wait()
+	if claimed.Load() != 1 {
+		t.Fatalf("publication claims = %d, want exactly one", claimed.Load())
 	}
 }

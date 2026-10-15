@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 NAMES_FILE="$SCRIPT_DIR/agent-cli-command-names.txt"
-GUARD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/multica-agent-cli-guard.XXXXXX")
+GUARD_DIR=$(mktemp -d "${TMPDIR:-${GOTMPDIR:-.}}/multica-agent-cli-guard.XXXXXX")
 BIN_DIR="$GUARD_DIR/bin"
 MARKER_FILE="$GUARD_DIR/invocations.log"
 

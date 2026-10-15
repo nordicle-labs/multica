@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2465,7 +2467,7 @@ func TestReconcileRecoveryManifestRetriesWithDaemonIdentityAndPreservesArtifact(
 	}))
 	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
 	manifest := execenv.RecoveryManifest{
-		TaskID: "restart-task", RuntimeID: "runtime-1", GitRoot: repo,
+		TaskID: "restart-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", GitRoot: repo,
 		CanonicalBranch: "main", BaseSHA: base, ExpectedRefSHA: base, HeadSHA: head,
 	}
 	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
@@ -2493,6 +2495,136 @@ func TestReconcileRecoveryManifestRetriesWithDaemonIdentityAndPreservesArtifact(
 	}
 	if len(entries) != 2 {
 		t.Fatalf("recovery state files = %d, want fixed manifest and bundle", len(entries))
+	}
+}
+
+func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
+	repo := createGCGitRepo(t)
+	base := runGitForGC(t, repo, "rev-parse", "HEAD")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runGitForGC(t, "", "init", "--bare", remote)
+	runGitForGC(t, repo, "push", remote, "HEAD:refs/heads/main")
+	runGitForGC(t, repo, "checkout", "-b", "delivery")
+	if err := os.WriteFile(filepath.Join(repo, "delivery.txt"), []byte("delivery\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitForGC(t, repo, "add", "delivery.txt")
+	runGitForGC(t, repo, "commit", "-m", "delivery")
+	head := runGitForGC(t, repo, "rev-parse", "HEAD")
+	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	var credentials, creates, revocations atomic.Int32
+	var created atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/concurrent-task/github-credentials", func(w http.ResponseWriter, _ *http.Request) {
+		credentials.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			creates.Add(1)
+			created.Store(true)
+			_, _ = w.Write([]byte(`{"number":42}`))
+			return
+		}
+		if created.Load() {
+			_, _ = w.Write([]byte(`[{"number":42}]`))
+		} else {
+			_, _ = w.Write([]byte(`[]`))
+		}
+	})
+	mux.HandleFunc("/repos/owner/repo/pulls/42", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"number":42,"html_url":"https://github.test/pull/42","head":{"ref":"delivery","sha":%q},"base":{"ref":"main"}}`, head)
+	})
+	mux.HandleFunc("/installation/token", func(w http.ResponseWriter, _ *http.Request) {
+		revocations.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	d := newGCTestDaemon(t, mux)
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	manifest := execenv.RecoveryManifest{
+		TaskID: "concurrent-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", GitRoot: repo,
+		CanonicalBranch: "delivery", BaseSHA: base, ExpectedRefSHA: base, HeadSHA: head,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	oldAPI, oldRemote, oldRevoke := githubAPIBaseURL, githubRepositoryRemote, githubInstallationTokenURL
+	githubAPIBaseURL = d.client.baseURL
+	githubRepositoryRemote = func(string) string { return remote }
+	githubInstallationTokenURL = d.client.baseURL + "/installation/token"
+	t.Cleanup(func() {
+		githubAPIBaseURL, githubRepositoryRemote, githubInstallationTokenURL = oldAPI, oldRemote, oldRevoke
+	})
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- d.reconcileRecoveryManifest(context.Background(), recoveryRoot, manifest)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if credentials.Load() != 1 || creates.Load() != 1 || revocations.Load() != 1 {
+		t.Fatalf("credentials=%d PR creates=%d revocations=%d, want one each", credentials.Load(), creates.Load(), revocations.Load())
+	}
+	if _, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID); err != nil || exists {
+		t.Fatalf("completed publication manifest exists=%v err=%v", exists, err)
+	}
+}
+
+func TestReconcileRecoveryManifestHonorsPersistedIntent(t *testing.T) {
+	repo := createGCGitRepo(t)
+	sha := runGitForGC(t, repo, "rev-parse", "HEAD")
+	requests := 0
+	d := newGCTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		http.Error(w, "unexpected publication", http.StatusBadRequest)
+	}))
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	artifact := execenv.RecoveryManifest{
+		TaskID: "artifact-task", RuntimeID: "runtime-1", DeliveryIntent: "artifact", GitRoot: repo,
+		CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha, HeadSHA: sha,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, artifact); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, artifact); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("artifact recovery made %d publication requests", requests)
+	}
+	if _, err := os.Stat(filepath.Join(recoveryRoot, artifact.TaskID, "recovery.bundle")); err != nil {
+		t.Fatalf("artifact recovery bundle missing: %v", err)
+	}
+
+	legacy := artifact
+	legacy.TaskID = "legacy-task"
+	legacy.DeliveryIntent = ""
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, legacy); err != nil {
+		t.Fatal(err)
+	}
+	err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, legacy)
+	if err == nil || !strings.Contains(err.Error(), "invalid delivery intent") {
+		t.Fatalf("legacy recovery error = %v", err)
+	}
+	if _, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, legacy.TaskID); err != nil || !exists {
+		t.Fatalf("legacy fail-closed manifest exists=%v err=%v", exists, err)
 	}
 }
 

@@ -93,7 +93,13 @@ func finalizeRepositoryDelivery(ctx context.Context, workDir string, required bo
 }
 
 func attachRepositoryDelivery(ctx context.Context, workDir string, result *TaskResult) error {
-	descriptor, err := finalizeRepositoryDelivery(ctx, workDir, true)
+	var descriptor deliverycontract.Repository
+	var err error
+	if result.BranchName != "" && result.CommitSHA != "" {
+		descriptor, err = deriveRepositoryBranchDescriptor(ctx, workDir, result.BranchName)
+	} else {
+		descriptor, err = finalizeRepositoryDelivery(ctx, workDir, true)
+	}
 	if err != nil {
 		return err
 	}
@@ -111,6 +117,19 @@ func attachRepositoryDelivery(ctx context.Context, workDir string, result *TaskR
 	result.CommitSHA = descriptor.CommitSHA
 	result.TreeSHA = descriptor.TreeSHA
 	return nil
+}
+
+func deriveRepositoryBranchDescriptor(ctx context.Context, workDir, branch string) (deliverycontract.Repository, error) {
+	if gitPreflight(ctx, workDir, "check-ref-format", "--branch", branch) == "" {
+		return deliverycontract.Repository{}, fmt.Errorf("required repository delivery has invalid branch %q", branch)
+	}
+	gitRoot := gitPreflight(ctx, workDir, "rev-parse", "--show-toplevel")
+	head := gitPreflight(ctx, workDir, "rev-parse", "--verify", "refs/heads/"+branch)
+	tree := gitPreflight(ctx, workDir, "rev-parse", head+"^{tree}")
+	if gitRoot == "" || head == "" || tree == "" {
+		return deliverycontract.Repository{}, errors.New("required repository delivery is missing branch or SHA, git root, or tree")
+	}
+	return deliverycontract.Repository{Git: true, GitRoot: gitRoot, Branch: branch, CommitSHA: head, TreeSHA: tree, Worktree: true}, nil
 }
 
 func preserveRepositoryArtifact(ctx context.Context, recoveryRoot, taskID string, result *TaskResult, logger *slog.Logger) error {
