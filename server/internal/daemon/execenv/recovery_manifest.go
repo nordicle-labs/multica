@@ -88,6 +88,17 @@ func RecordRecoveryFailure(root, taskID string, failure error) error {
 	return WriteRecoveryManifest(root, manifest)
 }
 
+// RecordRecoveryDeferral schedules a retry without consuming a publication
+// attempt. The server uses this while an earlier credential lease is live.
+func RecordRecoveryDeferral(root, taskID string, retryAt time.Time) error {
+	manifest, exists, err := ReadRecoveryManifest(root, taskID)
+	if err != nil || !exists {
+		return err
+	}
+	manifest.NextAttemptAt = retryAt.UTC()
+	return WriteRecoveryManifest(root, manifest)
+}
+
 func RecoveryRetryReady(manifest RecoveryManifest, now time.Time) bool {
 	return manifest.PublicationPhase != PublicationBlocked && (manifest.NextAttemptAt.IsZero() || !now.Before(manifest.NextAttemptAt))
 }

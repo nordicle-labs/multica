@@ -146,6 +146,13 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	if first.code != http.StatusOK || second.code != http.StatusConflict || minted.Load() != 1 {
 		t.Fatalf("claim statuses=%d/%d minted=%d", first.code, second.code, minted.Load())
 	}
+	var deferred struct {
+		Code    string    `json:"code"`
+		RetryAt time.Time `json:"retry_at"`
+	}
+	if err := json.Unmarshal(second.body, &deferred); err != nil || deferred.Code != "publication_credential_outstanding" || deferred.RetryAt.Before(time.Now().Add(64*time.Minute)) {
+		t.Fatalf("outstanding claim response=%s decoded=%+v err=%v", second.body, deferred, err)
+	}
 	var claimed struct {
 		ClaimID          string                 `json:"claim_id"`
 		CredentialHandle string                 `json:"credential_handle"`

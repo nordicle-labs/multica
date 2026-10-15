@@ -4035,13 +4035,18 @@ type publicationRecoveryState struct {
 	Claims              int    `json:"claims"`
 }
 
-func publicationRecoveryTimeExpired(value string, now time.Time) bool {
+func publicationRecoveryTime(value string) (time.Time, bool) {
 	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999Z07:00", "2006-01-02 15:04:05.999999999-07"} {
 		if expiry, err := time.Parse(layout, value); err == nil {
-			return !now.Before(expiry)
+			return expiry, true
 		}
 	}
-	return false
+	return time.Time{}, false
+}
+
+func publicationRecoveryTimeExpired(value string, now time.Time) bool {
+	expiry, ok := publicationRecoveryTime(value)
+	return ok && !now.Before(expiry)
 }
 
 func (s publicationRecoveryState) credentialExpired(now time.Time) bool {
@@ -4147,7 +4152,16 @@ func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *h
 			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_revoked"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
 			state.State = "credential_revoked"
 		case !state.credentialExpired(time.Now()):
-			writeError(w, http.StatusConflict, "previous publication credential is still outstanding")
+			retryAt, ok := publicationRecoveryTime(state.CredentialExpiresAt)
+			if !ok {
+				writeError(w, http.StatusConflict, "previous publication credential is still outstanding")
+				return
+			}
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":    "previous publication credential is still outstanding",
+				"code":     "publication_credential_outstanding",
+				"retry_at": retryAt.UTC(),
+			})
 			return
 		default:
 			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_expired"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)

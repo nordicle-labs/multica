@@ -78,8 +78,12 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 func (d *Daemon) reconcileRecoveryManifests(ctx context.Context, recoveryRoot string) (int, error) {
 	manifests, reconcileErr := execenv.LoadRecoveryManifests(recoveryRoot)
 	resumed := 0
+	now := time.Now()
+	if d.recoveryNow != nil {
+		now = d.recoveryNow()
+	}
 	for _, manifest := range manifests {
-		if manifest.HeadSHA == "" || !execenv.RecoveryRetryReady(manifest, time.Now()) {
+		if manifest.HeadSHA == "" || !execenv.RecoveryRetryReady(manifest, now) {
 			continue
 		}
 		if err := d.reconcileRecoveryManifest(ctx, recoveryRoot, manifest); err != nil {
@@ -141,6 +145,10 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 		publicationReady := manifest.PublicationPhase == execenv.PublicationPRReadBack || manifest.PublicationPhase == execenv.PublicationCredentialRevoked
 		claim, err := d.client.ClaimGitHubPublicationRecovery(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, repository, publicationReady)
 		if err != nil {
+			var deferred *publicationRecoveryDeferredError
+			if errors.As(err, &deferred) {
+				return execenv.RecordRecoveryDeferral(recoveryRoot, manifest.TaskID, deferred.RetryAt)
+			}
 			return fmt.Errorf("acquire recovery publication credential for task %s: %w", manifest.TaskID, err)
 		}
 		if claim.Completed {

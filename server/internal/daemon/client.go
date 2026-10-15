@@ -34,6 +34,14 @@ func (e *requestError) Error() string {
 	return fmt.Sprintf("%s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
 }
 
+type publicationRecoveryDeferredError struct {
+	RetryAt time.Time
+}
+
+func (e *publicationRecoveryDeferredError) Error() string {
+	return "publication credential lease is still outstanding"
+}
+
 var errInvalidResponseBody = errors.New("invalid response body")
 
 // isWorkspaceNotFoundError returns true if the error is a 404 with "workspace not found" body.
@@ -311,6 +319,14 @@ func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, r
 	var response publicationRecoveryClaim
 	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/claim", url.PathEscape(runtimeID), url.PathEscape(taskID))
 	if err := c.postJSON(ctx, path, map[string]any{"daemon_id": daemonID, "repository": repository, "publication_ready": publicationReady}, &response); err != nil {
+		var reqErr *requestError
+		var body struct {
+			Code    string    `json:"code"`
+			RetryAt time.Time `json:"retry_at"`
+		}
+		if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict && json.Unmarshal([]byte(reqErr.Body), &body) == nil && body.Code == "publication_credential_outstanding" && !body.RetryAt.IsZero() {
+			return response, &publicationRecoveryDeferredError{RetryAt: body.RetryAt}
+		}
 		return response, fmt.Errorf("claim GitHub publication recovery: %w", err)
 	}
 	return response, nil

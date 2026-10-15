@@ -403,6 +403,7 @@ type Daemon struct {
 	terminalReportSend   terminalReportSendFunc
 	terminalReportWakeup chan struct{}
 	terminalReportNow    func() time.Time
+	recoveryNow          func() time.Time
 	terminalReportMu     sync.Mutex
 	terminalReportFlight map[string]struct{}
 
@@ -729,6 +730,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		terminalReports:             newTerminalReportStore(cfg),
 		terminalReportWakeup:        make(chan struct{}, 1),
 		terminalReportNow:           time.Now,
+		recoveryNow:                 time.Now,
 		terminalReportFlight:        make(map[string]struct{}),
 		workspaces:                  make(map[string]*workspaceState),
 		runtimeIndex:                make(map[string]Runtime),

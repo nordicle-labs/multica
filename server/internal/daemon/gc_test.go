@@ -2510,6 +2510,69 @@ func TestReconcileRecoveryManifestRetriesWithDaemonIdentityAndPreservesArtifact(
 	}
 }
 
+func TestReconcileRecoveryManifestWaitsForOutstandingCredentialLease(t *testing.T) {
+	repo := createGCGitRepo(t)
+	base := runGitForGC(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "recovered.txt"), []byte("recovered\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitForGC(t, repo, "add", "recovered.txt")
+	runGitForGC(t, repo, "commit", "-m", "recover me")
+	head := runGitForGC(t, repo, "rev-parse", "HEAD")
+	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+
+	now := time.Date(2026, time.October, 15, 12, 0, 0, 0, time.UTC)
+	retryAt := now.Add(65 * time.Minute)
+	requests := 0
+	d := newGCTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if now.Before(retryAt) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "previous publication credential is still outstanding",
+				"code":  "publication_credential_outstanding", "retry_at": retryAt,
+			})
+			return
+		}
+		_, _ = w.Write([]byte(`{"completed":true}`))
+	}))
+	d.cfg.DaemonID = "daemon-1"
+	d.recoveryNow = func() time.Time { return now }
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	manifest := execenv.RecoveryManifest{
+		TaskID: "leased-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", GitRoot: repo,
+		CanonicalBranch: "main", BaseSHA: base, ExpectedRefSHA: base, HeadSHA: head,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 3 {
+		loaded, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID)
+		if err != nil || !exists {
+			t.Fatalf("restart read exists=%v err=%v", exists, err)
+		}
+		if err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, loaded); err != nil {
+			t.Fatalf("outstanding lease reconciliation: %v", err)
+		}
+	}
+	deferred, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID)
+	if err != nil || !exists || deferred.RecoveryAttempts != 0 || !deferred.NextAttemptAt.Equal(retryAt) {
+		t.Fatalf("deferred journal exists=%v err=%v manifest=%+v", exists, err, deferred)
+	}
+	if resumed, err := d.reconcileRecoveryManifests(context.Background(), recoveryRoot); err != nil || resumed != 0 || requests != 3 {
+		t.Fatalf("pre-expiry resume=%d requests=%d err=%v", resumed, requests, err)
+	}
+	now = retryAt
+	if resumed, err := d.reconcileRecoveryManifests(context.Background(), recoveryRoot); err != nil || resumed != 1 || requests != 4 {
+		t.Fatalf("post-expiry resume=%d requests=%d err=%v", resumed, requests, err)
+	}
+	if _, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID); err != nil || exists {
+		t.Fatalf("completed journal exists=%v err=%v", exists, err)
+	}
+}
+
 func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
 	repo := createGCGitRepo(t)
 	base := runGitForGC(t, repo, "rev-parse", "HEAD")

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRecoveryJournalUsesBundleAfterOriginalRepositoryDisappears(t *testing.T) {
@@ -56,6 +57,26 @@ func TestRecoveryJournalBoundsTransientFailures(t *testing.T) {
 	}
 	if got.PublicationPhase != PublicationBlocked || got.RecoveryAttempts != maxRecoveryAttempts || got.LastError == "" {
 		t.Fatalf("bounded recovery journal = %+v", got)
+	}
+}
+
+func TestRecoveryJournalDeferralDoesNotConsumeAttempts(t *testing.T) {
+	repo := newTestRepo(t)
+	sha := gitRun(t, repo, "rev-parse", "HEAD")
+	root := t.TempDir()
+	manifest := RecoveryManifest{TaskID: "leased", DeliveryIntent: "publish", Repository: "owner/repo", GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha}
+	if err := WriteRecoveryManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	retryAt := time.Date(2026, time.October, 15, 13, 5, 0, 0, time.UTC)
+	for range maxRecoveryAttempts + 2 {
+		if err := RecordRecoveryDeferral(root, manifest.TaskID, retryAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, exists, err := ReadRecoveryManifest(root, manifest.TaskID)
+	if err != nil || !exists || got.RecoveryAttempts != 0 || !got.NextAttemptAt.Equal(retryAt) || got.PublicationPhase == PublicationBlocked {
+		t.Fatalf("deferred recovery exists=%v err=%v manifest=%+v", exists, err, got)
 	}
 }
 
