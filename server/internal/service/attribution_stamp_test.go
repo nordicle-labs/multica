@@ -832,11 +832,15 @@ func TestDispatchRunOnlyScheduleStampsRuleOwnerRow(t *testing.T) {
 	}
 
 	var source pgtype.Text
+	var taskContext []byte
 	var originator, accountable, ruleVersion pgtype.UUID
 	if err := pool.QueryRow(ctx, `
-		SELECT originator_source, originator_user_id, accountable_user_id, rule_version_id
-		FROM agent_task_queue WHERE autopilot_run_id = $1`, run.ID).Scan(&source, &originator, &accountable, &ruleVersion); err != nil {
+		SELECT originator_source, originator_user_id, accountable_user_id, rule_version_id, context
+		FROM agent_task_queue WHERE autopilot_run_id = $1`, run.ID).Scan(&source, &originator, &accountable, &ruleVersion, &taskContext); err != nil {
 		t.Fatalf("read stored attribution: %v", err)
+	}
+	if string(taskContext) != `{"delivery_intent":"none"}` {
+		t.Fatalf("delivery context = %s, want server-authorized default", taskContext)
 	}
 	if source.String != string(attribution.SourceRuleOwner) {
 		t.Errorf("originator_source = %q, want rule_owner", source.String)
@@ -1276,6 +1280,9 @@ func TestEnqueueChatTaskStampsChatEvidence(t *testing.T) {
 	}, util.MustParseUUID(userID), false)
 	if err != nil {
 		t.Fatalf("EnqueueChatTask: %v", err)
+	}
+	if string(task.Context) != `{"delivery_intent":"none"}` {
+		t.Fatalf("delivery context = %s, want server-authorized default", task.Context)
 	}
 
 	var source, evidenceKind pgtype.Text

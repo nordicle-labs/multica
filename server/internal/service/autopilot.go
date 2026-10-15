@@ -1050,6 +1050,7 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 		OriginatorSource:     apSource,
 		TriggerEvidenceKind:  apEvidenceKind,
 		TriggerEvidenceRefID: apEvidenceRef,
+		Context:              agentDeliveryContext(agent),
 	})
 	if err != nil {
 		return fmt.Errorf("create autopilot task: %w", err)

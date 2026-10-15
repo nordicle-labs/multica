@@ -250,6 +250,7 @@ func (f *Fixture) Task(t TB, agentID string, over ...Cols) string {
 		"agent_id": agentID,
 		"status":   "queued",
 		"priority": 0,
+		"context":  `{"delivery_intent":"none"}`,
 	}, over))
 }
 

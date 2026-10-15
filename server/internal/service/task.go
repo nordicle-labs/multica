@@ -1550,15 +1550,16 @@ func agentDeliveryIntent(agent db.Agent) string {
 // onto the agent's Instructions, matching the behavior of issue-bound
 // tasks assigned to the squad.
 type QuickCreateContext struct {
-	Type          string   `json:"type"`
-	Prompt        string   `json:"prompt"`
-	RequesterID   string   `json:"requester_id"`
-	WorkspaceID   string   `json:"workspace_id"`
-	Priority      string   `json:"priority,omitempty"`
-	DueDate       string   `json:"due_date,omitempty"`
-	ProjectID     string   `json:"project_id,omitempty"`
-	SquadID       string   `json:"squad_id,omitempty"`
-	AttachmentIDs []string `json:"attachment_ids,omitempty"`
+	Type           string   `json:"type"`
+	Prompt         string   `json:"prompt"`
+	RequesterID    string   `json:"requester_id"`
+	WorkspaceID    string   `json:"workspace_id"`
+	DeliveryIntent string   `json:"delivery_intent"`
+	Priority       string   `json:"priority,omitempty"`
+	DueDate        string   `json:"due_date,omitempty"`
+	ProjectID      string   `json:"project_id,omitempty"`
+	SquadID        string   `json:"squad_id,omitempty"`
+	AttachmentIDs  []string `json:"attachment_ids,omitempty"`
 	// ParentIssueID is the optional UUID of the parent issue the new issue
 	// should be filed under. Set when the user opens the modal from "Add
 	// sub issue" on an existing issue; the daemon claim handler resolves the
@@ -1617,12 +1618,13 @@ func (s *TaskService) enqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	}
 
 	payload := QuickCreateContext{
-		Type:        QuickCreateContextType,
-		Prompt:      prompt,
-		RequesterID: util.UUIDToString(requesterID),
-		WorkspaceID: util.UUIDToString(workspaceID),
-		Priority:    priority,
-		DueDate:     dueDate,
+		Type:           QuickCreateContextType,
+		Prompt:         prompt,
+		RequesterID:    util.UUIDToString(requesterID),
+		WorkspaceID:    util.UUIDToString(workspaceID),
+		DeliveryIntent: agentDeliveryIntent(agent),
+		Priority:       priority,
+		DueDate:        dueDate,
 	}
 	if projectID.Valid {
 		payload.ProjectID = util.UUIDToString(projectID)
@@ -2122,6 +2124,7 @@ func (s *TaskService) enqueueChatTaskTx(
 		OriginatorSource:     prepared.attrSource,
 		TriggerEvidenceKind:  prepared.attrEvidenceKind,
 		TriggerEvidenceRefID: chatSession.ID,
+		Context:              agentDeliveryContext(agent),
 		ChannelContextRevision: pgtype.Int8{
 			Int64: contextRevision, Valid: contextRevision > 0,
 		},
@@ -2427,6 +2430,7 @@ func (s *TaskService) SendDirectChatMessage(
 			OriginatorSource:     attrSource,
 			TriggerEvidenceKind:  attrEvidenceKind,
 			TriggerEvidenceRefID: attrEvidenceRef,
+			Context:              agentDeliveryContext(carrier),
 		})
 		if err != nil {
 			return fmt.Errorf("create direct chat task: %w", err)

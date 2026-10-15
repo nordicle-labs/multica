@@ -32,8 +32,8 @@ func seedQueuedIssueTask(t *testing.T, ctx context.Context, agentID, runtimeID, 
 	t.Helper()
 	var id string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
-		VALUES ($1, $2, $3, 'queued', 0)
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, context)
+		VALUES ($1, $2, $3, 'queued', 0, '{"delivery_intent":"none"}')
 		RETURNING id
 	`, agentID, runtimeID, issueID).Scan(&id); err != nil {
 		t.Fatalf("seed queued task: %v", err)

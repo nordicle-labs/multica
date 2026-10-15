@@ -2097,7 +2097,7 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 
 	setupGitHubClaimTestBroker(t, projectRepoURL)
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-project-repos")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -2289,7 +2289,7 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-daemon-claim")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("runtimeId", runtimeID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
