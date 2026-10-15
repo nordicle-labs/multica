@@ -2535,7 +2535,12 @@ func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
 		}
 		credentials.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"claim_id":"claim-1","credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+		_, _ = w.Write([]byte(`{"claim_id":"claim-1","credential_handle":"credential-1","credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+	})
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/concurrent-task/github-publication-recovery/credential", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = fmt.Fprintf(w, `{"revocation_confirmed":%t}`, body["credential_action"] == "revoke")
 	})
 	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/concurrent-task/github-publication-recovery/complete", func(w http.ResponseWriter, _ *http.Request) {
 		completions.Add(1)
@@ -2627,9 +2632,19 @@ func TestReconcileRecoveryManifestPersistsRevocationFailure(t *testing.T) {
 	head := runGitForGC(t, repo, "rev-parse", "HEAD")
 	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
+	var claims, credentialResponses, completions atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/revoke-task/github-publication-recovery/claim", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"claim_id":"claim-1","credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+		claims.Add(1)
+		if credentialResponses.Load() > 0 {
+			_, _ = w.Write([]byte(`{"claim_id":"claim-1","credential_handle":"credential-1","revocation_confirmed":true}`))
+			return
+		}
+		credentialResponses.Add(1)
+		_, _ = w.Write([]byte(`{"claim_id":"claim-1","credential_handle":"credential-1","credentials":[{"repository":"owner/repo","token":"installation-secret"}]}`))
+	})
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/revoke-task/github-publication-recovery/credential", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"revocation_confirmed":false}`))
 	})
 	mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -2643,6 +2658,10 @@ func TestReconcileRecoveryManifestPersistsRevocationFailure(t *testing.T) {
 	})
 	mux.HandleFunc("/installation/token", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/api/daemon/runtimes/runtime-1/tasks/revoke-task/github-publication-recovery/complete", func(w http.ResponseWriter, _ *http.Request) {
+		completions.Add(1)
+		_, _ = w.Write([]byte(`{"completed":true}`))
 	})
 	d := newGCTestDaemon(t, mux)
 	d.cfg.DaemonID = "daemon-1"
@@ -2673,6 +2692,12 @@ func TestReconcileRecoveryManifestPersistsRevocationFailure(t *testing.T) {
 	data, readErr := os.ReadFile(filepath.Join(recoveryRoot, manifest.TaskID, "manifest.json"))
 	if readErr != nil || bytes.Contains(data, []byte("installation-secret")) {
 		t.Fatalf("manifest persisted credential: err=%v data=%s", readErr, data)
+	}
+	if err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, got); err != nil {
+		t.Fatalf("resume after server-side revocation: %v", err)
+	}
+	if claims.Load() != 2 || credentialResponses.Load() != 1 || completions.Load() != 1 {
+		t.Fatalf("claims=%d credentials=%d completions=%d, want same credential completed without remint", claims.Load(), credentialResponses.Load(), completions.Load())
 	}
 }
 

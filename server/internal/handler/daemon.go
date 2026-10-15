@@ -4011,11 +4011,66 @@ type publicationRecoveryRequest struct {
 	DaemonID            string `json:"daemon_id"`
 	Repository          string `json:"repository"`
 	ClaimID             string `json:"claim_id,omitempty"`
+	CredentialHandle    string `json:"credential_handle,omitempty"`
+	CredentialAction    string `json:"credential_action,omitempty"`
+	PublicationReady    bool   `json:"publication_ready,omitempty"`
 	RemoteSHA           string `json:"remote_sha,omitempty"`
 	PullRequestNumber   int    `json:"pull_request_number,omitempty"`
 	PullRequestURL      string `json:"pull_request_url,omitempty"`
 	ReadBackHeadSHA     string `json:"readback_head_sha,omitempty"`
 	RevocationConfirmed bool   `json:"revocation_confirmed,omitempty"`
+}
+
+const maxPublicationRecoveryClaims = 3
+
+var publicationRecoveryCredentials sync.Map // credential handle -> []githubapp.Credential; never persisted
+
+type publicationRecoveryState struct {
+	State               string `json:"state"`
+	ClaimID             string `json:"claim_id"`
+	DaemonID            string `json:"daemon_id"`
+	CredentialHandle    string `json:"credential_handle"`
+	CredentialExpiresAt string `json:"credential_expires_at"`
+	ClaimExpiresAt      string `json:"claim_expires_at"`
+	Claims              int    `json:"claims"`
+}
+
+func publicationRecoveryTimeExpired(value string, now time.Time) bool {
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999Z07:00", "2006-01-02 15:04:05.999999999-07"} {
+		if expiry, err := time.Parse(layout, value); err == nil {
+			return !now.Before(expiry)
+		}
+	}
+	return false
+}
+
+func (s publicationRecoveryState) credentialExpired(now time.Time) bool {
+	return publicationRecoveryTimeExpired(s.CredentialExpiresAt, now)
+}
+
+func taskPublicationRecoveryState(task db.AgentTaskQueue) publicationRecoveryState {
+	var context struct {
+		PublicationRecovery publicationRecoveryState `json:"publication_recovery"`
+	}
+	_ = json.Unmarshal(task.Context, &context)
+	return context.PublicationRecovery
+}
+
+func revokePublicationRecoveryCredential(handle string) (bool, error) {
+	value, ok := publicationRecoveryCredentials.Load(handle)
+	if !ok {
+		return false, nil
+	}
+	credentials, ok := value.([]githubapp.Credential)
+	if !ok {
+		publicationRecoveryCredentials.Delete(handle)
+		return false, errors.New("invalid publication credential handle")
+	}
+	if err := revokeGitHubClaimCredentials(githubAppBroker(), credentials); err != nil {
+		return true, err
+	}
+	publicationRecoveryCredentials.Delete(handle)
+	return true, nil
 }
 
 func publicationCredentialFailureState(err error) string {
@@ -4074,34 +4129,68 @@ func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *h
 		writeError(w, http.StatusForbidden, "repository is not authorized for this task")
 		return
 	}
+	state := taskPublicationRecoveryState(task)
+	if state.CredentialHandle != "" && slices.Contains([]string{"credential_minting", "credential_issued", "credential_received", "revocation_pending"}, state.State) {
+		mayRevoke := state.State == "revocation_pending" || (state.State == "credential_issued" && publicationRecoveryTimeExpired(state.ClaimExpiresAt, time.Now()))
+		found := false
+		var revokeErr error
+		if mayRevoke {
+			found, revokeErr = revokePublicationRecoveryCredential(state.CredentialHandle)
+		}
+		switch {
+		case revokeErr != nil:
+			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"revocation_pending"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
+			writeError(w, http.StatusConflict, "previous publication credential revocation is pending")
+			return
+		case found:
+			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_revoked"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
+			state.State = "credential_revoked"
+		case !state.credentialExpired(time.Now()):
+			writeError(w, http.StatusConflict, "previous publication credential is still outstanding")
+			return
+		default:
+			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_expired"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
+			state.State = "credential_expired"
+		}
+	}
+	if req.PublicationReady && slices.Contains([]string{"credential_revoked", "credential_expired"}, state.State) {
+		writeJSON(w, http.StatusOK, map[string]any{"claim_id": state.ClaimID, "credential_handle": state.CredentialHandle, "revocation_confirmed": true})
+		return
+	}
 	claimID := dbid.NewV7()
+	credentialHandle := uuidToString(dbid.NewV7())
 	var claimedID pgtype.UUID
 	err = h.DB.QueryRow(r.Context(), `
 UPDATE agent_task_queue
-SET context = context || jsonb_build_object('publication_recovery', jsonb_build_object(
-  'state','claimed','claim_id',$4::text,'daemon_id',$5::text,
+SET context = jsonb_set(context, '{publication_recovery}',
+  COALESCE(context->'publication_recovery','{}'::jsonb) || jsonb_build_object(
+  'state','credential_minting','claim_id',$4::text,'daemon_id',$5::text,
+  'credential_handle',$6::text,'repository',$3::text,
   'claims',COALESCE((context->'publication_recovery'->>'claims')::int,0)+1,
-  'claim_expires_at',(clock_timestamp()+interval '2 minutes')::text))
+	  'claim_expires_at',(clock_timestamp()+interval '2 minutes')::text,
+  'credential_expires_at',(clock_timestamp()+interval '65 minutes')::text), true)
 WHERE id=$1 AND runtime_id=$2 AND status='completed'
   AND context->>'delivery_intent'='publish'
   AND result->>'recovery_repository'=$3
   AND result->>'recovery_bundle_verified'='true'
   AND COALESCE(context->'publication_recovery'->>'state','pending') <> 'completed'
   AND COALESCE(context->'publication_recovery'->>'state','pending') <> 'blocked'
-  AND (context->'publication_recovery'->>'claim_expires_at' IS NULL
-       OR (context->'publication_recovery'->>'claim_expires_at')::timestamptz < clock_timestamp())
-RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.DaemonID).Scan(&claimedID)
+  AND COALESCE((context->'publication_recovery'->>'claims')::int,0) < $7
+  AND (context->'publication_recovery'->>'credential_handle' IS NULL
+       OR context->'publication_recovery'->>'state' IN ('credential_revoked','credential_expired','pending')
+       OR (context->'publication_recovery'->>'credential_expires_at')::timestamptz <= clock_timestamp())
+RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.DaemonID, credentialHandle, maxPublicationRecoveryClaims).Scan(&claimedID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, getErr := h.Queries.GetAgentTask(r.Context(), taskID)
 		if getErr == nil {
-			var state struct {
-				PublicationRecovery struct {
-					State string `json:"state"`
-				} `json:"publication_recovery"`
-			}
-			_ = json.Unmarshal(existing.Context, &state)
-			if state.PublicationRecovery.State == "completed" {
+			existingState := taskPublicationRecoveryState(existing)
+			if existingState.State == "completed" {
 				writeJSON(w, http.StatusOK, map[string]any{"completed": true})
+				return
+			}
+			if existingState.Claims >= maxPublicationRecoveryClaims {
+				_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"blocked"',true) WHERE id=$1 AND COALESCE((context->'publication_recovery'->>'claims')::int,0) >= $2 AND context->'publication_recovery'->>'state' <> 'completed'`, taskID, maxPublicationRecoveryClaims)
+				writeError(w, http.StatusConflict, "publication recovery retry limit reached")
 				return
 			}
 		}
@@ -4115,19 +4204,88 @@ RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.Da
 	credentials, err := h.githubCredentialsForClaim(r.Context(), runtime, uuidToString(runtime.WorkspaceID), []RepoData{repository})
 	if err != nil {
 		state := publicationCredentialFailureState(err)
-		_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context #- '{publication_recovery,claim_expires_at}','{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), state, util.SanitizeTextForPostgres(err.Error()))
+		if state == "pending" {
+			state = "credential_minting"
+		}
+		_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), state, util.SanitizeTextForPostgres(err.Error()))
 		writeError(w, http.StatusForbidden, "GitHub App authorization failed")
 		return
 	}
-	if err := writeJSONAndFlush(w, http.StatusOK, map[string]any{"claim_id": uuidToString(claimID), "credentials": credentials}); err != nil {
+	publicationRecoveryCredentials.Store(credentialHandle, credentials)
+	time.AfterFunc(time.Until(credentials[0].ExpiresAt), func() {
+		publicationRecoveryCredentials.Delete(credentialHandle)
+	})
+	tag, persistErr := h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(jsonb_set(context,'{publication_recovery,state}','"credential_issued"',true),'{publication_recovery,credential_expires_at}',to_jsonb($3::text),true) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2 AND context->'publication_recovery'->>'state'='credential_minting'`, taskID, uuidToString(claimID), credentials[0].ExpiresAt.UTC().Format(time.RFC3339Nano))
+	if persistErr != nil || tag.RowsAffected() != 1 {
+		_, revokeErr := revokePublicationRecoveryCredential(credentialHandle)
+		logGitHubCredentialDeliveryFailure(slog.Default(), runtimeID, taskID, revokeErr)
+		writeError(w, http.StatusConflict, "publication credential lease was not persisted")
+		return
+	}
+	if err := writeJSONAndFlush(w, http.StatusOK, map[string]any{"claim_id": uuidToString(claimID), "credential_handle": credentialHandle, "credentials": credentials}); err != nil {
 		revokeErr := revokeGitHubClaimCredentials(githubAppBroker(), credentials)
-		state := "pending"
+		state := "credential_revoked"
 		if revokeErr != nil {
-			state = "revocation_unconfirmed"
+			state = "revocation_pending"
+		} else {
+			publicationRecoveryCredentials.Delete(credentialHandle)
 		}
-		_, _ = h.DB.Exec(context.Background(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2`, taskID, uuidToString(claimID), state, "credential response lost; revocation confirmed="+strconv.FormatBool(revokeErr == nil))
+		_, _ = h.DB.Exec(context.Background(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}',to_jsonb($3::text),true) || jsonb_build_object('publication_recovery_error',$4::text) WHERE id=$1 AND context->'publication_recovery'->>'claim_id'=$2 AND context->'publication_recovery'->>'credential_handle'=$5`, taskID, uuidToString(claimID), state, "credential response lost; revocation confirmed="+strconv.FormatBool(revokeErr == nil), credentialHandle)
 		logGitHubCredentialDeliveryFailure(slog.Default(), runtimeID, taskID, revokeErr)
 	}
+}
+
+// UpdateTaskGitHubPublicationCredential durably acknowledges receipt or asks
+// the server to retry revocation by opaque handle. Tokens remain memory-only.
+func (h *Handler) UpdateTaskGitHubPublicationCredential(w http.ResponseWriter, r *http.Request) {
+	if middleware.DaemonAuthPathFromContext(r.Context()) != middleware.DaemonAuthPathDaemonToken {
+		writeError(w, http.StatusForbidden, "daemon authentication is required")
+		return
+	}
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, chi.URLParam(r, "runtimeId"))
+	if !ok {
+		return
+	}
+	var req publicationRecoveryRequest
+	if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req) != nil {
+		writeError(w, http.StatusBadRequest, "invalid publication credential update")
+		return
+	}
+	if !runtime.DaemonID.Valid || runtime.DaemonID.String != strings.TrimSpace(req.DaemonID) || middleware.DaemonIDFromContext(r.Context()) != strings.TrimSpace(req.DaemonID) {
+		writeError(w, http.StatusForbidden, "runtime is not assigned to this daemon")
+		return
+	}
+	taskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "taskId")
+	if !ok {
+		return
+	}
+	state := "credential_received"
+	switch req.CredentialAction {
+	case "revoke":
+		found, err := revokePublicationRecoveryCredential(strings.TrimSpace(req.CredentialHandle))
+		if err != nil || !found {
+			state = "revocation_pending"
+		} else {
+			state = "credential_revoked"
+		}
+	case "revoked":
+		publicationRecoveryCredentials.Delete(strings.TrimSpace(req.CredentialHandle))
+		state = "credential_revoked"
+	case "ack":
+	default:
+		writeError(w, http.StatusBadRequest, "credential_action must be ack, revoke, or revoked")
+		return
+	}
+	tag, err := h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}',to_jsonb($5::text),true) WHERE id=$1 AND runtime_id=$2 AND context->'publication_recovery'->>'claim_id'=$3 AND context->'publication_recovery'->>'credential_handle'=$4 AND context->'publication_recovery'->>'state' IN ('credential_issued','credential_received','revocation_pending')`, taskID, runtime.ID, strings.TrimSpace(req.ClaimID), strings.TrimSpace(req.CredentialHandle), state)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update publication credential")
+		return
+	}
+	if tag.RowsAffected() != 1 {
+		writeError(w, http.StatusConflict, "stale publication credential update")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revocation_confirmed": state == "credential_revoked"})
 }
 
 func (h *Handler) CompleteTaskGitHubPublicationRecovery(w http.ResponseWriter, r *http.Request) {
@@ -4162,13 +4320,15 @@ func (h *Handler) CompleteTaskGitHubPublicationRecovery(w http.ResponseWriter, r
 UPDATE agent_task_queue
 SET context=jsonb_set(context,'{publication_recovery}',jsonb_build_object(
   'state','completed','claim_id',$4::text,'daemon_id',$5::text,
+	  'credential_handle',$10::text,
   'remote_sha',$6::text,'pull_request_number',$7::int,'pull_request_url',$8::text,
   'readback_head_sha',$9::text,'revocation_confirmed',true),true)
 WHERE id=$1 AND runtime_id=$2 AND result->>'recovery_repository'=$3
 	  AND result->>'recovery_head_sha'=$6
   AND context->'publication_recovery'->>'claim_id'=$4
   AND context->'publication_recovery'->>'daemon_id'=$5
-	  AND context->'publication_recovery'->>'state'='claimed'`, taskID, runtime.ID, strings.TrimSpace(req.Repository), strings.TrimSpace(req.ClaimID), strings.TrimSpace(req.DaemonID), strings.TrimSpace(req.RemoteSHA), req.PullRequestNumber, strings.TrimSpace(req.PullRequestURL), strings.TrimSpace(req.ReadBackHeadSHA))
+	  AND context->'publication_recovery'->>'credential_handle'=$10
+	  AND context->'publication_recovery'->>'state' IN ('credential_revoked','credential_expired')`, taskID, runtime.ID, strings.TrimSpace(req.Repository), strings.TrimSpace(req.ClaimID), strings.TrimSpace(req.DaemonID), strings.TrimSpace(req.RemoteSHA), req.PullRequestNumber, strings.TrimSpace(req.PullRequestURL), strings.TrimSpace(req.ReadBackHeadSHA), strings.TrimSpace(req.CredentialHandle))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to complete publication recovery")
 		return

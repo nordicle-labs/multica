@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
@@ -185,8 +186,9 @@ type Task struct {
 }
 
 type GitHubCredential struct {
-	Repository string `json:"repository"`
-	Token      string `json:"token"`
+	Repository string    `json:"repository"`
+	Token      string    `json:"token"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon

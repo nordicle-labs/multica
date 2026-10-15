@@ -21,8 +21,9 @@ const responseLimit = 1 << 20
 type Permissions map[string]string
 
 type Credential struct {
-	Repository string `json:"repository"`
-	Token      string `json:"token"`
+	Repository string    `json:"repository"`
+	Token      string    `json:"token"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 type Broker struct {
@@ -94,7 +95,8 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 		return Credential{}, fmt.Errorf("create installation token: github status %d", resp.StatusCode)
 	}
 	var out struct {
-		Token        string `json:"token"`
+		Token        string    `json:"token"`
+		ExpiresAt    time.Time `json:"expires_at"`
 		Repositories []struct {
 			FullName string `json:"full_name"`
 		} `json:"repositories"`
@@ -105,11 +107,14 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 	if out.Token == "" {
 		return Credential{}, errors.New("create installation token: empty token")
 	}
+	if out.ExpiresAt.IsZero() {
+		out.ExpiresAt = time.Now().Add(time.Hour)
+	}
 	if len(out.Repositories) != 1 || !strings.EqualFold(out.Repositories[0].FullName, repository) {
 		_ = b.Revoke(context.Background(), out.Token)
 		return Credential{}, errors.New("create installation token: repository scope mismatch")
 	}
-	return Credential{Repository: repository, Token: out.Token}, nil
+	return Credential{Repository: repository, Token: out.Token, ExpiresAt: out.ExpiresAt}, nil
 }
 
 func (b Broker) Revoke(ctx context.Context, token string) error {

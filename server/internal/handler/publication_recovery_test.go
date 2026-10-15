@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
@@ -49,6 +50,24 @@ func TestValidGitObjectID(t *testing.T) {
 	}
 }
 
+func TestPublicationRecoveryCredentialLeaseExpiry(t *testing.T) {
+	now := time.Date(2026, time.October, 15, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		expires string
+		want    bool
+	}{
+		{now.Add(-time.Second).Format(time.RFC3339Nano), true},
+		{now.Add(time.Second).Format(time.RFC3339Nano), false},
+		{"2026-10-15 11:59:59+00", true},
+		{"", false},
+		{"forged", false},
+	} {
+		if got := (publicationRecoveryState{CredentialExpiresAt: tc.expires}).credentialExpired(now); got != tc.want {
+			t.Errorf("credentialExpired(%q) = %v, want %v", tc.expires, got, tc.want)
+		}
+	}
+}
+
 func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -70,6 +89,7 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	router := chi.NewRouter()
 	router.Use(middleware.DaemonAuth(testHandler.Queries, nil, nil, nil))
 	router.Post("/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/github-publication-recovery/claim", testHandler.ClaimTaskGitHubPublicationRecovery)
+	router.Post("/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/github-publication-recovery/credential", testHandler.UpdateTaskGitHubPublicationCredential)
 	router.Post("/api/daemon/runtimes/{runtimeId}/tasks/{taskId}/github-publication-recovery/complete", testHandler.CompleteTaskGitHubPublicationRecovery)
 	claimPath := "/api/daemon/runtimes/" + runtimeID + "/tasks/" + taskID + "/github-publication-recovery/claim"
 	body := []byte(`{"daemon_id":"` + daemonID + `","repository":"test-owner/test-repo"}`)
@@ -107,14 +127,27 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 		t.Fatalf("claim statuses=%d/%d minted=%d", first.code, second.code, minted.Load())
 	}
 	var claimed struct {
-		ClaimID     string                 `json:"claim_id"`
-		Credentials []githubapp.Credential `json:"credentials"`
+		ClaimID          string                 `json:"claim_id"`
+		CredentialHandle string                 `json:"credential_handle"`
+		Credentials      []githubapp.Credential `json:"credentials"`
 	}
-	if err := json.Unmarshal(first.body, &claimed); err != nil || claimed.ClaimID == "" || len(claimed.Credentials) != 1 {
-		t.Fatalf("decode recovery claim: claim_id=%q credentials=%d err=%v", claimed.ClaimID, len(claimed.Credentials), err)
+	if err := json.Unmarshal(first.body, &claimed); err != nil || claimed.ClaimID == "" || claimed.CredentialHandle == "" || len(claimed.Credentials) != 1 {
+		t.Fatalf("decode recovery claim: claim_id=%q handle=%q credentials=%d err=%v", claimed.ClaimID, claimed.CredentialHandle, len(claimed.Credentials), err)
 	}
-	if err := revokeGitHubClaimCredentials(githubAppBroker(), claimed.Credentials); err != nil {
-		t.Fatal(err)
+	credentialPath := "/api/daemon/runtimes/" + runtimeID + "/tasks/" + taskID + "/github-publication-recovery/credential"
+	credentialUpdate := func(action string) *httptest.ResponseRecorder {
+		updateBody := []byte(`{"daemon_id":"` + daemonID + `","claim_id":"` + claimed.ClaimID + `","credential_handle":"` + claimed.CredentialHandle + `","credential_action":"` + action + `"}`)
+		req := httptest.NewRequest(http.MethodPost, credentialPath, bytes.NewReader(updateBody))
+		req.Header.Set("Authorization", "Bearer "+daemonToken)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	if w := credentialUpdate("ack"); w.Code != http.StatusOK {
+		t.Fatalf("ack status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := credentialUpdate("revoke"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revocation_confirmed":true`) {
+		t.Fatalf("revoke status=%d body=%s", w.Code, w.Body.String())
 	}
 	select {
 	case <-revoked:
@@ -122,7 +155,7 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 		t.Fatal("recovery credential was not revoked")
 	}
 	const publishedSHA = "0123456789012345678901234567890123456789"
-	completeBody := []byte(`{"daemon_id":"` + daemonID + `","repository":"test-owner/test-repo","claim_id":"` + claimed.ClaimID + `","remote_sha":"` + publishedSHA + `","pull_request_number":42,"pull_request_url":"https://github.test/pull/42","readback_head_sha":"` + publishedSHA + `","revocation_confirmed":true}`)
+	completeBody := []byte(`{"daemon_id":"` + daemonID + `","repository":"test-owner/test-repo","claim_id":"` + claimed.ClaimID + `","credential_handle":"` + claimed.CredentialHandle + `","remote_sha":"` + publishedSHA + `","pull_request_number":42,"pull_request_url":"https://github.test/pull/42","readback_head_sha":"` + publishedSHA + `","revocation_confirmed":true}`)
 	completePath := "/api/daemon/runtimes/" + runtimeID + "/tasks/" + taskID + "/github-publication-recovery/complete"
 	request := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, completePath, bytes.NewReader(completeBody))
@@ -148,5 +181,21 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"completed":true`) || minted.Load() != 1 {
 		t.Fatalf("readback status=%d minted=%d body=%s", w.Code, minted.Load(), w.Body.String())
+	}
+
+	limitedTaskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status='completed', completed_at=now(), context='{"delivery_intent":"publish","publication_recovery":{"state":"pending","claims":3}}', result='{"recovery_repository":"test-owner/test-repo","recovery_bundle_verified":true,"recovery_head_sha":"0123456789012345678901234567890123456789"}' WHERE id=$1`, limitedTaskID)
+	limitedPath := "/api/daemon/runtimes/" + runtimeID + "/tasks/" + limitedTaskID + "/github-publication-recovery/claim"
+	limitedReq := httptest.NewRequest(http.MethodPost, limitedPath, bytes.NewReader(body))
+	limitedReq.Header.Set("Authorization", "Bearer "+daemonToken)
+	limited := httptest.NewRecorder()
+	router.ServeHTTP(limited, limitedReq)
+	if limited.Code != http.StatusConflict || minted.Load() != 1 {
+		t.Fatalf("retry limit status=%d minted=%d body=%s", limited.Code, minted.Load(), limited.Body.String())
+	}
+	var limitedState string
+	dbfx.QueryRow(t, `SELECT context->'publication_recovery'->>'state' FROM agent_task_queue WHERE id=$1`, limitedTaskID).Scan(&limitedState)
+	if limitedState != "blocked" {
+		t.Fatalf("retry limit state=%q, want blocked", limitedState)
 	}
 }

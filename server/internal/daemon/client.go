@@ -300,24 +300,35 @@ func (c *Client) AcquireGitHubCredentials(ctx context.Context, task Task, reposi
 }
 
 type publicationRecoveryClaim struct {
-	ClaimID     string             `json:"claim_id"`
-	Credentials []GitHubCredential `json:"credentials"`
-	Completed   bool               `json:"completed"`
+	ClaimID             string             `json:"claim_id"`
+	CredentialHandle    string             `json:"credential_handle"`
+	Credentials         []GitHubCredential `json:"credentials"`
+	RevocationConfirmed bool               `json:"revocation_confirmed"`
+	Completed           bool               `json:"completed"`
 }
 
-func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository string) (publicationRecoveryClaim, error) {
+func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository string, publicationReady bool) (publicationRecoveryClaim, error) {
 	var response publicationRecoveryClaim
 	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/claim", url.PathEscape(runtimeID), url.PathEscape(taskID))
-	if err := c.postJSON(ctx, path, map[string]string{"daemon_id": daemonID, "repository": repository}, &response); err != nil {
+	if err := c.postJSON(ctx, path, map[string]any{"daemon_id": daemonID, "repository": repository, "publication_ready": publicationReady}, &response); err != nil {
 		return response, fmt.Errorf("claim GitHub publication recovery: %w", err)
 	}
 	return response, nil
 }
 
-func (c *Client) CompleteGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository, claimID, remoteSHA string, pullRequest githubPullRequest) error {
+func (c *Client) UpdateGitHubPublicationCredential(ctx context.Context, daemonID, runtimeID, taskID, claimID, credentialHandle, action string) (bool, error) {
+	var response struct {
+		RevocationConfirmed bool `json:"revocation_confirmed"`
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/credential", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	err := c.postJSON(ctx, path, map[string]string{"daemon_id": daemonID, "claim_id": claimID, "credential_handle": credentialHandle, "credential_action": action}, &response)
+	return response.RevocationConfirmed, err
+}
+
+func (c *Client) CompleteGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository, claimID, credentialHandle, remoteSHA string, pullRequest githubPullRequest) error {
 	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/complete", url.PathEscape(runtimeID), url.PathEscape(taskID))
 	return c.postJSON(ctx, path, map[string]any{
-		"daemon_id": daemonID, "repository": repository, "claim_id": claimID,
+		"daemon_id": daemonID, "repository": repository, "claim_id": claimID, "credential_handle": credentialHandle,
 		"remote_sha": remoteSHA, "pull_request_number": pullRequest.Number,
 		"pull_request_url": pullRequest.URL, "readback_head_sha": pullRequest.HeadSHA,
 		"revocation_confirmed": true,
