@@ -99,7 +99,7 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 			FullName string `json:"full_name"`
 		} `json:"repositories"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, responseLimit)).Decode(&out); err != nil {
+	if err := decodeBoundedJSON(resp.Body, &out); err != nil {
 		return Credential{}, errors.New("create installation token: malformed response")
 	}
 	if out.Token == "" {
@@ -145,7 +145,7 @@ func (b Broker) MintInstallation(ctx context.Context, installationID int64, perm
 	var out struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, responseLimit)).Decode(&out); err != nil || out.Token == "" {
+	if err := decodeBoundedJSON(resp.Body, &out); err != nil || out.Token == "" {
 		return "", errors.New("create installation token: malformed response")
 	}
 	return out.Token, nil
@@ -202,4 +202,22 @@ func (b Broker) client() *http.Client {
 		return b.Client
 	}
 	return &http.Client{Timeout: 15 * time.Second}
+}
+
+func decodeBoundedJSON(r io.Reader, out any) error {
+	raw, err := io.ReadAll(io.LimitReader(r, responseLimit+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > responseLimit {
+		return errors.New("response exceeds 1 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("response contains trailing data")
+	}
+	return nil
 }

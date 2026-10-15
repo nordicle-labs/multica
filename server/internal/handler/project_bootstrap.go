@@ -6,17 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/githubapp"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 type ProjectBootstrapper interface {
-	Check(context.Context, int64, string, string) (bool, githubapp.BootstrapResult, error)
+	Check(context.Context, int64, string, string, string) (bool, githubapp.BootstrapResult, error)
 	Bootstrap(context.Context, int64, string, string, string) (githubapp.BootstrapResult, error)
-	Delete(context.Context, int64, string) error
+	Delete(context.Context, int64, string, int64) error
 }
 
 func NewProjectBootstrapper() ProjectBootstrapper {
@@ -37,6 +40,10 @@ type projectBootstrapResponse struct {
 // BootstrapProject creates the canonical GitHub repository and its Multica
 // project/resource. Every local collision is resolved before the first write.
 func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
+	if isMachineCredentialActor(r) {
+		writeError(w, http.StatusForbidden, "this endpoint is only available to human actors")
+		return
+	}
 	var req projectBootstrapRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 	decoder.DisallowUnknownFields()
@@ -83,6 +90,18 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	repoURL := "https://github.com/" + githubapp.BootstrapOwner + "/" + name
+	lockTx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to serialize project bootstrap")
+		return
+	}
+	defer lockTx.Rollback(r.Context())
+	for _, key := range bootstrapLockKeys(workspaceID, req.Product, repoURL) {
+		if _, err := lockTx.Exec(r.Context(), "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", key); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to serialize project bootstrap")
+			return
+		}
+	}
 	existingProject, localState, err := h.bootstrapLocalState(r.Context(), wsUUID, req.Product, repoURL)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to preflight Multica project")
@@ -93,7 +112,7 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	remoteExists, remote, err := h.ProjectBootstrap.Check(r.Context(), installation.InstallationID, name, req.Visibility)
+	remoteExists, remote, err := h.ProjectBootstrap.Check(r.Context(), installation.InstallationID, name, req.Visibility, req.Product)
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -116,9 +135,15 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	project, err := h.createBootstrapProject(r.Context(), wsUUID, requester.UserID, req.Product, repoURL)
+	if remote.State != "created" {
+		writeError(w, http.StatusConflict, "GitHub repository appeared during bootstrap; refusing to adopt it")
+		return
+	}
+	project, err := h.createBootstrapProject(r.Context(), lockTx, wsUUID, requester.UserID, req.Product, repoURL)
 	if err != nil {
-		if rollbackErr := h.ProjectBootstrap.Delete(context.Background(), installation.InstallationID, name); rollbackErr != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if rollbackErr := h.ProjectBootstrap.Delete(rollbackCtx, installation.InstallationID, name, remote.RepositoryID); rollbackErr != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("create Multica project failed; rollback incomplete; reconcile repository %s/%s", githubapp.BootstrapOwner, name))
 			return
 		}
@@ -129,20 +154,16 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func bootstrapInstallation(installations []db.GithubInstallation) (db.GithubInstallation, error) {
-	var match *db.GithubInstallation
-	for i := range installations {
-		if strings.TrimSpace(installations[i].AccountLogin) != githubapp.BootstrapOwner {
-			continue
-		}
-		if match != nil {
-			return db.GithubInstallation{}, errors.New("multiple nordicle-labs GitHub App installations")
-		}
-		match = &installations[i]
+	if len(installations) != 1 || strings.TrimSpace(installations[0].AccountLogin) != githubapp.BootstrapOwner || installations[0].AccountType != "Organization" || installations[0].InstallationID <= 0 {
+		return db.GithubInstallation{}, errors.New("workspace must have exactly one nordicle-labs Organization GitHub App installation")
 	}
-	if match == nil {
-		return db.GithubInstallation{}, errors.New("nordicle-labs GitHub App installation not found")
-	}
-	return *match, nil
+	return installations[0], nil
+}
+
+func bootstrapLockKeys(workspaceID, product, repoURL string) []string {
+	keys := []string{workspaceID + ":product:" + product, workspaceID + ":repository:" + repoURL}
+	sort.Strings(keys)
+	return keys
 }
 
 func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UUID, product, repoURL string) (db.Project, string, error) {
@@ -189,12 +210,7 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 	return db.Project{}, "absent", nil
 }
 
-func (h *Handler) createBootstrapProject(ctx context.Context, workspaceID, userID pgtype.UUID, product, repoURL string) (db.Project, error) {
-	tx, err := h.TxStarter.Begin(ctx)
-	if err != nil {
-		return db.Project{}, err
-	}
-	defer tx.Rollback(ctx)
+func (h *Handler) createBootstrapProject(ctx context.Context, tx pgx.Tx, workspaceID, userID pgtype.UUID, product, repoURL string) (db.Project, error) {
 	qtx := h.Queries.WithTx(tx)
 	project, err := qtx.CreateProject(ctx, db.CreateProjectParams{WorkspaceID: workspaceID, Title: product, Status: "planned", Priority: "none"})
 	if err != nil {
