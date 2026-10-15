@@ -273,3 +273,73 @@ func TestArtifactEvidenceUsesOneExactSHA(t *testing.T) {
 		t.Fatalf("mismatched artifact accepted: %v", err)
 	}
 }
+
+func TestResumeRevalidatesBindingAndRole(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+		want   error
+	}{
+		{"revoked role", func(cfg *Config) { cfg.AllowedRoles["Engineering Developer"] = false }, ErrRoleDenied},
+		{"stale binding", func(cfg *Config) { cfg.Bindings[1].ValidUntil = time.Unix(1, 0) }, ErrBindingStale},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, path, issues, dispatch, notify := newHarness(t)
+			dispatch.fail = true
+			engine := New(cfg, NewFileStore(path), issues, dispatch, notify)
+			state, err := engine.Process(context.Background(), Message{Source: Source{Kind: SourceTelegram, ID: "bot-product-a"}, ID: tc.name, CanonicalKey: tc.name, Text: "bug: x"})
+			if err == nil {
+				t.Fatal("initial dispatch unexpectedly succeeded")
+			}
+			dispatch.fail = false
+			tc.mutate(&engine.config)
+			if _, err := engine.Resume(context.Background(), state.Key); !errors.Is(err, tc.want) {
+				t.Fatalf("Resume error = %v, want %v", err, tc.want)
+			}
+			if dispatch.calls != 1 {
+				t.Fatalf("dispatch calls = %d, want 1", dispatch.calls)
+			}
+		})
+	}
+}
+
+func TestEvidenceIsMonotoneAndVerdictsAreBounded(t *testing.T) {
+	cfg, path, issues, dispatch, notify := newHarness(t)
+	engine := New(cfg, NewFileStore(path), issues, dispatch, notify)
+	state, err := engine.Process(context.Background(), Message{Source: Source{Kind: SourceTelegram, ID: "bot-product-a"}, ID: "evidence", CanonicalKey: "evidence", Text: "feature: x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	if _, err := engine.RecordEvidence(context.Background(), state.Key, StageReview, sha, "passed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RecordEvidence(context.Background(), state.Key, StageQA, sha, "passed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RecordEvidence(context.Background(), state.Key, StageReview, sha, "failed"); !errors.Is(err, ErrEvidenceOrder) {
+		t.Fatalf("rewrote review evidence: %v", err)
+	}
+	if _, err := engine.RecordEvidence(context.Background(), state.Key, StageMerge, sha, "approved"); !errors.Is(err, ErrEvidenceVerdict) {
+		t.Fatalf("accepted unknown verdict: %v", err)
+	}
+}
+
+func TestDispatchFailureReturnsPersistenceFailure(t *testing.T) {
+	cfg, path, issues, dispatch, notify := newHarness(t)
+	store := NewFileStore(path)
+	dispatch.fail = true
+	persistErr := errors.New("disk unavailable")
+	saves := 0
+	store.saveHook = func(records map[string]State) error {
+		saves++
+		if saves == 2 {
+			return persistErr
+		}
+		return store.save(records)
+	}
+	state, err := New(cfg, store, issues, dispatch, notify).Process(context.Background(), Message{Source: Source{Kind: SourceTelegram, ID: "bot-product-a"}, ID: "persist", CanonicalKey: "persist", Text: "bug: x"})
+	if !errors.Is(err, persistErr) || state.Status != StatusAgentFailed {
+		t.Fatalf("state=%#v err=%v", state, err)
+	}
+}

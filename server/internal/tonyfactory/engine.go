@@ -67,6 +67,7 @@ var (
 	ErrWakeupLimit      = errors.New("tony factory: wakeup limit reached")
 	ErrArtifactMismatch = errors.New("tony factory: evidence artifact SHA mismatch")
 	ErrEvidenceStage    = errors.New("tony factory: invalid evidence stage")
+	ErrEvidenceVerdict  = errors.New("tony factory: invalid evidence verdict")
 	ErrEvidenceOrder    = errors.New("tony factory: evidence transition is out of order")
 	ErrConfigInvalid    = errors.New("tony factory: invalid contract configuration")
 )
@@ -143,6 +144,7 @@ type State struct {
 	Wakeups        int                        `json:"wakeups"`
 	NotifiedStatus Status                     `json:"notified_status,omitempty"`
 	LastError      string                     `json:"last_error,omitempty"`
+	GrantedGates   []string                   `json:"granted_gates,omitempty"`
 }
 
 type IssueRequest struct {
@@ -220,6 +222,7 @@ func (e *Engine) Process(ctx context.Context, msg Message) (State, error) {
 			ProductID: binding.ProductID, ProjectID: binding.ProjectID, PolicyID: binding.PolicyID,
 			Kind: kind, Risk: policy.Risk, Role: route.Role, Squad: route.Squad,
 			BoardStatus: "todo", Status: StatusPending, Evidence: map[EvidenceStage]Evidence{},
+			GrantedGates: append([]string(nil), msg.GrantedGates...),
 		}
 		issueID, created, resolveErr := e.issues.Resolve(ctx, IssueRequest{
 			ProjectID: binding.ProjectID, ProductID: binding.ProductID, CanonicalKey: msg.CanonicalKey,
@@ -227,7 +230,9 @@ func (e *Engine) Process(ctx context.Context, msg Message) (State, error) {
 		})
 		if resolveErr != nil {
 			delete(records, key)
-			_ = persist()
+			if persistErr := persist(); persistErr != nil {
+				return state, errors.Join(resolveErr, persistErr)
+			}
 			return state, resolveErr
 		}
 		state.IssueID, state.IssueCreated = issueID, created
@@ -248,9 +253,9 @@ func (e *Engine) Resume(ctx context.Context, key string) (State, error) {
 		if state.Status == StatusCancelled {
 			return state, ErrCancelled
 		}
-		route, ok := e.config.Routes[state.Kind]
-		if !ok {
-			return state, ErrRouteMissing
+		route, err := e.revalidate(state)
+		if err != nil {
+			return state, err
 		}
 		if state.Status == StatusActive {
 			return e.finishDispatch(ctx, records, state, route, persist, false)
@@ -278,15 +283,23 @@ func (e *Engine) finishDispatch(ctx context.Context, records map[string]State, s
 		if err != nil {
 			state.Status, state.LastError = StatusAgentFailed, err.Error()
 			records[state.Key] = state
-			_ = persist()
-			e.notify(ctx, records, &state, persist)
+			if persistErr := persist(); persistErr != nil {
+				return state, errors.Join(err, persistErr)
+			}
+			if notifyErr := e.notify(ctx, records, &state, persist); notifyErr != nil {
+				return state, errors.Join(err, notifyErr)
+			}
 			return state, err
 		}
 		if run.ID == "" || run.StartedAt.IsZero() {
 			state.Status, state.LastError = StatusAgentFailed, ErrRunInvalid.Error()
 			records[state.Key] = state
-			_ = persist()
-			e.notify(ctx, records, &state, persist)
+			if persistErr := persist(); persistErr != nil {
+				return state, errors.Join(ErrRunInvalid, persistErr)
+			}
+			if notifyErr := e.notify(ctx, records, &state, persist); notifyErr != nil {
+				return state, errors.Join(ErrRunInvalid, notifyErr)
+			}
 			return state, ErrRunInvalid
 		}
 		state.Run, state.Status, state.BoardStatus = run, StatusActive, "in_progress"
@@ -314,8 +327,7 @@ func (e *Engine) notify(ctx context.Context, records map[string]State, state *St
 	if err != nil {
 		state.LastError = err.Error()
 		records[state.Key] = *state
-		_ = persist()
-		return err
+		return errors.Join(err, persist())
 	}
 	state.NotifiedStatus = state.Status
 	state.LastError = ""
@@ -348,6 +360,9 @@ func (e *Engine) RecordEvidence(_ context.Context, key string, stage EvidenceSta
 	default:
 		return State{}, ErrEvidenceStage
 	}
+	if verdict != "passed" && verdict != "failed" {
+		return State{}, ErrEvidenceVerdict
+	}
 	return e.store.withLock(func(records map[string]State, persist func() error) (State, error) {
 		state, ok := records[key]
 		if !ok {
@@ -355,6 +370,12 @@ func (e *Engine) RecordEvidence(_ context.Context, key string, stage EvidenceSta
 		}
 		if state.ArtifactSHA != "" && state.ArtifactSHA != sha {
 			return state, ErrArtifactMismatch
+		}
+		if evidence, exists := state.Evidence[stage]; exists {
+			if evidence.Verdict == verdict {
+				return state, nil
+			}
+			return state, fmt.Errorf("%w: %s evidence is immutable", ErrEvidenceOrder, stage)
 		}
 		previous := map[EvidenceStage]EvidenceStage{
 			StageQA: StageReview, StageMerge: StageQA, StageActivation: StageMerge, StageProduction: StageActivation,
@@ -424,6 +445,52 @@ func (e *Engine) plan(msg Message) (Binding, RiskPolicy, Route, Kind, error) {
 	return binding, policy, route, kind, nil
 }
 
+func (e *Engine) revalidate(state State) (Route, error) {
+	matches := make([]Binding, 0, 1)
+	for _, binding := range e.config.Bindings {
+		if binding.Source == state.Source {
+			matches = append(matches, binding)
+		}
+	}
+	if len(matches) == 0 {
+		return Route{}, ErrBindingMissing
+	}
+	if len(matches) != 1 {
+		return Route{}, ErrBindingAmbiguous
+	}
+	binding := matches[0]
+	if binding.ValidUntil.IsZero() || !binding.ValidUntil.After(e.now()) {
+		return Route{}, ErrBindingStale
+	}
+	if binding.ProductID != state.ProductID || binding.ProjectID != state.ProjectID || binding.PolicyID != state.PolicyID {
+		return Route{}, ErrConfigInvalid
+	}
+	policy, ok := e.config.Policies[binding.PolicyID]
+	if !ok || policy.Risk != state.Risk {
+		return Route{}, ErrPolicyMissing
+	}
+	granted := make(map[string]bool, len(state.GrantedGates))
+	for _, gate := range state.GrantedGates {
+		granted[gate] = true
+	}
+	for _, gate := range policy.EntryGates {
+		if !granted[gate] {
+			return Route{}, fmt.Errorf("%w: %s", ErrGateMissing, gate)
+		}
+	}
+	route, ok := e.config.Routes[state.Kind]
+	if !ok || route.Role == "" || route.Squad == "" {
+		return Route{}, ErrRouteMissing
+	}
+	if !e.config.AllowedRoles[route.Role] {
+		return Route{}, ErrRoleDenied
+	}
+	if route.Role != state.Role || route.Squad != state.Squad {
+		return Route{}, ErrConfigInvalid
+	}
+	return route, nil
+}
+
 func Classify(text string) (Kind, bool) {
 	prefix, _, ok := strings.Cut(strings.TrimSpace(strings.ToLower(text)), ":")
 	if !ok || strings.TrimSpace(classifiedTitle(text)) == "" {
@@ -460,7 +527,8 @@ func validSHA(s string) bool {
 }
 
 type FileStore struct {
-	path string
+	path     string
+	saveHook func(map[string]State) error
 }
 
 func NewFileStore(path string) *FileStore { return &FileStore{path: path} }
@@ -483,7 +551,12 @@ func (s *FileStore) withLock(fn func(map[string]State, func() error) (State, err
 	if err != nil {
 		return State{}, err
 	}
-	persist := func() error { return s.save(records) }
+	persist := func() error {
+		if s.saveHook != nil {
+			return s.saveHook(records)
+		}
+		return s.save(records)
+	}
 	return fn(records, persist)
 }
 
@@ -508,8 +581,26 @@ func (s *FileStore) save(records map[string]State) error {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if _, err = f.Write(append(data, '\n')); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
