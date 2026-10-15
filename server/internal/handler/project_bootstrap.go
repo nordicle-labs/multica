@@ -184,6 +184,10 @@ func bootstrapLockKeys(workspaceID, product, repoURL string) []string {
 }
 
 func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UUID, product, repoURL string) (db.Project, string, error) {
+	targetRepository, err := githubapp.RepositoryIdentity(repoURL)
+	if err != nil {
+		return db.Project{}, "", err
+	}
 	projects, err := h.Queries.ListProjects(ctx, db.ListProjectsParams{WorkspaceID: workspaceID})
 	if err != nil {
 		return db.Project{}, "", err
@@ -202,7 +206,16 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 				continue
 			}
 			var ref struct{ URL, DefaultBranchHint string }
-			if json.Unmarshal(resource.ResourceRef, &ref) == nil && strings.EqualFold(strings.TrimSuffix(ref.URL, ".git"), repoURL) {
+			if json.Unmarshal(resource.ResourceRef, &ref) != nil {
+				collision = true
+				continue
+			}
+			identity, err := githubapp.RepositoryIdentity(ref.URL)
+			if err != nil {
+				collision = true
+				continue
+			}
+			if identity == targetRepository {
 				repoMatch = ref.DefaultBranchHint == githubapp.DefaultBranch
 				if !repoMatch {
 					collision = true

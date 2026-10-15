@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -94,6 +95,37 @@ func NormalizeRepositoryName(raw string) (string, error) {
 		return "", errors.New("name must be 1-100 lowercase letters, digits, dots, underscores, or hyphens")
 	}
 	return name, nil
+}
+
+func RepositoryIdentity(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	var path string
+	if strings.HasPrefix(strings.ToLower(raw), "git@github.com:") {
+		path = raw[len("git@github.com:"):]
+	} else {
+		u, err := url.Parse(raw)
+		if err != nil || !strings.EqualFold(u.Scheme, "https") || !strings.EqualFold(u.Hostname(), "github.com") || u.Port() != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawPath != "" {
+			return "", errors.New("invalid GitHub repository URL")
+		}
+		path = strings.TrimPrefix(u.Path, "/")
+	}
+	path = strings.TrimSuffix(path, "/")
+	if len(path) >= 4 && strings.EqualFold(path[len(path)-4:], ".git") {
+		path = path[:len(path)-4]
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", errors.New("invalid GitHub repository URL")
+	}
+	owner, err := NormalizeRepositoryName(parts[0])
+	if err != nil {
+		return "", errors.New("invalid GitHub repository URL")
+	}
+	repository, err := NormalizeRepositoryName(parts[1])
+	if err != nil {
+		return "", errors.New("invalid GitHub repository URL")
+	}
+	return owner + "/" + repository, nil
 }
 
 func ValidateVisibility(value string) error {
