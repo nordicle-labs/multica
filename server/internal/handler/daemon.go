@@ -4149,8 +4149,8 @@ func (h *Handler) CompleteTaskGitHubPublicationRecovery(w http.ResponseWriter, r
 		writeError(w, http.StatusForbidden, "runtime is not assigned to this daemon")
 		return
 	}
-	remoteBytes, shaErr := hex.DecodeString(strings.TrimSpace(req.RemoteSHA))
-	if shaErr != nil || len(remoteBytes) != sha256.Size || req.ReadBackHeadSHA != req.RemoteSHA || req.PullRequestNumber <= 0 || strings.TrimSpace(req.PullRequestURL) == "" || !req.RevocationConfirmed {
+	remoteSHA := strings.TrimSpace(req.RemoteSHA)
+	if req.RemoteSHA != remoteSHA || !validGitObjectID(remoteSHA) || req.ReadBackHeadSHA != remoteSHA || req.PullRequestNumber <= 0 || strings.TrimSpace(req.PullRequestURL) == "" || !req.RevocationConfirmed {
 		writeError(w, http.StatusBadRequest, "verified publication evidence is required")
 		return
 	}
@@ -4178,6 +4178,11 @@ WHERE id=$1 AND runtime_id=$2 AND result->>'recovery_repository'=$3
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"completed": true})
+}
+
+func validGitObjectID(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && (len(decoded) == 20 || len(decoded) == sha256.Size)
 }
 
 func githubInstallationForRepository(installations []db.GithubInstallation, repository string) (db.GithubInstallation, error) {

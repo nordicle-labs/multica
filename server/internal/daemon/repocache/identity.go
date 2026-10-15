@@ -48,19 +48,19 @@ func isolateWorktreeIdentityContext(ctx context.Context, barePath, checkoutPath 
 		return fmt.Errorf("resolve worktree config directory: %w", err)
 	}
 	gitDir := strings.TrimSpace(string(out))
-	out, err = runGitOutputContext(ctx, "-C", checkoutPath, "config", "--null", "--show-scope", "--includes", "--get-regexp", `^(user|author|committer)\.(name|email)$`)
-	var exitErr *exec.ExitError
-	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 1) {
-		return fmt.Errorf("read user Git identity: %w", err)
-	}
 	values := make(map[string]string)
-	fields := strings.Split(string(out), "\x00")
-	for i := 0; i+1 < len(fields); i += 2 {
-		if fields[i] != "global" && fields[i] != "system" {
-			continue
+	for _, scope := range []string{"--system", "--global"} {
+		out, err = runGitOutputContext(ctx, "-C", checkoutPath, "config", "--null", scope, "--includes", "--get-regexp", `^(user|author|committer)\.(name|email)$`)
+		var exitErr *exec.ExitError
+		if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 1) {
+			return fmt.Errorf("read user Git identity: %w", err)
 		}
-		key, value, _ := strings.Cut(fields[i+1], "\n")
-		values[key] = value
+		for _, entry := range strings.Split(string(out), "\x00") {
+			key, value, found := strings.Cut(entry, "\n")
+			if found {
+				values[key] = value
+			}
+		}
 	}
 	var config strings.Builder
 	for _, section := range []string{"user", "author", "committer"} {

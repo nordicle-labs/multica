@@ -33,6 +33,22 @@ func TestPublicationCredentialFailureState(t *testing.T) {
 	}
 }
 
+func TestValidGitObjectID(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"0123456789012345678901234567890123456789", true},
+		{"0123456789012345678901234567890123456789012345678901234567890123", true},
+		{"012345678901234567890123456789012345678", false},
+		{"012345678901234567890123456789012345678g", false},
+	} {
+		if got := validGitObjectID(tc.value); got != tc.want {
+			t.Errorf("validGitObjectID(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
 func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
