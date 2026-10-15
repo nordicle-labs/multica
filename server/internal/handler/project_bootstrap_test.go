@@ -155,6 +155,10 @@ func TestBootstrapRepositoryRefMatchesCanonicalJSONB(t *testing.T) {
 	if bootstrapRepositoryRefMatches([]byte(`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb","extra":"value"}`), repoURL) {
 		t.Fatal("unexpected repository fields were accepted")
 	}
+	var ref bootstrapRepositoryRef
+	if err := json.Unmarshal([]byte(`{"default_branch_hint":"main","url":"https://github.com/nordicle-labs/canonical-jsonb"}`), &ref); err != nil || ref.URL != repoURL || ref.DefaultBranchHint != githubapp.DefaultBranch {
+		t.Fatalf("repository ref = %+v, err = %v", ref, err)
+	}
 }
 
 func TestBootstrapProjectCreatesAndReadsBackResource(t *testing.T) {

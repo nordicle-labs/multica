@@ -37,6 +37,11 @@ type projectBootstrapResponse struct {
 	Project ProjectResponse `json:"project"`
 }
 
+type bootstrapRepositoryRef struct {
+	URL               string `json:"url"`
+	DefaultBranchHint string `json:"default_branch_hint"`
+}
+
 type bootstrapCommitError struct{ err error }
 
 func (e *bootstrapCommitError) Error() string { return e.err.Error() }
@@ -214,7 +219,7 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 			if resource.ResourceType != "github_repo" {
 				continue
 			}
-			var ref struct{ URL, DefaultBranchHint string }
+			var ref bootstrapRepositoryRef
 			if json.Unmarshal(resource.ResourceRef, &ref) != nil {
 				collision = true
 				continue
