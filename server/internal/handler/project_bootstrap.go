@@ -37,6 +37,11 @@ type projectBootstrapResponse struct {
 	Project ProjectResponse `json:"project"`
 }
 
+type bootstrapCommitError struct{ err error }
+
+func (e *bootstrapCommitError) Error() string { return e.err.Error() }
+func (e *bootstrapCommitError) Unwrap() error { return e.err }
+
 // BootstrapProject creates the canonical GitHub repository and its Multica
 // project/resource. Every local collision is resolved before the first write.
 func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +146,18 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 	}
 	project, err := h.createBootstrapProject(r.Context(), lockTx, wsUUID, requester.UserID, req.Product, repoURL)
 	if err != nil {
+		var commitErr *bootstrapCommitError
+		if errors.As(err, &commitErr) && !errors.Is(err, pgx.ErrTxCommitRollback) {
+			readProject, state, readErr := h.bootstrapLocalState(r.Context(), wsUUID, req.Product, repoURL)
+			if readErr != nil || (state != "absent" && (state != "exact" || readProject.ID != project.ID)) {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("database commit outcome is ambiguous; reconcile repository %s/%s and Multica project", githubapp.BootstrapOwner, name))
+				return
+			}
+			if state == "exact" {
+				writeJSON(w, http.StatusCreated, projectBootstrapResponse{BootstrapResult: remote, Project: projectToResponse(readProject)})
+				return
+			}
+		}
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if rollbackErr := h.ProjectBootstrap.Delete(rollbackCtx, installation.InstallationID, name, remote.RepositoryID); rollbackErr != nil {
@@ -230,7 +247,7 @@ func (h *Handler) createBootstrapProject(ctx context.Context, tx pgx.Tx, workspa
 		return db.Project{}, errors.New("project resource readback mismatch")
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return db.Project{}, err
+		return readProject, &bootstrapCommitError{err: err}
 	}
 	return readProject, nil
 }

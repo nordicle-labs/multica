@@ -198,10 +198,12 @@ func (b Broker) SignJWT() (string, error) {
 }
 
 func (b Broker) client() *http.Client {
+	client := http.Client{Timeout: 15 * time.Second}
 	if b.Client != nil {
-		return b.Client
+		client = *b.Client
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &client
 }
 
 func decodeBoundedJSON(r io.Reader, out any) error {

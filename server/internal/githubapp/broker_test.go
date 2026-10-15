@@ -104,6 +104,48 @@ func TestMintInstallationRejectsOversizedResponse(t *testing.T) {
 	}
 }
 
+func TestBrokerRefusesRedirectWithAppJWT(t *testing.T) {
+	var redirectedAuthorization string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedAuthorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: source.URL, Client: source.Client()}
+	if _, err := broker.MintInstallation(context.Background(), 42, Permissions{"metadata": "read"}); err == nil {
+		t.Fatal("MintInstallation followed a redirect")
+	}
+	if redirectedAuthorization != "" {
+		t.Fatal("App JWT was forwarded to the redirect target")
+	}
+}
+
+func TestBrokerRefusesRedirectWithInstallationToken(t *testing.T) {
+	var redirectedAuthorization string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedAuthorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	broker := Broker{APIBase: source.URL, Client: source.Client()}
+	if err := broker.Revoke(context.Background(), "installation-secret"); err == nil {
+		t.Fatal("Revoke followed a redirect")
+	}
+	if redirectedAuthorization != "" {
+		t.Fatal("installation token was forwarded to the redirect target")
+	}
+}
+
 func TestParseRepository(t *testing.T) {
 	for _, raw := range []string{"https://github.com/owner/repo.git", "git@github.com:owner/repo.git"} {
 		got, err := ParseRepository(raw)
