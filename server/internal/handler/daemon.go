@@ -4053,6 +4053,25 @@ func (s publicationRecoveryState) credentialExpired(now time.Time) bool {
 	return publicationRecoveryTimeExpired(s.CredentialExpiresAt, now)
 }
 
+func (s publicationRecoveryState) credentialOutstanding(now time.Time) bool {
+	return s.CredentialHandle != "" &&
+		slices.Contains([]string{"credential_minting", "credential_unknown", "credential_issued", "credential_received", "revocation_pending"}, s.State) &&
+		!s.credentialExpired(now)
+}
+
+func writePublicationCredentialOutstanding(w http.ResponseWriter, state publicationRecoveryState) {
+	retryAt, ok := publicationRecoveryTime(state.CredentialExpiresAt)
+	if !ok {
+		writeError(w, http.StatusConflict, "previous publication credential is still outstanding")
+		return
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"error":    "previous publication credential is still outstanding",
+		"code":     "publication_credential_outstanding",
+		"retry_at": retryAt.UTC(),
+	})
+}
+
 func taskPublicationRecoveryState(task db.AgentTaskQueue) publicationRecoveryState {
 	var context struct {
 		PublicationRecovery publicationRecoveryState `json:"publication_recovery"`
@@ -4151,17 +4170,8 @@ func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *h
 		case found:
 			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_revoked"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
 			state.State = "credential_revoked"
-		case !state.credentialExpired(time.Now()):
-			retryAt, ok := publicationRecoveryTime(state.CredentialExpiresAt)
-			if !ok {
-				writeError(w, http.StatusConflict, "previous publication credential is still outstanding")
-				return
-			}
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":    "previous publication credential is still outstanding",
-				"code":     "publication_credential_outstanding",
-				"retry_at": retryAt.UTC(),
-			})
+		case state.credentialOutstanding(time.Now()):
+			writePublicationCredentialOutstanding(w, state)
 			return
 		default:
 			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_expired"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
@@ -4204,6 +4214,10 @@ RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.Da
 			existingState := taskPublicationRecoveryState(existing)
 			if existingState.State == "completed" {
 				writeJSON(w, http.StatusOK, map[string]any{"completed": true})
+				return
+			}
+			if existingState.credentialOutstanding(time.Now()) {
+				writePublicationCredentialOutstanding(w, existingState)
 				return
 			}
 			if existingState.Claims >= maxPublicationRecoveryClaims {

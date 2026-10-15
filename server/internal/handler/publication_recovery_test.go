@@ -93,11 +93,11 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	const daemonID = "publication-recovery-daemon"
 	runtimeID := createClaimReclaimRuntime(t, ctx, "Publication recovery runtime")
-	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id=$2 WHERE id=$1`, runtimeID, daemonID)
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Publication recovery agent")
 	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	daemonID := "publication-recovery-" + taskID
+	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id=$2 WHERE id=$1`, runtimeID, daemonID)
 	dbfx.Exec(t, `UPDATE agent_task_queue SET status='completed', completed_at=now(), context='{"delivery_intent":"publish"}', result='{"recovery_repository":"test-owner/test-repo","recovery_bundle_verified":true,"recovery_head_sha":"0123456789012345678901234567890123456789"}' WHERE id=$1`, taskID)
 	minted, revoked := setupGitHubClaimRevocation(t, issueID)
 
@@ -120,8 +120,12 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	if patResponse.Code != http.StatusForbidden || minted.Load() != 0 {
 		t.Fatalf("PAT claim status=%d minted=%d, want forbidden without mint", patResponse.Code, minted.Load())
 	}
-	daemonToken := "mdt_publication_recovery"
+	daemonToken := "mdt_" + strings.ReplaceAll(taskID, "-", "")
 	dbfx.Exec(t, `INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, expires_at) VALUES ($1, $2, $3, now() + interval '1 day')`, auth.HashToken(daemonToken), testWorkspaceID, daemonID)
+	blocker := beginWarmedTx(t, ctx)
+	if _, err := blocker.Exec(ctx, `SELECT id FROM agent_task_queue WHERE id=$1 FOR UPDATE`, taskID); err != nil {
+		t.Fatalf("lock publication recovery task: %v", err)
+	}
 	type response struct {
 		code int
 		body []byte
@@ -139,6 +143,12 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 		}()
 	}
 	close(start)
+	if !waitForPublicationRecoveryCASWaiters(t, 2, 10*time.Second) {
+		t.Fatal("both recovery claims did not reach the CAS")
+	}
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("release publication recovery task: %v", err)
+	}
 	first, second := <-responses, <-responses
 	if first.code == http.StatusConflict {
 		first, second = second, first
@@ -152,6 +162,11 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	}
 	if err := json.Unmarshal(second.body, &deferred); err != nil || deferred.Code != "publication_credential_outstanding" || deferred.RetryAt.Before(time.Now().Add(64*time.Minute)) {
 		t.Fatalf("outstanding claim response=%s decoded=%+v err=%v", second.body, deferred, err)
+	}
+	var claims int
+	dbfx.QueryRow(t, `SELECT (context->'publication_recovery'->>'claims')::int FROM agent_task_queue WHERE id=$1`, taskID).Scan(&claims)
+	if claims != 1 {
+		t.Fatalf("publication recovery claims=%d, want 1", claims)
 	}
 	var claimed struct {
 		ClaimID          string                 `json:"claim_id"`
@@ -224,6 +239,31 @@ func TestPublicationRecoveryClaimsTerminalTaskOnceThroughMiddleware(t *testing.T
 	dbfx.QueryRow(t, `SELECT context->'publication_recovery'->>'state' FROM agent_task_queue WHERE id=$1`, limitedTaskID).Scan(&limitedState)
 	if limitedState != "blocked" {
 		t.Fatalf("retry limit state=%q, want blocked", limitedState)
+	}
+}
+
+func waitForPublicationRecoveryCASWaiters(t *testing.T, want int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		var waiting int
+		if err := testPool.QueryRow(context.Background(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND state = 'active'
+			  AND wait_event_type = 'Lock'
+			  AND wait_event IN ('transactionid', 'tuple')
+			  AND query LIKE '%UPDATE agent_task_queue%publication_recovery%'
+		`).Scan(&waiting); err != nil {
+			t.Fatalf("probe publication recovery waiters: %v", err)
+		}
+		if waiting >= want {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
