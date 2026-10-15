@@ -18,14 +18,20 @@ import (
 type bootstrapGitHub struct {
 	mu                  sync.Mutex
 	repository          bool
+	repositoryReads     int
 	visibility          string
 	files               map[string]string
 	protected           bool
 	createCount         int
 	deleteCount         int
+	failCreate          bool
+	failTemplate        bool
 	failProtection      bool
+	failDelete          bool
 	omitProtectionFlags bool
 	malformedCreate     bool
+	malformedRepoRead   int
+	disconnectCreate    bool
 }
 
 func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
@@ -50,11 +56,24 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "/orgs/nordicle-labs/repos" {
+		if g.failCreate {
+			http.Error(w, "injected", http.StatusInternalServerError)
+			return
+		}
 		g.repository = true
 		g.createCount++
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		g.visibility, _ = body["visibility"].(string)
+		if g.disconnectCreate {
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				http.Error(w, "hijack", http.StatusInternalServerError)
+				return
+			}
+			_ = connection.Close()
+			return
+		}
 		w.WriteHeader(http.StatusCreated)
 		if g.malformedCreate {
 			_, _ = w.Write([]byte(`{}`))
@@ -64,14 +83,23 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "/repos/nordicle-labs/widget" && r.Method == http.MethodDelete {
+		if g.failDelete {
+			http.Error(w, "injected", http.StatusInternalServerError)
+			return
+		}
 		g.repository = false
 		g.deleteCount++
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if path == "/repos/nordicle-labs/widget" {
+		g.repositoryReads++
 		if !g.repository {
 			http.NotFound(w, r)
+			return
+		}
+		if g.malformedRepoRead == g.repositoryReads {
+			_, _ = w.Write([]byte(`{`))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 123, "full_name": "nordicle-labs/widget", "visibility": g.visibility, "default_branch": "main"})
@@ -81,6 +109,10 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(path, contents) {
 		file := strings.TrimPrefix(path, contents)
 		if r.Method == http.MethodPut {
+			if g.failTemplate {
+				http.Error(w, "injected", http.StatusInternalServerError)
+				return
+			}
 			var body struct {
 				Content string `json:"content"`
 			}
@@ -220,11 +252,23 @@ func TestBootstrapReportsReconciliationAfterMalformedCreatedResponse(t *testing.
 	state := &bootstrapGitHub{files: map[string]string{}, malformedCreate: true}
 	bootstrapper := testBootstrapper(t, state)
 	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
-	if err == nil || !strings.Contains(err.Error(), "rollback incomplete; reconcile repository nordicle-labs/widget") {
+	if err == nil || !strings.Contains(err.Error(), "reconcile repository nordicle-labs/widget") {
 		t.Fatalf("malformed create error = %v", err)
 	}
 	if !state.repository || state.deleteCount != 0 {
 		t.Fatalf("repository=%v deletes=%d", state.repository, state.deleteCount)
+	}
+}
+
+func TestBootstrapReadsBackLostCreateResponseAndRequiresReconciliation(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}, disconnectCreate: true}
+	bootstrapper := testBootstrapper(t, state)
+	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err == nil || !strings.Contains(err.Error(), "reconcile repository nordicle-labs/widget") {
+		t.Fatalf("lost create response error = %v", err)
+	}
+	if !state.repository || state.deleteCount != 0 || state.repositoryReads < 2 {
+		t.Fatalf("repository=%v deletes=%d reads=%d", state.repository, state.deleteCount, state.repositoryReads)
 	}
 }
 
@@ -236,6 +280,39 @@ func TestBootstrapRollsBackOnlyRepositoryCreatedByCall(t *testing.T) {
 		t.Fatal("expected injected protection failure")
 	}
 	if state.repository || state.deleteCount != 1 {
+		t.Fatalf("repository=%v deletes=%d", state.repository, state.deleteCount)
+	}
+}
+
+func TestBootstrapFailureBoundariesRollbackCreatedRepository(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state *bootstrapGitHub
+	}{
+		{name: "template write", state: &bootstrapGitHub{failTemplate: true}},
+		{name: "branch protection", state: &bootstrapGitHub{failProtection: true}},
+		{name: "malformed final repository readback", state: &bootstrapGitHub{malformedRepoRead: 3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bootstrapper := testBootstrapper(t, tc.state)
+			if _, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget"); err == nil {
+				t.Fatal("expected injected failure")
+			}
+			if tc.state.repository || tc.state.deleteCount != 1 {
+				t.Fatalf("repository=%v deletes=%d", tc.state.repository, tc.state.deleteCount)
+			}
+		})
+	}
+}
+
+func TestBootstrapReportsIncompleteRemoteRollback(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}, failProtection: true, failDelete: true}
+	bootstrapper := testBootstrapper(t, state)
+	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget")
+	if err == nil || !strings.Contains(err.Error(), "rollback incomplete; reconcile repository nordicle-labs/widget") {
+		t.Fatalf("rollback error = %v", err)
+	}
+	if !state.repository || state.deleteCount != 0 {
 		t.Fatalf("repository=%v deletes=%d", state.repository, state.deleteCount)
 	}
 }
