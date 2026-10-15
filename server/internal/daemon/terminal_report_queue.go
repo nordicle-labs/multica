@@ -43,19 +43,22 @@ const (
 // untouched and reported on every replay pass; downgrading must never delete a
 // payload merely because the older binary cannot decode it.
 type persistedTerminalTaskReport struct {
-	Version               int       `json:"version"`
-	CreatedAt             time.Time `json:"created_at"`
-	Kind                  string    `json:"kind"`
-	TaskID                string    `json:"task_id"`
-	Output                string    `json:"output,omitempty"`
-	BranchName            string    `json:"branch_name,omitempty"`
-	ErrorMessage          string    `json:"error,omitempty"`
-	SessionID             string    `json:"session_id,omitempty"`
-	WorkDir               string    `json:"work_dir,omitempty"`
-	DurableWorkDir        string    `json:"durable_work_dir,omitempty"`
-	FailureReason         string    `json:"failure_reason,omitempty"`
-	SessionRolloutMissing bool      `json:"session_rollout_missing,omitempty"`
-	RetiredSessionID      string    `json:"retired_session_id,omitempty"`
+	Version                int       `json:"version"`
+	CreatedAt              time.Time `json:"created_at"`
+	Kind                   string    `json:"kind"`
+	TaskID                 string    `json:"task_id"`
+	Output                 string    `json:"output,omitempty"`
+	BranchName             string    `json:"branch_name,omitempty"`
+	ErrorMessage           string    `json:"error,omitempty"`
+	SessionID              string    `json:"session_id,omitempty"`
+	WorkDir                string    `json:"work_dir,omitempty"`
+	DurableWorkDir         string    `json:"durable_work_dir,omitempty"`
+	RecoveryRef            string    `json:"recovery_ref,omitempty"`
+	RecoveryBundlePath     string    `json:"recovery_bundle_path,omitempty"`
+	RecoveryBundleVerified bool      `json:"recovery_bundle_verified,omitempty"`
+	FailureReason          string    `json:"failure_reason,omitempty"`
+	SessionRolloutMissing  bool      `json:"session_rollout_missing,omitempty"`
+	RetiredSessionID       string    `json:"retired_session_id,omitempty"`
 
 	PermanentRejectionCount   int        `json:"permanent_rejection_count,omitempty"`
 	FirstPermanentRejectionAt *time.Time `json:"first_permanent_rejection_at,omitempty"`
@@ -133,19 +136,22 @@ func persistedTerminalReport(report terminalTaskReport, createdAt time.Time) (pe
 		return persistedTerminalTaskReport{}, err
 	}
 	return persistedTerminalTaskReport{
-		Version:               terminalReportRecordVersion,
-		CreatedAt:             createdAt.UTC(),
-		Kind:                  kind,
-		TaskID:                report.taskID,
-		Output:                report.output,
-		BranchName:            report.branchName,
-		ErrorMessage:          report.errorMessage,
-		SessionID:             report.sessionID,
-		WorkDir:               report.workDir,
-		DurableWorkDir:        report.durableWorkDir,
-		FailureReason:         report.failureReason,
-		SessionRolloutMissing: report.sessionRolloutMissing,
-		RetiredSessionID:      report.retiredSessionID,
+		Version:                terminalReportRecordVersion,
+		CreatedAt:              createdAt.UTC(),
+		Kind:                   kind,
+		TaskID:                 report.taskID,
+		Output:                 report.output,
+		BranchName:             report.branchName,
+		ErrorMessage:           report.errorMessage,
+		SessionID:              report.sessionID,
+		WorkDir:                report.workDir,
+		DurableWorkDir:         report.durableWorkDir,
+		RecoveryRef:            report.recoveryRef,
+		RecoveryBundlePath:     report.recoveryBundlePath,
+		RecoveryBundleVerified: report.recoveryBundleVerified,
+		FailureReason:          report.failureReason,
+		SessionRolloutMissing:  report.sessionRolloutMissing,
+		RetiredSessionID:       report.retiredSessionID,
 	}, nil
 }
 
@@ -166,17 +172,20 @@ func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, 
 		return terminalTaskReport{}, fmt.Errorf("unsupported terminal report kind %q", record.Kind)
 	}
 	return terminalTaskReport{
-		kind:                  kind,
-		taskID:                record.TaskID,
-		output:                record.Output,
-		branchName:            record.BranchName,
-		errorMessage:          record.ErrorMessage,
-		sessionID:             record.SessionID,
-		workDir:               record.WorkDir,
-		durableWorkDir:        record.DurableWorkDir,
-		failureReason:         record.FailureReason,
-		sessionRolloutMissing: record.SessionRolloutMissing,
-		retiredSessionID:      record.RetiredSessionID,
+		kind:                   kind,
+		taskID:                 record.TaskID,
+		output:                 record.Output,
+		branchName:             record.BranchName,
+		errorMessage:           record.ErrorMessage,
+		sessionID:              record.SessionID,
+		workDir:                record.WorkDir,
+		durableWorkDir:         record.DurableWorkDir,
+		recoveryRef:            record.RecoveryRef,
+		recoveryBundlePath:     record.RecoveryBundlePath,
+		recoveryBundleVerified: record.RecoveryBundleVerified,
+		failureReason:          record.FailureReason,
+		sessionRolloutMissing:  record.SessionRolloutMissing,
+		retiredSessionID:       record.RetiredSessionID,
 	}, nil
 }
 

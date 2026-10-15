@@ -833,8 +833,10 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		Intent string `json:"delivery_intent"`
 	}
 	_ = json.Unmarshal(t.Context, &deliveryContext)
-	if deliveryContext.Intent != "artifact" {
-		deliveryContext.Intent = ""
+	switch deliveryContext.Intent {
+	case "none", "artifact", "publish":
+	default:
+		deliveryContext.Intent = "invalid"
 	}
 	handoffNote := ""
 	if t.HandoffNote.Valid {

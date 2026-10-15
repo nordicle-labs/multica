@@ -1309,6 +1309,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		Context:              agentDeliveryContext(agent),
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1339,6 +1340,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 			RerunOfTaskID:        createParams.RerunOfTaskID,
 			TriggerEvidenceKind:  createParams.TriggerEvidenceKind,
 			TriggerEvidenceRefID: createParams.TriggerEvidenceRefID,
+			Context:              createParams.Context,
 			FireAt:               fireAt,
 		})
 	} else {
@@ -1482,6 +1484,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		Context:              agentDeliveryContext(agent),
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1505,6 +1508,29 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 	s.NotifyTaskEnqueued(ctx, task)
 	return task, nil
+}
+
+// agentDeliveryContext snapshots server-owned policy at enqueue. Provider
+// output cannot grant publication authority, and later config edits cannot
+// change a queued task.
+func agentDeliveryContext(agent db.Agent) []byte {
+	contextJSON, _ := json.Marshal(map[string]string{"delivery_intent": agentDeliveryIntent(agent)})
+	return contextJSON
+}
+
+func agentDeliveryIntent(agent db.Agent) string {
+	var config struct {
+		DeliveryIntent string `json:"delivery_intent"`
+	}
+	if json.Unmarshal(agent.RuntimeConfig, &config) == nil {
+		switch config.DeliveryIntent {
+		case "none", "artifact", "publish":
+			return config.DeliveryIntent
+		case "":
+			return "none"
+		}
+	}
+	return "invalid"
 }
 
 // QuickCreateContext is the JSON payload stored on a quick-create task's

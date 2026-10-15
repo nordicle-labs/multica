@@ -71,6 +71,9 @@ const (
 	// DaemonCapabilityGitHubAppCredentialsV3 mints repository credentials only
 	// after the provider has exited and the host finalized its canonical ref.
 	DaemonCapabilityGitHubAppCredentialsV3 = "github-app-credentials-v3"
+	// DaemonCapabilityExplicitDeliveryV1 understands the persisted none/artifact/
+	// publish policy and never infers publication from repository presence.
+	DaemonCapabilityExplicitDeliveryV1 = "explicit-delivery-v1"
 	// DaemonCapabilityTaskSupplementV1 advertises that this provider run can accept
 	// an additional text instruction without cancelling or starting a task.
 	// It is persisted when this exact task enters running; absence always means

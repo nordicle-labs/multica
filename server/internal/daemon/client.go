@@ -223,6 +223,7 @@ func daemonCommonCapabilities() []string {
 		capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV2)
 	}
 	capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	capabilities = append(capabilities, protocol.DaemonCapabilityExplicitDeliveryV1)
 	return capabilities
 }
 
@@ -692,10 +693,10 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 }
 
 func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, defaultTerminalRetrySchedule)
+	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", "", false, defaultTerminalRetrySchedule)
 }
 
-func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, schedule []time.Duration) error {
+func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, recoveryRef, recoveryBundlePath string, recoveryBundleVerified bool, schedule []time.Duration) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -708,6 +709,11 @@ func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, outp
 	}
 	if durableWorkDir != "" {
 		body["durable_work_dir"] = durableWorkDir
+	}
+	if recoveryRef != "" {
+		body["recovery_ref"] = recoveryRef
+		body["recovery_bundle_path"] = recoveryBundlePath
+		body["recovery_bundle_verified"] = recoveryBundleVerified
 	}
 	if sessionRolloutMissing {
 		body["session_rollout_missing"] = true

@@ -330,11 +330,13 @@ SELECT
     COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE),
     sqlc.narg(handoff_note),
     sqlc.narg(squad_id),
-    CASE
-        WHEN COALESCE(sqlc.narg('head_sha')::text, '') <> ''
-        THEN jsonb_build_object('head_sha', sqlc.narg('head_sha')::text)
-        ELSE NULL
-    END,
+    NULLIF(
+        COALESCE(sqlc.narg('context')::jsonb, '{}'::jsonb) ||
+        jsonb_strip_nulls(jsonb_build_object(
+            'head_sha', NULLIF(COALESCE(sqlc.narg('head_sha')::text, ''), '')
+        )),
+        '{}'::jsonb
+    ),
     sqlc.narg(originator_user_id),
     sqlc.narg(accountable_user_id),
     sqlc.narg(runtime_mcp_overlay),
@@ -373,7 +375,7 @@ SELECT
     COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE),
     sqlc.narg(handoff_note),
     sqlc.narg(squad_id),
-    jsonb_strip_nulls(jsonb_build_object(
+    COALESCE(sqlc.narg('context')::jsonb, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
         'head_sha', NULLIF(COALESCE(sqlc.narg('head_sha')::text, ''), ''),
         'channel_issue_media_pending', TRUE
     )),

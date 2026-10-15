@@ -2447,7 +2447,7 @@ func gitRefExists(t *testing.T, repoPath, ref string) bool {
 	return true
 }
 
-func TestReconcileRecoveryManifestWithoutClaimTokenCreatesLocalRecovery(t *testing.T) {
+func TestReconcileRecoveryManifestRetriesWithDaemonIdentityAndPreservesArtifact(t *testing.T) {
 	repo := createGCGitRepo(t)
 	base := runGitForGC(t, repo, "rev-parse", "HEAD")
 	if err := os.WriteFile(filepath.Join(repo, "recovered.txt"), []byte("recovered\n"), 0o644); err != nil {
@@ -2456,6 +2456,7 @@ func TestReconcileRecoveryManifestWithoutClaimTokenCreatesLocalRecovery(t *testi
 	runGitForGC(t, repo, "add", "recovered.txt")
 	runGitForGC(t, repo, "commit", "-m", "recover me")
 	head := runGitForGC(t, repo, "rev-parse", "HEAD")
+	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
 	requests := 0
 	d := newGCTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -2472,11 +2473,11 @@ func TestReconcileRecoveryManifestWithoutClaimTokenCreatesLocalRecovery(t *testi
 	}
 
 	err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, manifest)
-	if err == nil || !strings.Contains(err.Error(), "claim token") {
-		t.Fatalf("reconcile error = %v, want missing claim token", err)
+	if err == nil || !strings.Contains(err.Error(), "acquire recovery publication credential") {
+		t.Fatalf("reconcile error = %v, want credential acquisition failure", err)
 	}
-	if requests != 0 {
-		t.Fatalf("credential requests = %d, want zero without a claim token", requests)
+	if requests != 1 {
+		t.Fatalf("credential requests = %d, want one daemon-authenticated retry", requests)
 	}
 	if got := runGitForGC(t, repo, "rev-parse", "refs/multica/recovery/restart-task"); got != head {
 		t.Fatalf("recovery ref = %s, want %s", got, head)

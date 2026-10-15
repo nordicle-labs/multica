@@ -83,6 +83,8 @@ func TestHandleTaskDoesNotPublishWithoutExplicitDeliveryIntent(t *testing.T) {
 			record("revoke")
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			_, _ = w.Write([]byte(`{"status":"running"}`))
+		case strings.HasSuffix(r.URL.Path, "/fail"):
+			record("fail")
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -106,15 +108,15 @@ func TestHandleTaskDoesNotPublishWithoutExplicitDeliveryIntent(t *testing.T) {
 		if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
 			t.Fatal("runner received GitHub credentials")
 		}
-		return TaskResult{BranchName: descriptor.Branch, CommitSHA: descriptor.CommitSHA, TreeSHA: descriptor.TreeSHA, DurableWorkDir: work}, nil
+		return TaskResult{Status: "completed", BranchName: descriptor.Branch, CommitSHA: descriptor.CommitSHA, TreeSHA: descriptor.TreeSHA, DurableWorkDir: work}, nil
 	})
 	d.handleTask(context.Background(), Task{ID: "task-1", RuntimeID: "runtime-1", Agent: &AgentData{Name: "test-agent"}, Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}}, 0)
 
 	mu.Lock()
 	got := append([]string(nil), calls...)
 	mu.Unlock()
-	if strings.Join(got, ",") != "run" {
-		t.Fatalf("credential lifecycle calls = %v, want [run]", got)
+	if strings.Join(got, ",") != "run,fail" {
+		t.Fatalf("delivery calls = %v, want [run fail]", got)
 	}
 }
 
@@ -137,7 +139,8 @@ func TestHandleTaskPreservesGitHubRepoArtifactWithoutPublishing(t *testing.T) {
 
 	fakeBin := filepath.Join(t.TempDir(), "claude")
 	writeTestExecutable(t, fakeBin, []byte(`#!/bin/sh
-git init -b canonical . >/dev/null
+git init . >/dev/null
+git symbolic-ref HEAD refs/heads/canonical
 git config user.name test
 git config user.email test@example.com
 git remote add origin https://github.com/owner/repo.git
@@ -179,7 +182,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 	}
 }
 
-func TestHandleTaskDoesNotImplicitlyPublishInPlaceDelivery(t *testing.T) {
+func TestHandleTaskPreservesInPlaceArtifactWithoutPublishing(t *testing.T) {
 	t.Setenv("IS_SANDBOX", "1")
 	realGit, err := exec.LookPath("git")
 	if err != nil {
@@ -251,7 +254,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 		ID: "task-in-place", WorkspaceID: "workspace-1", RuntimeID: "runtime-1",
 		IssueID: "issue-1", AgentID: "agent-1", AuthToken: "mat_task", RemoteMCPDaemonToken: "claim-token",
 		Agent: &AgentData{ID: "agent-1", Name: "test-agent"},
-		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}},
+		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}, DeliveryIntent: "artifact",
 		ProjectResources: []ProjectResourceData{{
 			ID: "local-1", ResourceType: localDirectoryResourceType,
 			ResourceRef: localRef,
@@ -259,7 +262,10 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 	}, 0)
 
 	if acquired {
-		t.Fatal("handleTask acquired GitHub credentials without an explicit delivery intent")
+		t.Fatal("handleTask acquired GitHub credentials for artifact-only delivery")
+	}
+	if _, err := os.Stat(filepath.Join(d.cfg.WorkspacesRoot, "recovery", "task-in-place", "recovery.bundle")); err != nil {
+		t.Fatalf("in-place artifact bundle missing: %v", err)
 	}
 }
 

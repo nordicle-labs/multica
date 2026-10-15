@@ -87,18 +87,11 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 	if err := execenv.VerifyRecoveryManifest(manifest); err != nil {
 		return err
 	}
-	if manifest.RuntimeID == "" {
-		if _, err := execenv.CreateRecoveryArtifact(manifest.GitRoot, recoveryRoot, manifest.TaskID, manifest.HeadSHA, d.logger); err != nil {
-			return err
-		}
-	} else {
+	if _, err := execenv.CreateRecoveryArtifact(manifest.GitRoot, recoveryRoot, manifest.TaskID, manifest.HeadSHA, d.logger); err != nil {
+		return err
+	}
+	if manifest.RuntimeID != "" {
 		task := Task{ID: manifest.TaskID, RuntimeID: manifest.RuntimeID}
-		if strings.TrimSpace(task.RemoteMCPDaemonToken) == "" {
-			if _, err := execenv.CreateRecoveryArtifact(manifest.GitRoot, recoveryRoot, manifest.TaskID, manifest.HeadSHA, d.logger); err != nil {
-				return err
-			}
-			return fmt.Errorf("task %s recovery publication has no claim token; local recovery artifact preserved", manifest.TaskID)
-		}
 		repository, err := githubRepositoryForWorkDir(manifest.GitRoot)
 		if err != nil {
 			return fmt.Errorf("resolve recovery repository for task %s: %w", manifest.TaskID, err)

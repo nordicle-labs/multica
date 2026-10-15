@@ -120,9 +120,13 @@ func preserveRepositoryArtifact(ctx context.Context, recoveryRoot, taskID string
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if _, err := execenv.CreateRecoveryArtifact(result.DurableWorkDir, recoveryRoot, taskID, result.CommitSHA, logger); err != nil {
+	artifact, err := execenv.CreateRecoveryArtifact(result.DurableWorkDir, recoveryRoot, taskID, result.CommitSHA, logger)
+	if err != nil {
 		return fmt.Errorf("preserve repository delivery artifact: %w", err)
 	}
+	result.RecoveryRef = artifact.Ref
+	result.RecoveryBundlePath = artifact.BundlePath
+	result.RecoveryBundleVerified = artifact.BundleVerified
 	return nil
 }
 

@@ -3758,7 +3758,23 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 
 	if len(resp.Repos) > 0 {
-		if !requestHasClientCapability(r, protocol.DaemonCapabilityGitHubAppCredentialsV3) {
+		if resp.DeliveryIntent == "invalid" {
+			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+				r.Context(), task,
+				"This run has no valid server-authorized repository delivery policy. Re-enqueue it before retrying.",
+				taskfailure.ReasonInvalidTaskIdentity,
+				"error_delivery_intent", http.StatusUnprocessableEntity, "invalid repository delivery intent",
+			)
+		}
+		if !requestHasClientCapability(r, protocol.DaemonCapabilityExplicitDeliveryV1) {
+			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+				r.Context(), task,
+				"This run requires explicit repository delivery policy support. Update the runtime and retry.",
+				taskfailure.ReasonInvalidTaskIdentity,
+				"error_delivery_capability", http.StatusUnprocessableEntity, "runtime does not support explicit delivery policy",
+			)
+		}
+		if resp.DeliveryIntent == "publish" && !requestHasClientCapability(r, protocol.DaemonCapabilityGitHubAppCredentialsV3) {
 			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
 				r.Context(), task,
 				"This run requires host-side GitHub publication, but the claiming runtime cannot acquire credentials after finalization. Update the runtime and retry.",
@@ -3766,14 +3782,16 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				"error_github_credentials_capability", http.StatusUnprocessableEntity, "runtime does not support GitHub App credentials",
 			)
 		}
-		if _, err := h.githubPublicationPlan(r.Context(), runtime, resp.WorkspaceID, resp.Repos); err != nil {
-			slog.Error("task claim: GitHub App credential broker rejected run", "task_id", uuidToString(task.ID), "error", err)
-			return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
-				r.Context(), task,
-				"GitHub access could not be authorized for this run. Check the workspace GitHub App installation and retry.",
-				taskfailure.ReasonInvalidTaskIdentity,
-				"error_github_credentials", http.StatusForbidden, "GitHub App authorization failed",
-			)
+		if resp.DeliveryIntent == "publish" {
+			if _, err := h.githubPublicationPlan(r.Context(), runtime, resp.WorkspaceID, resp.Repos); err != nil {
+				slog.Error("task claim: GitHub App credential broker rejected run", "task_id", uuidToString(task.ID), "error", err)
+				return resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+					r.Context(), task,
+					"GitHub access could not be authorized for this run. Check the workspace GitHub App installation and retry.",
+					taskfailure.ReasonInvalidTaskIdentity,
+					"error_github_credentials", http.StatusForbidden, "GitHub App authorization failed",
+				)
+			}
 		}
 	}
 
@@ -4629,7 +4647,10 @@ type TaskCompleteRequest struct {
 	// BranchName is the branch this run delivered its work on. Worktree-mode
 	// local_directory tasks never touch the user's working copy, so this is the
 	// only pointer to where the changes went. Empty for every other task kind.
-	BranchName string `json:"branch_name,omitempty"`
+	BranchName             string `json:"branch_name,omitempty"`
+	RecoveryRef            string `json:"recovery_ref,omitempty"`
+	RecoveryBundlePath     string `json:"recovery_bundle_path,omitempty"`
+	RecoveryBundleVerified bool   `json:"recovery_bundle_verified,omitempty"`
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -4655,6 +4676,8 @@ func sanitizeTaskCompleteRequest(req *TaskCompleteRequest) {
 	req.WorkDir = util.SanitizeTextForPostgres(req.WorkDir)
 	req.DurableWorkDir = util.SanitizeTextForPostgres(req.DurableWorkDir)
 	req.BranchName = util.SanitizeTextForPostgres(req.BranchName)
+	req.RecoveryRef = util.SanitizeTextForPostgres(req.RecoveryRef)
+	req.RecoveryBundlePath = util.SanitizeTextForPostgres(req.RecoveryBundlePath)
 	req.RetiredSessionID = util.SanitizeTextForPostgres(req.RetiredSessionID)
 }
 

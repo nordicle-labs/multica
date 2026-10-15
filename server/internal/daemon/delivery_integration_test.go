@@ -166,6 +166,9 @@ func TestPreserveRepositoryArtifactCreatesVerifiedBundle(t *testing.T) {
 	if result.BranchName != "delivery" || result.CommitSHA == "" || result.TreeSHA == "" {
 		t.Fatalf("result = %+v", result)
 	}
+	if result.RecoveryRef != "refs/multica/recovery/task-artifact" || result.RecoveryBundlePath == "" || !result.RecoveryBundleVerified {
+		t.Fatalf("recovery descriptor = %+v", result)
+	}
 	if _, err := os.Stat(filepath.Join(recoveryRoot, "task-artifact", "recovery.bundle")); err != nil {
 		t.Fatalf("verified recovery bundle missing: %v", err)
 	}
@@ -173,6 +176,11 @@ func TestPreserveRepositoryArtifactCreatesVerifiedBundle(t *testing.T) {
 
 func gitTestRun(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	if len(args) == 4 && args[0] == "init" && args[1] == "-b" {
+		branch, repo := args[2], args[3]
+		gitTestRun(t, "", "init", repo)
+		return gitTestRun(t, repo, "symbolic-ref", "HEAD", "refs/heads/"+branch)
+	}
 	if dir != "" {
 		args = append([]string{"-C", dir}, args...)
 	}

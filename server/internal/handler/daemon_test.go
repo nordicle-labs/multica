@@ -2704,9 +2704,11 @@ func TestTaskToResponseReadsPersistedDeliveryIntentFailClosed(t *testing.T) {
 		context string
 		want    string
 	}{
+		{name: "none", context: `{"delivery_intent":"none"}`, want: "none"},
 		{name: "artifact", context: `{"delivery_intent":"artifact"}`, want: "artifact"},
-		{name: "legacy", context: `{}`},
-		{name: "unknown", context: `{"delivery_intent":"publish"}`},
+		{name: "publish", context: `{"delivery_intent":"publish"}`, want: "publish"},
+		{name: "legacy", context: `{}`, want: "invalid"},
+		{name: "unknown", context: `{"delivery_intent":"admin"}`, want: "invalid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := taskToResponse(db.AgentTaskQueue{Context: []byte(tc.context)}, "").DeliveryIntent
@@ -2735,7 +2737,7 @@ type claimRuntimeGuardTask struct {
 
 func claimTaskForRuntimeGuard(t *testing.T, runtimeID, daemonID string) *claimRuntimeGuardTask {
 	t.Helper()
-	return claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	return claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 }
 
 // claimTaskForRuntimeGuardWithCapabilities claims as a daemon advertising the
