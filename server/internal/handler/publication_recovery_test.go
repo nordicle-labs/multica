@@ -134,7 +134,7 @@ func TestPublicationRecoveryUnknownCredentialExpiryNeverRemints(t *testing.T) {
 	daemonID := "publication-expiry-unknown-" + runtimeID
 	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id=$2 WHERE id=$1`, runtimeID, daemonID)
 	minted, _ := setupGitHubClaimRevocation(t, issueID)
-	token := "mdt_publication_expiry_unknown"
+	token := "mdt_" + strings.ReplaceAll(runtimeID, "-", "")
 	dbfx.Exec(t, `INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, expires_at) VALUES ($1, $2, $3, now() + interval '1 day')`, auth.HashToken(token), testWorkspaceID, daemonID)
 	router := chi.NewRouter()
 	router.Use(middleware.DaemonAuth(testHandler.Queries, nil, nil, nil))
