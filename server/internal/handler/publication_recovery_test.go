@@ -438,7 +438,8 @@ func publicationRecoveryGitRepo(t *testing.T) (string, string) {
 		}
 		return strings.TrimSpace(string(out))
 	}
-	run("init", "-b", "main")
+	run("init")
+	run("symbolic-ref", "HEAD", "refs/heads/main")
 	run("config", "user.name", "test")
 	run("config", "user.email", "test@example.com")
 	if err := os.WriteFile(filepath.Join(repo, "delivery.txt"), []byte("delivery\n"), 0o644); err != nil {
