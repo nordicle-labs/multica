@@ -2573,6 +2573,33 @@ func TestReconcileRecoveryManifestWaitsForOutstandingCredentialLease(t *testing.
 	}
 }
 
+func TestReconcileRecoveryManifestBlocksUnknownCredentialExpiry(t *testing.T) {
+	repo := createGCGitRepo(t)
+	head := runGitForGC(t, repo, "rev-parse", "HEAD")
+	runGitForGC(t, repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	d := newGCTestDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"previous publication credential expiry is unknown","code":"publication_credential_expiry_unknown","status":"blocked"}`))
+	}))
+	d.cfg.DaemonID = "daemon-1"
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	manifest := execenv.RecoveryManifest{
+		TaskID: "unknown-expiry-task", RuntimeID: "runtime-1", DeliveryIntent: "publish", GitRoot: repo,
+		CanonicalBranch: "main", BaseSHA: head, ExpectedRefSHA: head, HeadSHA: head,
+	}
+	if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.reconcileRecoveryManifest(context.Background(), recoveryRoot, manifest); err != nil {
+		t.Fatalf("unknown expiry reconciliation: %v", err)
+	}
+	blocked, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID)
+	if err != nil || !exists || blocked.PublicationPhase != execenv.PublicationBlocked || blocked.RecoveryAttempts != 0 || blocked.LastError == "" || !blocked.NextAttemptAt.IsZero() {
+		t.Fatalf("blocked journal exists=%v err=%v manifest=%+v", exists, err, blocked)
+	}
+}
+
 func TestReconcileRecoveryManifestConcurrentEventsPublishOnce(t *testing.T) {
 	repo := createGCGitRepo(t)
 	base := runGitForGC(t, repo, "rev-parse", "HEAD")

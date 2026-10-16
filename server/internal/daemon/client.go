@@ -42,6 +42,14 @@ func (e *publicationRecoveryDeferredError) Error() string {
 	return "publication credential lease is still outstanding"
 }
 
+type publicationRecoveryBlockedError struct {
+	Reason string
+}
+
+func (e *publicationRecoveryBlockedError) Error() string {
+	return e.Reason
+}
+
 var errInvalidResponseBody = errors.New("invalid response body")
 
 // isWorkspaceNotFoundError returns true if the error is a 404 with "workspace not found" body.
@@ -322,10 +330,16 @@ func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, r
 		var reqErr *requestError
 		var body struct {
 			Code    string    `json:"code"`
+			Error   string    `json:"error"`
 			RetryAt time.Time `json:"retry_at"`
 		}
-		if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict && json.Unmarshal([]byte(reqErr.Body), &body) == nil && body.Code == "publication_credential_outstanding" && !body.RetryAt.IsZero() {
-			return response, &publicationRecoveryDeferredError{RetryAt: body.RetryAt}
+		if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict && json.Unmarshal([]byte(reqErr.Body), &body) == nil {
+			switch {
+			case body.Code == "publication_credential_outstanding" && !body.RetryAt.IsZero():
+				return response, &publicationRecoveryDeferredError{RetryAt: body.RetryAt}
+			case body.Code == "publication_credential_expiry_unknown":
+				return response, &publicationRecoveryBlockedError{Reason: body.Error}
+			}
 		}
 		return response, fmt.Errorf("claim GitHub publication recovery: %w", err)
 	}

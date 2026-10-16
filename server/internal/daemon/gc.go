@@ -95,6 +95,11 @@ func (d *Daemon) reconcileRecoveryManifests(ctx context.Context, recoveryRoot st
 	return resumed, reconcileErr
 }
 
+// ReconcileRecoveryManifests resumes durable deliveries from an isolated root.
+func (d *Daemon) ReconcileRecoveryManifests(ctx context.Context, recoveryRoot string) (int, error) {
+	return d.reconcileRecoveryManifests(ctx, recoveryRoot)
+}
+
 func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot string, manifest execenv.RecoveryManifest) (returnErr error) {
 	release, claimed, err := execenv.ClaimRecoveryPublication(recoveryRoot, manifest.TaskID)
 	if err != nil {
@@ -148,6 +153,10 @@ func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot str
 			var deferred *publicationRecoveryDeferredError
 			if errors.As(err, &deferred) {
 				return execenv.RecordRecoveryDeferral(recoveryRoot, manifest.TaskID, deferred.RetryAt)
+			}
+			var blocked *publicationRecoveryBlockedError
+			if errors.As(err, &blocked) {
+				return execenv.RecordRecoveryBlock(recoveryRoot, manifest.TaskID, blocked)
 			}
 			return fmt.Errorf("acquire recovery publication credential for task %s: %w", manifest.TaskID, err)
 		}

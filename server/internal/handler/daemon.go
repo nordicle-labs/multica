@@ -4035,6 +4035,14 @@ type publicationRecoveryState struct {
 	Claims              int    `json:"claims"`
 }
 
+type publicationCredentialExpiry string
+
+const (
+	publicationCredentialExpiryUnknown publicationCredentialExpiry = "unknown"
+	publicationCredentialExpiryFuture  publicationCredentialExpiry = "valid_future"
+	publicationCredentialExpiryExpired publicationCredentialExpiry = "valid_expired"
+)
+
 func publicationRecoveryTime(value string) (time.Time, bool) {
 	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999Z07:00", "2006-01-02 15:04:05.999999999-07"} {
 		if expiry, err := time.Parse(layout, value); err == nil {
@@ -4050,24 +4058,38 @@ func publicationRecoveryTimeExpired(value string, now time.Time) bool {
 }
 
 func (s publicationRecoveryState) credentialExpired(now time.Time) bool {
-	return publicationRecoveryTimeExpired(s.CredentialExpiresAt, now)
+	return s.credentialExpiry(now) == publicationCredentialExpiryExpired
 }
 
-func (s publicationRecoveryState) credentialOutstanding(now time.Time) bool {
-	return s.CredentialHandle != "" &&
-		slices.Contains([]string{"credential_minting", "credential_unknown", "credential_issued", "credential_received", "revocation_pending"}, s.State) &&
-		!s.credentialExpired(now)
+func (s publicationRecoveryState) hasActiveCredential() bool {
+	return s.CredentialHandle != "" && slices.Contains([]string{"credential_minting", "credential_unknown", "credential_issued", "credential_received", "revocation_pending"}, s.State)
 }
 
-func writePublicationCredentialOutstanding(w http.ResponseWriter, state publicationRecoveryState) {
-	retryAt, ok := publicationRecoveryTime(state.CredentialExpiresAt)
+func (s publicationRecoveryState) credentialExpiry(now time.Time) publicationCredentialExpiry {
+	expiry, ok := publicationRecoveryTime(s.CredentialExpiresAt)
 	if !ok {
-		writeError(w, http.StatusConflict, "previous publication credential is still outstanding")
+		return publicationCredentialExpiryUnknown
+	}
+	if now.Before(expiry) {
+		return publicationCredentialExpiryFuture
+	}
+	return publicationCredentialExpiryExpired
+}
+
+func writePublicationCredentialOutstanding(w http.ResponseWriter, state publicationRecoveryState, expiry publicationCredentialExpiry) {
+	if expiry == publicationCredentialExpiryUnknown {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":  "previous publication credential expiry is unknown",
+			"code":   "publication_credential_expiry_unknown",
+			"status": "blocked",
+		})
 		return
 	}
+	retryAt, _ := publicationRecoveryTime(state.CredentialExpiresAt)
 	writeJSON(w, http.StatusConflict, map[string]any{
 		"error":    "previous publication credential is still outstanding",
 		"code":     "publication_credential_outstanding",
+		"status":   "waiting",
 		"retry_at": retryAt.UTC(),
 	})
 }
@@ -4155,8 +4177,9 @@ func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *h
 		return
 	}
 	state := taskPublicationRecoveryState(task)
-	if state.CredentialHandle != "" && slices.Contains([]string{"credential_minting", "credential_unknown", "credential_issued", "credential_received", "revocation_pending"}, state.State) {
-		mayRevoke := state.State == "revocation_pending" || (state.State == "credential_issued" && publicationRecoveryTimeExpired(state.ClaimExpiresAt, time.Now()))
+	now := time.Now()
+	if state.hasActiveCredential() {
+		mayRevoke := state.State == "revocation_pending" || (state.State == "credential_issued" && publicationRecoveryTimeExpired(state.ClaimExpiresAt, now))
 		found := false
 		var revokeErr error
 		if mayRevoke {
@@ -4170,8 +4193,12 @@ func (h *Handler) ClaimTaskGitHubPublicationRecovery(w http.ResponseWriter, r *h
 		case found:
 			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_revoked"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
 			state.State = "credential_revoked"
-		case state.credentialOutstanding(time.Now()):
-			writePublicationCredentialOutstanding(w, state)
+		case state.credentialExpiry(now) != publicationCredentialExpiryExpired:
+			expiry := state.credentialExpiry(now)
+			if expiry == publicationCredentialExpiryUnknown {
+				_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=context || jsonb_build_object('publication_recovery_error','publication credential expiry is unknown') WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
+			}
+			writePublicationCredentialOutstanding(w, state, expiry)
 			return
 		default:
 			_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"credential_expired"',true) WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, state.CredentialHandle)
@@ -4205,8 +4232,7 @@ WHERE id=$1 AND runtime_id=$2 AND status='completed'
 	     OR context->'publication_recovery'->>'retry_after' IS NULL
 	     OR (context->'publication_recovery'->>'retry_after')::timestamptz <= clock_timestamp())
   AND (context->'publication_recovery'->>'credential_handle' IS NULL
-       OR context->'publication_recovery'->>'state' IN ('credential_revoked','credential_expired','pending')
-       OR (context->'publication_recovery'->>'credential_expires_at')::timestamptz <= clock_timestamp())
+	       OR context->'publication_recovery'->>'state' IN ('credential_revoked','credential_expired','pending'))
 RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.DaemonID, credentialHandle, maxPublicationRecoveryClaims).Scan(&claimedID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, getErr := h.Queries.GetAgentTask(r.Context(), taskID)
@@ -4216,9 +4242,15 @@ RETURNING id`, taskID, runtime.ID, req.Repository, uuidToString(claimID), req.Da
 				writeJSON(w, http.StatusOK, map[string]any{"completed": true})
 				return
 			}
-			if existingState.credentialOutstanding(time.Now()) {
-				writePublicationCredentialOutstanding(w, existingState)
-				return
+			if existingState.hasActiveCredential() {
+				expiry := existingState.credentialExpiry(time.Now())
+				if expiry != publicationCredentialExpiryExpired {
+					if expiry == publicationCredentialExpiryUnknown {
+						_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=context || jsonb_build_object('publication_recovery_error','publication credential expiry is unknown') WHERE id=$1 AND context->'publication_recovery'->>'credential_handle'=$2`, taskID, existingState.CredentialHandle)
+					}
+					writePublicationCredentialOutstanding(w, existingState, expiry)
+					return
+				}
 			}
 			if existingState.Claims >= maxPublicationRecoveryClaims {
 				_, _ = h.DB.Exec(r.Context(), `UPDATE agent_task_queue SET context=jsonb_set(context,'{publication_recovery,state}','"blocked"',true) WHERE id=$1 AND COALESCE((context->'publication_recovery'->>'claims')::int,0) >= $2 AND context->'publication_recovery'->>'state' <> 'completed'`, taskID, maxPublicationRecoveryClaims)

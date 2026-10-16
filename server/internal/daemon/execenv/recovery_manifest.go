@@ -99,6 +99,22 @@ func RecordRecoveryDeferral(root, taskID string, retryAt time.Time) error {
 	return WriteRecoveryManifest(root, manifest)
 }
 
+// RecordRecoveryBlock preserves a definitive server refusal without turning it
+// into a retry attempt. An operator must resolve the durable reason explicitly.
+func RecordRecoveryBlock(root, taskID string, failure error) error {
+	manifest, exists, err := ReadRecoveryManifest(root, taskID)
+	if err != nil || !exists {
+		return err
+	}
+	manifest.PublicationPhase = PublicationBlocked
+	manifest.NextAttemptAt = time.Time{}
+	manifest.LastError = failure.Error()
+	if len(manifest.LastError) > 1024 {
+		manifest.LastError = manifest.LastError[:1024]
+	}
+	return WriteRecoveryManifest(root, manifest)
+}
+
 func RecoveryRetryReady(manifest RecoveryManifest, now time.Time) bool {
 	return manifest.PublicationPhase != PublicationBlocked && (manifest.NextAttemptAt.IsZero() || !now.Before(manifest.NextAttemptAt))
 }

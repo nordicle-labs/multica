@@ -80,6 +80,23 @@ func TestRecoveryJournalDeferralDoesNotConsumeAttempts(t *testing.T) {
 	}
 }
 
+func TestRecoveryJournalBlockDoesNotConsumeAttempts(t *testing.T) {
+	repo := newTestRepo(t)
+	sha := gitRun(t, repo, "rev-parse", "HEAD")
+	root := t.TempDir()
+	manifest := RecoveryManifest{TaskID: "blocked", DeliveryIntent: "publish", Repository: "owner/repo", GitRoot: repo, CanonicalBranch: "main", BaseSHA: sha, ExpectedRefSHA: sha}
+	if err := WriteRecoveryManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordRecoveryBlock(root, manifest.TaskID, errors.New("publication credential expiry is unknown")); err != nil {
+		t.Fatal(err)
+	}
+	got, exists, err := ReadRecoveryManifest(root, manifest.TaskID)
+	if err != nil || !exists || got.RecoveryAttempts != 0 || got.PublicationPhase != PublicationBlocked || got.LastError == "" || !got.NextAttemptAt.IsZero() {
+		t.Fatalf("blocked recovery exists=%v err=%v manifest=%+v", exists, err, got)
+	}
+}
+
 func TestPublicationJournalPersistsDurableLifecycleWithoutCredential(t *testing.T) {
 	repo := newTestRepo(t)
 	sha := gitRun(t, repo, "rev-parse", "HEAD")
