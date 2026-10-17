@@ -34,6 +34,22 @@ func (e *requestError) Error() string {
 	return fmt.Sprintf("%s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
 }
 
+type publicationRecoveryDeferredError struct {
+	RetryAt time.Time
+}
+
+func (e *publicationRecoveryDeferredError) Error() string {
+	return "publication credential lease is still outstanding"
+}
+
+type publicationRecoveryBlockedError struct {
+	Reason string
+}
+
+func (e *publicationRecoveryBlockedError) Error() string {
+	return e.Reason
+}
+
 var errInvalidResponseBody = errors.New("invalid response body")
 
 // isWorkspaceNotFoundError returns true if the error is a 404 with "workspace not found" body.
@@ -223,6 +239,7 @@ func daemonCommonCapabilities() []string {
 		capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV2)
 	}
 	capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	capabilities = append(capabilities, protocol.DaemonCapabilityExplicitDeliveryV1)
 	return capabilities
 }
 
@@ -296,6 +313,56 @@ func (c *Client) AcquireGitHubCredentials(ctx context.Context, task Task, reposi
 		return nil, fmt.Errorf("acquire GitHub App publication credentials: %w", err)
 	}
 	return response.Credentials, nil
+}
+
+type publicationRecoveryClaim struct {
+	ClaimID             string             `json:"claim_id"`
+	CredentialHandle    string             `json:"credential_handle"`
+	Credentials         []GitHubCredential `json:"credentials"`
+	RevocationConfirmed bool               `json:"revocation_confirmed"`
+	Completed           bool               `json:"completed"`
+}
+
+func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository string, publicationReady bool) (publicationRecoveryClaim, error) {
+	var response publicationRecoveryClaim
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/claim", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	if err := c.postJSON(ctx, path, map[string]any{"daemon_id": daemonID, "repository": repository, "publication_ready": publicationReady}, &response); err != nil {
+		var reqErr *requestError
+		var body struct {
+			Code    string    `json:"code"`
+			Error   string    `json:"error"`
+			RetryAt time.Time `json:"retry_at"`
+		}
+		if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict && json.Unmarshal([]byte(reqErr.Body), &body) == nil {
+			switch {
+			case body.Code == "publication_credential_outstanding" && !body.RetryAt.IsZero():
+				return response, &publicationRecoveryDeferredError{RetryAt: body.RetryAt}
+			case body.Code == "publication_credential_expiry_unknown":
+				return response, &publicationRecoveryBlockedError{Reason: body.Error}
+			}
+		}
+		return response, fmt.Errorf("claim GitHub publication recovery: %w", err)
+	}
+	return response, nil
+}
+
+func (c *Client) UpdateGitHubPublicationCredential(ctx context.Context, daemonID, runtimeID, taskID, claimID, credentialHandle, action string) (bool, error) {
+	var response struct {
+		RevocationConfirmed bool `json:"revocation_confirmed"`
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/credential", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	err := c.postJSON(ctx, path, map[string]string{"daemon_id": daemonID, "claim_id": claimID, "credential_handle": credentialHandle, "credential_action": action}, &response)
+	return response.RevocationConfirmed, err
+}
+
+func (c *Client) CompleteGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository, claimID, credentialHandle, remoteSHA string, pullRequest githubPullRequest) error {
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/complete", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	return c.postJSON(ctx, path, map[string]any{
+		"daemon_id": daemonID, "repository": repository, "claim_id": claimID, "credential_handle": credentialHandle,
+		"remote_sha": remoteSHA, "pull_request_number": pullRequest.Number,
+		"pull_request_url": pullRequest.URL, "readback_head_sha": pullRequest.HeadSHA,
+		"revocation_confirmed": true,
+	}, nil)
 }
 
 func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, taskID, contributionID string) (http.Header, error) {
@@ -692,10 +759,10 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 }
 
 func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, defaultTerminalRetrySchedule)
+	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", "", false, "", "", defaultTerminalRetrySchedule)
 }
 
-func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, schedule []time.Duration) error {
+func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, recoveryRef, recoveryBundlePath string, recoveryBundleVerified bool, recoveryRepository, recoveryHeadSHA string, schedule []time.Duration) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -708,6 +775,13 @@ func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, outp
 	}
 	if durableWorkDir != "" {
 		body["durable_work_dir"] = durableWorkDir
+	}
+	if recoveryRef != "" {
+		body["recovery_ref"] = recoveryRef
+		body["recovery_bundle_path"] = recoveryBundlePath
+		body["recovery_bundle_verified"] = recoveryBundleVerified
+		body["recovery_repository"] = recoveryRepository
+		body["recovery_head_sha"] = recoveryHeadSHA
 	}
 	if sessionRolloutMissing {
 		body["session_rollout_missing"] = true

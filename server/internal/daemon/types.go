@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
@@ -102,6 +103,7 @@ type Task struct {
 	Agent                         *AgentData             `json:"agent,omitempty"`
 	ConnectedApps                 []ConnectedAppData     `json:"connected_apps,omitempty"` // per-run app capabilities mounted through runtime MCP overlays
 	Repos                         []RepoData             `json:"repos,omitempty"`
+	DeliveryIntent                string                 `json:"delivery_intent,omitempty"`     // allowlisted server-persisted policy; absent/unknown fails closed
 	ProjectID                     string                 `json:"project_id,omitempty"`          // active project for this task, when present
 	ProjectTitle                  string                 `json:"project_title,omitempty"`       // human-readable project title for context injection
 	ProjectDescription            string                 `json:"project_description,omitempty"` // durable project-level context injected into the brief
@@ -184,8 +186,9 @@ type Task struct {
 }
 
 type GitHubCredential struct {
-	Repository string `json:"repository"`
-	Token      string `json:"token"`
+	Repository string    `json:"repository"`
+	Token      string    `json:"token"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon
@@ -308,9 +311,13 @@ type TaskResult struct {
 	WorkDir    string `json:"work_dir,omitempty"`   // working directory used during execution
 	// DurableWorkDir replaces WorkDir only after a disposable local worktree
 	// was finalized and its removal was confirmed. Empty keeps WorkDir authoritative.
-	DurableWorkDir string `json:"durable_work_dir,omitempty"`
-	EnvRoot        string `json:"-"` // env root dir for writing GC metadata (not sent to server)
-	FailureReason  string `json:"-"` // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
+	DurableWorkDir         string `json:"durable_work_dir,omitempty"`
+	RecoveryRef            string `json:"recovery_ref,omitempty"`
+	RecoveryBundlePath     string `json:"recovery_bundle_path,omitempty"`
+	RecoveryBundleVerified bool   `json:"recovery_bundle_verified,omitempty"`
+	RecoveryRepository     string `json:"recovery_repository,omitempty"`
+	EnvRoot                string `json:"-"` // env root dir for writing GC metadata (not sent to server)
+	FailureReason          string `json:"-"` // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
 	// SessionRolloutMissing is set when the daemon withheld this task's Codex
 	// session because its rollout was not in the store (MUL-5305). Forwarded to
 	// the terminal report so the server clears the resume pointer and flags the

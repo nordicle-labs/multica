@@ -7,6 +7,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -14,6 +16,10 @@ import (
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func testPrivateKey(t *testing.T) string {
 	t.Helper()
@@ -91,6 +97,48 @@ func TestMintRejectsTokenScopedToDifferentOwner(t *testing.T) {
 	}
 }
 
+func TestMintRevokesTokenFromMalformedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		revokeStatus    int
+		wantRevokeError bool
+	}{
+		{name: "revoked", revokeStatus: http.StatusNoContent},
+		{name: "revoke failed", revokeStatus: http.StatusInternalServerError, wantRevokeError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := strings.Repeat("x", 40)
+			deleteCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deleteCount++
+					w.WriteHeader(tc.revokeStatus)
+					return
+				}
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprintf(w, `{"token":%q,"expires_at":"2099-01-01T00:00:00Z","repositories":[{"full_name":"owner/repo"}]} trailing`, token)
+			}))
+			defer server.Close()
+
+			broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client(), Now: func() time.Time { return time.Unix(1_700_000_000, 0) }}
+			permissions, _ := PermissionsForRole("member")
+			_, err := broker.Mint(context.Background(), 42, "owner/repo", permissions)
+			if err == nil || !strings.Contains(err.Error(), "malformed response") {
+				t.Fatalf("Mint error = %v", err)
+			}
+			if deleteCount != 1 {
+				t.Fatalf("DELETE count = %d, want 1", deleteCount)
+			}
+			if got := strings.Contains(err.Error(), "revoke installation token"); got != tc.wantRevokeError {
+				t.Fatalf("revocation error present = %v, want %v: %v", got, tc.wantRevokeError, err)
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Fatal("Mint exposed the token in its error")
+			}
+		})
+	}
+}
+
 func TestMintInstallationRejectsOversizedResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
@@ -101,6 +149,68 @@ func TestMintInstallationRejectsOversizedResponse(t *testing.T) {
 	broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client()}
 	if _, err := broker.MintInstallation(context.Background(), 42, Permissions{"metadata": "read"}); err == nil {
 		t.Fatal("MintInstallation accepted a response larger than the limit")
+	}
+}
+
+func TestMintInstallationRevokesTokenFromMalformedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		revokeStatus    int
+		wantRevokeError bool
+	}{
+		{name: "revoked", revokeStatus: http.StatusNoContent},
+		{name: "revoke failed", revokeStatus: http.StatusInternalServerError, wantRevokeError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := strings.Repeat("x", 40)
+			deleteCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deleteCount++
+					w.WriteHeader(tc.revokeStatus)
+					return
+				}
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprintf(w, `{"token":%q,"expires_at":"2099-01-01T00:00:00Z"} trailing`, token)
+			}))
+			defer server.Close()
+
+			broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client(), Now: func() time.Time { return time.Unix(1_700_000_000, 0) }}
+			_, err := broker.MintInstallation(context.Background(), 42, Permissions{"metadata": "read"})
+			if err == nil || !strings.Contains(err.Error(), "malformed response") {
+				t.Fatalf("MintInstallation error = %v", err)
+			}
+			if deleteCount != 1 {
+				t.Fatalf("DELETE count = %d, want 1", deleteCount)
+			}
+			if got := strings.Contains(err.Error(), "revoke installation token"); got != tc.wantRevokeError {
+				t.Fatalf("revocation error present = %v, want %v: %v", got, tc.wantRevokeError, err)
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Fatal("MintInstallation exposed the token in its error")
+			}
+		})
+	}
+}
+
+func TestMintInstallationRejectsInvalidExpiration(t *testing.T) {
+	for _, response := range []string{
+		`{"token":"must-not-be-accepted"}`,
+		`{"token":"must-not-be-accepted","expires_at":"not-a-time"}`,
+		`{"token":"must-not-be-accepted","expires_at":"2000-01-01T00:00:00Z"}`,
+	} {
+		t.Run(response, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(response))
+			}))
+			defer server.Close()
+
+			broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client(), Now: func() time.Time { return time.Unix(1_700_000_000, 0) }}
+			if _, err := broker.MintInstallation(context.Background(), 42, Permissions{"metadata": "read"}); err == nil {
+				t.Fatal("MintInstallation accepted an invalid expiration")
+			}
+		})
 	}
 }
 
@@ -143,6 +253,29 @@ func TestBrokerRefusesRedirectWithInstallationToken(t *testing.T) {
 	}
 	if redirectedAuthorization != "" {
 		t.Fatal("installation token was forwarded to the redirect target")
+	}
+}
+
+func TestMintFailureDistinguishesRejectedAndUncertainRequests(t *testing.T) {
+	permissions, _ := PermissionsForRole("member")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	broker := Broker{AppID: "7", PrivateKey: testPrivateKey(t), APIBase: server.URL, Client: server.Client()}
+	_, err := broker.Mint(context.Background(), 42, "owner/repo", permissions)
+	var failure *MintFailure
+	if !errors.As(err, &failure) || !failure.NoCredential || !failure.Retryable {
+		t.Fatalf("HTTP rejection failure = %#v, %v", failure, err)
+	}
+
+	broker.Client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("response lost")
+	})}
+	_, err = broker.Mint(context.Background(), 42, "owner/repo", permissions)
+	failure = nil
+	if !errors.As(err, &failure) || failure.NoCredential || !failure.Retryable {
+		t.Fatalf("uncertain network failure = %#v, %v", failure, err)
 	}
 }
 

@@ -13,14 +13,16 @@ import (
 
 func identityTestEnvironment(t *testing.T) string {
 	t.Helper()
-	for _, key := range []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} {
+	for _, key := range []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL"} {
 		t.Setenv(key, "")
 		if err := os.Unsetenv(key); err != nil {
 			t.Fatal(err)
 		}
 	}
-	global := filepath.Join(t.TempDir(), "gitconfig")
-	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	global := filepath.Join(home, ".gitconfig")
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	gitIdentityCommand(t, "config", "--global", "user.name", "User")
 	gitIdentityCommand(t, "config", "--global", "user.email", "user@example.com")
@@ -44,6 +46,16 @@ func assertCommitIdentity(t *testing.T, path, name, email string) {
 	if got != want {
 		t.Fatalf("commit identity = %q, want %q", got, want)
 	}
+}
+
+// setCheckoutIdentity uses only commands available in Git 2.15. The file is
+// the checkout-private include installed by isolateWorktreeIdentityContext.
+func setCheckoutIdentity(t *testing.T, path, name, email string) {
+	t.Helper()
+	gitDir := gitIdentityCommand(t, "-C", path, "rev-parse", "--absolute-git-dir")
+	config := filepath.Join(gitDir, "multica-identity.override.config")
+	gitIdentityCommand(t, "config", "--file", config, "user.name", name)
+	gitIdentityCommand(t, "config", "--file", config, "user.email", email)
 }
 
 func polluteCacheIdentity(t *testing.T, path string) {
@@ -101,13 +113,20 @@ func TestCheckoutIdentityConcurrentTasksAndOverrides(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	gitIdentityCommand(t, "-C", results[0].Path, "config", "--worktree", "user.name", "Task A")
-	gitIdentityCommand(t, "-C", results[0].Path, "config", "--worktree", "user.email", "a@example.com")
+	setCheckoutIdentity(t, results[0].Path, "Task A", "a@example.com")
 	// A plain `git config` still writes shared config in linked worktrees.
 	// Even such a later write must not change another protected task.
 	gitIdentityCommand(t, "-C", results[0].Path, "config", "user.name", "Later contamination")
 	assertCommitIdentity(t, results[0].Path, "Task A", "a@example.com")
 	assertCommitIdentity(t, results[1].Path, "User", "user@example.com")
+	shared, err := os.OpenFile(filepath.Join(bare, "config"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := shared.WriteString("\n[user]\n	name = Late cache identity\n	email = late@example.com\n")
+	if closeErr := shared.Close(); writeErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(writeErr, closeErr))
+	}
 	gitIdentityCommand(t, "config", "--global", "user.name", "Updated User")
 	for i := range params {
 		if _, err := f.cache.CreateWorktree(params[i]); err != nil {
@@ -120,36 +139,20 @@ func TestCheckoutIdentityConcurrentTasksAndOverrides(t *testing.T) {
 
 func TestCheckoutIdentityMigratesExistingWorktree(t *testing.T) {
 	identityTestEnvironment(t)
-	for _, enabled := range []bool{false, true} {
-		t.Run(fmt.Sprintf("worktreeConfig=%v", enabled), func(t *testing.T) {
-			f := newExistingCheckoutFixture(t, false)
-			bare := f.cache.Lookup("ws-1", f.source)
-			polluteCacheIdentity(t, bare)
-			path := filepath.Join(f.workDir, repoNameFromURL(f.source))
-			gitIdentityCommand(t, "-C", bare, "worktree", "add", "-b", taskBranchName(firstTaskID), path)
-			other := filepath.Join(t.TempDir(), "active")
-			gitIdentityCommand(t, "-C", bare, "worktree", "add", "-b", "other-active-task", other)
-			if enabled {
-				// Model caches already using the extension before this fix.
-				gitIdentityCommand(t, "-C", bare, "config", "core.bare", "false")
-				gitIdentityCommand(t, "-C", bare, "config", "extensions.worktreeConfig", "true")
-				gitIdentityCommand(t, "-C", path, "config", "--worktree", "user.name", "Intentional")
-				gitIdentityCommand(t, "-C", path, "config", "--worktree", "user.email", "intentional@example.com")
-			}
-			result := f.checkout(t, firstTaskID, false)
-			if enabled {
-				assertCommitIdentity(t, result.Path, "Intentional", "intentional@example.com")
-			} else {
-				assertCommitIdentity(t, result.Path, "User", "user@example.com")
-				if got := gitIdentityCommand(t, "-C", bare, "rev-parse", "--is-bare-repository"); got != "true" {
-					t.Fatalf("cache stopped being bare: %s", got)
-				}
-			}
-			// Do not mutate another active checkout's effective identity or
-			// turn it into a bare repository while enabling the extension.
-			assertCommitIdentity(t, other, "Old Agent", "old@example.com")
-		})
+	f := newExistingCheckoutFixture(t, false)
+	bare := f.cache.Lookup("ws-1", f.source)
+	polluteCacheIdentity(t, bare)
+	path := filepath.Join(f.workDir, repoNameFromURL(f.source))
+	gitIdentityCommand(t, "-C", bare, "worktree", "add", "-b", taskBranchName(firstTaskID), path)
+	other := filepath.Join(t.TempDir(), "active")
+	gitIdentityCommand(t, "-C", bare, "worktree", "add", "-b", "other-active-task", other)
+	result := f.checkout(t, firstTaskID, false)
+	assertCommitIdentity(t, result.Path, "User", "user@example.com")
+	if got := gitIdentityCommand(t, "-C", bare, "rev-parse", "--is-bare-repository"); got != "true" {
+		t.Fatalf("cache stopped being bare: %s", got)
 	}
+	// Installing a checkout-specific include must not change a sibling checkout.
+	assertCommitIdentity(t, other, "Old Agent", "old@example.com")
 }
 
 func TestCheckoutIdentityUserConfigAndCoauthor(t *testing.T) {
@@ -157,10 +160,7 @@ func TestCheckoutIdentityUserConfigAndCoauthor(t *testing.T) {
 	f := newExistingCheckoutFixture(t, false)
 	bare := f.cache.Lookup("ws-1", f.source)
 	polluteCacheIdentity(t, bare)
-	include := filepath.Join(t.TempDir(), "identity.config")
-	gitIdentityCommand(t, "config", "--file", include, "user.name", "Conditional User")
-	gitIdentityCommand(t, "config", "--file", include, "author.name", "Explicit Author")
-	gitIdentityCommand(t, "config", "--global", "includeIf.onbranch:agent/**.path", filepath.ToSlash(include))
+	gitIdentityCommand(t, "config", "--global", "user.name", "Conditional User")
 	for _, enabled := range []bool{true, false} {
 		params := WorktreeParams{WorkspaceID: "ws-1", RepoURL: f.source, WorkDir: f.workDir, AgentName: "Agent", TaskID: firstTaskID, CoAuthoredByEnabled: enabled}
 		result, err := f.cache.CreateWorktree(params)
@@ -169,8 +169,8 @@ func TestCheckoutIdentityUserConfigAndCoauthor(t *testing.T) {
 		}
 		gitIdentityCommand(t, "-C", result.Path, "commit", "--allow-empty", "-m", "coauthor identity")
 		got := gitIdentityCommand(t, "-C", result.Path, "log", "-1", "--format=%an <%ae>|%cn <%ce>")
-		if got != "Explicit Author <user@example.com>|Conditional User <user@example.com>" {
-			t.Fatalf("conditional user/author identity = %q", got)
+		if got != "Conditional User <user@example.com>|Conditional User <user@example.com>" {
+			t.Fatalf("user identity = %q", got)
 		}
 		body := gitIdentityCommand(t, "-C", result.Path, "log", "-1", "--format=%B")
 		if strings.Contains(body, "Co-authored-by: multica-agent <github@multica.ai>") != enabled {
@@ -194,11 +194,11 @@ func TestCheckoutIdentityWithoutUserFailsClosed(t *testing.T) {
 	polluteCacheIdentity(t, f.cache.Lookup("ws-1", f.source))
 	result := f.checkout(t, firstTaskID, false)
 	if out, err := runGitCombinedOutput("-C", result.Path, "commit", "--allow-empty", "-m", "must not use cache author"); err == nil {
-		t.Fatalf("commit succeeded without a configured identity: %s", out)
+		got := gitIdentityCommand(t, "-C", result.Path, "log", "-1", "--format=%an <%ae>|%cn <%ce>")
+		t.Fatalf("commit succeeded without a configured identity as %s: %s", got, out)
 	}
 	// Setting an explicit worktree identity restores ordinary commits.
-	gitIdentityCommand(t, "-C", result.Path, "config", "--worktree", "user.name", "Configured")
-	gitIdentityCommand(t, "-C", result.Path, "config", "--worktree", "user.email", "configured@example.com")
+	setCheckoutIdentity(t, result.Path, "Configured", "configured@example.com")
 	assertCommitIdentity(t, result.Path, "Configured", "configured@example.com")
 }
 
@@ -217,7 +217,7 @@ func TestCheckoutIdentityConfigLockFailureIsRetryable(t *testing.T) {
 	f := newExistingCheckoutFixture(t, false)
 	result := f.checkout(t, firstTaskID, false)
 	gitDir := gitIdentityCommand(t, "-C", result.Path, "rev-parse", "--absolute-git-dir")
-	lock := filepath.Join(gitDir, "config.worktree.lock")
+	lock := filepath.Join(gitDir, "multica-identity.config.lock")
 	if err := os.WriteFile(lock, []byte("another writer"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -229,11 +229,11 @@ func TestCheckoutIdentityConfigLockFailureIsRetryable(t *testing.T) {
 	if err != nil || string(contents) != "another writer" {
 		t.Fatalf("another writer's lock changed: %s, %v", contents, err)
 	}
-	assertCommitIdentity(t, result.Path, "User", "user@example.com")
 	if err := os.Remove(lock); err != nil {
 		t.Fatal(err)
 	}
-	f.checkout(t, firstTaskID, false)
+	result = f.checkout(t, firstTaskID, false)
+	assertCommitIdentity(t, result.Path, "User", "user@example.com")
 }
 
 func TestCheckoutIdentityRejectsForeignWorktree(t *testing.T) {

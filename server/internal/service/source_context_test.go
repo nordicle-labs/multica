@@ -238,6 +238,13 @@ func TestEnqueueQuickCreateTaskWithSourceContextIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue with source context: %v", err)
 	}
+	var payload QuickCreateContext
+	if err := json.Unmarshal(task.Context, &payload); err != nil {
+		t.Fatalf("decode quick-create context: %v", err)
+	}
+	if payload.DeliveryIntent != "none" {
+		t.Fatalf("delivery intent = %q, want server-authorized default", payload.DeliveryIntent)
+	}
 	var state string
 	var originTaskID pgtype.UUID
 	if err := pool.QueryRow(ctx, `

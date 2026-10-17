@@ -42,7 +42,7 @@ func TestResumeRecoveryManifestsBeforeGC(t *testing.T) {
 	head := gitRun(t, repo, "rev-parse", "HEAD")
 	root := t.TempDir()
 	manifest := RecoveryManifest{
-		TaskID: "restart-task", GitRoot: repo, CanonicalBranch: "main",
+		TaskID: "restart-task", DeliveryIntent: "artifact", GitRoot: repo, CanonicalBranch: "main",
 		BaseSHA: base, ExpectedRefSHA: base, HeadSHA: head,
 	}
 	if err := WriteRecoveryManifest(root, manifest); err != nil {

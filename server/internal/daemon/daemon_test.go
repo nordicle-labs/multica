@@ -36,7 +36,7 @@ func createDaemonTestRepo(t *testing.T) string {
 		{"-C", dir, "commit", "--allow-empty", "-m", "initial"},
 	} {
 		cmd := exec.Command("git", args...)
-		cmd.Env = append(os.Environ(),
+		cmd.Env = isolatedGitTestEnv(
 			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
 			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
 		)
@@ -45,6 +45,22 @@ func createDaemonTestRepo(t *testing.T) string {
 		}
 	}
 	return dir
+}
+
+func isolatedGitTestEnv(overrides ...string) []string {
+	blocked := map[string]bool{"GIT_CONFIG_COUNT": true}
+	for _, override := range overrides {
+		blocked[strings.SplitN(override, "=", 2)[0]] = true
+	}
+	env := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, value := range os.Environ() {
+		key := strings.SplitN(value, "=", 2)[0]
+		if blocked[key] || strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		env = append(env, value)
+	}
+	return append(env, overrides...)
 }
 
 func TestNormalizeServerBaseURL(t *testing.T) {

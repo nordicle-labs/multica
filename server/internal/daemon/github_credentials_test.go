@@ -64,7 +64,7 @@ func TestGitHubCredentialSessionKeepsTokenOutOfProviderAndRevokes(t *testing.T) 
 	}
 }
 
-func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.T) {
+func TestHandleTaskDoesNotPublishWithoutExplicitDeliveryIntent(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
 	record := func(call string) { mu.Lock(); calls = append(calls, call); mu.Unlock() }
@@ -83,6 +83,8 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 			record("revoke")
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			_, _ = w.Write([]byte(`{"status":"running"}`))
+		case strings.HasSuffix(r.URL.Path, "/fail"):
+			record("fail")
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -106,19 +108,19 @@ func TestHandleTaskDoesNotAcquireGitHubCredentialBeforeRunnerReturns(t *testing.
 		if task.GitHubCredentials != nil || task.GitCredentialHelper != "" {
 			t.Fatal("runner received GitHub credentials")
 		}
-		return TaskResult{BranchName: descriptor.Branch, CommitSHA: descriptor.CommitSHA, TreeSHA: descriptor.TreeSHA, DurableWorkDir: work}, nil
+		return TaskResult{Status: "completed", BranchName: descriptor.Branch, CommitSHA: descriptor.CommitSHA, TreeSHA: descriptor.TreeSHA, DurableWorkDir: work}, nil
 	})
 	d.handleTask(context.Background(), Task{ID: "task-1", RuntimeID: "runtime-1", Agent: &AgentData{Name: "test-agent"}, Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}}, 0)
 
 	mu.Lock()
 	got := append([]string(nil), calls...)
 	mu.Unlock()
-	if strings.Join(got, ",") != "run,acquire" {
-		t.Fatalf("credential lifecycle calls = %v, want [run acquire]", got)
+	if strings.Join(got, ",") != "run,fail" {
+		t.Fatalf("delivery calls = %v, want [run fail]", got)
 	}
 }
 
-func TestHandleTaskDerivesGitHubRepoDeliveryBeforeCredentialAcquisition(t *testing.T) {
+func TestHandleTaskPreservesGitHubRepoArtifactWithoutPublishing(t *testing.T) {
 	t.Setenv("IS_SANDBOX", "1")
 	var acquired bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +139,8 @@ func TestHandleTaskDerivesGitHubRepoDeliveryBeforeCredentialAcquisition(t *testi
 
 	fakeBin := filepath.Join(t.TempDir(), "claude")
 	writeTestExecutable(t, fakeBin, []byte(`#!/bin/sh
-git init -b canonical . >/dev/null
+git init . >/dev/null
+git symbolic-ref HEAD refs/heads/canonical
 git config user.name test
 git config user.email test@example.com
 git remote add origin https://github.com/owner/repo.git
@@ -148,6 +151,7 @@ IFS= read -r _
 printf '%s\n' '{"type":"system","session_id":"session-delivery"}'
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"session-delivery","result":"done"}'
 `))
+	workspacesRoot := t.TempDir()
 	d := &Daemon{
 		client:             NewClient(srv.URL),
 		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -156,7 +160,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 		activeEnvRoots:     make(map[string]int),
 		cancelPollInterval: time.Hour,
 		cfg: Config{
-			WorkspacesRoot: t.TempDir(),
+			WorkspacesRoot: workspacesRoot,
 			AgentTimeout:   5 * time.Second,
 			ServerBaseURL:  srv.URL,
 			Agents:         map[string]AgentEntry{"claude": {Path: fakeBin}},
@@ -167,15 +171,18 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 		ID: "task-delivery", WorkspaceID: "workspace-1", RuntimeID: "runtime-1",
 		IssueID: "issue-1", AgentID: "agent-1", AuthToken: "mat_task", RemoteMCPDaemonToken: "claim-token",
 		Agent: &AgentData{ID: "agent-1", Name: "test-agent"},
-		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}},
+		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}, DeliveryIntent: "artifact",
 	}, 0)
 
-	if !acquired {
-		t.Fatal("handleTask did not acquire GitHub credentials after runTask completed a real repository delivery")
+	if acquired {
+		t.Fatal("handleTask acquired GitHub credentials for artifact-only delivery")
+	}
+	if _, err := os.Stat(filepath.Join(workspacesRoot, "recovery", "task-delivery", "recovery.bundle")); err != nil {
+		t.Fatalf("artifact-only delivery bundle missing: %v", err)
 	}
 }
 
-func TestHandleTaskDerivesInPlaceDeliveryBeforeCredentialAcquisition(t *testing.T) {
+func TestHandleTaskPreservesInPlaceArtifactWithoutPublishing(t *testing.T) {
 	t.Setenv("IS_SANDBOX", "1")
 	realGit, err := exec.LookPath("git")
 	if err != nil {
@@ -247,15 +254,18 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 		ID: "task-in-place", WorkspaceID: "workspace-1", RuntimeID: "runtime-1",
 		IssueID: "issue-1", AgentID: "agent-1", AuthToken: "mat_task", RemoteMCPDaemonToken: "claim-token",
 		Agent: &AgentData{ID: "agent-1", Name: "test-agent"},
-		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}},
+		Repos: []RepoData{{URL: "https://github.com/owner/repo.git"}}, DeliveryIntent: "artifact",
 		ProjectResources: []ProjectResourceData{{
 			ID: "local-1", ResourceType: localDirectoryResourceType,
 			ResourceRef: localRef,
 		}},
 	}, 0)
 
-	if !acquired {
-		t.Fatal("handleTask did not acquire GitHub credentials after runTask completed a local_directory/in_place delivery")
+	if acquired {
+		t.Fatal("handleTask acquired GitHub credentials for artifact-only delivery")
+	}
+	if _, err := os.Stat(filepath.Join(d.cfg.WorkspacesRoot, "recovery", "task-in-place", "recovery.bundle")); err != nil {
+		t.Fatalf("in-place artifact bundle missing: %v", err)
 	}
 }
 
@@ -457,11 +467,8 @@ func TestGitHubCredentialSessionRevokesTokenWhenCredentialIsInvalid(t *testing.T
 func TestGitHubCredentialSessionPublishesExactSHAAndVerifiesRemote(t *testing.T) {
 	remote := filepath.Join(t.TempDir(), "remote.git")
 	work := filepath.Join(t.TempDir(), "work")
-	for _, cmd := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
-		if out, err := exec.Command("git", cmd...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %s: %v", cmd, out, err)
-		}
-	}
+	gitTestRun(t, "", "init", "--bare", remote)
+	gitTestRun(t, "", "init", "-b", "main", work)
 	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
 		t.Fatalf("git remote add: %s: %v", out, err)
 	}
@@ -522,11 +529,8 @@ func TestGitHubCredentialSessionCreatesAndVerifiesPullRequest(t *testing.T) {
 	const branch = "agent/engineering-developer/herm-959"
 	remote := filepath.Join(t.TempDir(), "remote.git")
 	work := filepath.Join(t.TempDir(), "work")
-	for _, cmd := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", work}} {
-		if out, err := exec.Command("git", cmd...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %s: %v", cmd, out, err)
-		}
-	}
+	gitTestRun(t, "", "init", "--bare", remote)
+	gitTestRun(t, "", "init", "-b", "main", work)
 	if out, err := exec.Command("git", "-C", work, "remote", "add", "origin", "https://github.com/owner/repo.git").CombinedOutput(); err != nil {
 		t.Fatalf("git remote add: %s: %v", out, err)
 	}

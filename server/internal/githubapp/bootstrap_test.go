@@ -25,6 +25,7 @@ type bootstrapGitHub struct {
 	createCount         int
 	deleteCount         int
 	failCreate          bool
+	createThenFail      bool
 	failTemplate        bool
 	failProtection      bool
 	failDelete          bool
@@ -32,6 +33,8 @@ type bootstrapGitHub struct {
 	malformedCreate     bool
 	malformedRepoRead   int
 	disconnectCreate    bool
+	revokeCount         int
+	failRevokeAt        int
 }
 
 func TestRepositoryIdentity(t *testing.T) {
@@ -71,13 +74,18 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.WriteHeader(http.StatusCreated)
 		if len(body.Repositories) == 1 {
-			_, _ = w.Write([]byte(`{"token":"test-installation-token","repositories":[{"full_name":"nordicle-labs/widget"}]}`))
+			_, _ = w.Write([]byte(`{"token":"test-installation-token","expires_at":"2099-01-01T00:00:00Z","repositories":[{"full_name":"nordicle-labs/widget"}]}`))
 		} else {
-			_, _ = w.Write([]byte(`{"token":"test-installation-token"}`))
+			_, _ = w.Write([]byte(`{"token":"test-installation-token","expires_at":"2099-01-01T00:00:00Z"}`))
 		}
 		return
 	}
 	if path == "/installation/token" {
+		g.revokeCount++
+		if g.revokeCount == g.failRevokeAt {
+			http.Error(w, "injected", http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -91,6 +99,10 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		g.visibility, _ = body["visibility"].(string)
+		if g.createThenFail {
+			http.Error(w, "injected after creation", http.StatusInternalServerError)
+			return
+		}
 		if g.disconnectCreate {
 			connection, _, err := w.(http.Hijacker).Hijack()
 			if err != nil {
@@ -295,6 +307,30 @@ func TestBootstrapReadsBackLostCreateResponseAndRequiresReconciliation(t *testin
 	}
 	if !state.repository || state.deleteCount != 0 || state.repositoryReads < 2 {
 		t.Fatalf("repository=%v deletes=%d reads=%d", state.repository, state.deleteCount, state.repositoryReads)
+	}
+}
+
+func TestBootstrapReadsBackCreatedRepositoryAfterServerError(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}, createThenFail: true}
+	bootstrapper := testBootstrapper(t, state)
+	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err == nil || !strings.Contains(err.Error(), "reconcile repository nordicle-labs/widget") {
+		t.Fatalf("ambiguous create error = %v", err)
+	}
+	if !state.repository || state.deleteCount != 0 || state.repositoryReads < 2 {
+		t.Fatalf("repository=%v deletes=%d reads=%d", state.repository, state.deleteCount, state.repositoryReads)
+	}
+}
+
+func TestBootstrapFailsWhenSuccessfulBootstrapTokenRevocationFails(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}, failRevokeAt: 2}
+	bootstrapper := testBootstrapper(t, state)
+	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err == nil || !strings.Contains(err.Error(), "revoke installation token") || !strings.Contains(err.Error(), "nordicle-labs/widget") {
+		t.Fatalf("revocation error = %v", err)
+	}
+	if state.repository || state.deleteCount != 1 || state.revokeCount != 3 {
+		t.Fatalf("repository=%v deletes=%d revocations=%d", state.repository, state.deleteCount, state.revokeCount)
 	}
 }
 

@@ -1575,6 +1575,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/runtimes/{runtimeId}/tasks/claim", h.ClaimTaskByRuntime)
 		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/claim-ack", h.AcknowledgeTaskClaim)
 		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/github-credentials", h.AcquireTaskGitHubCredentials)
+		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/github-publication-recovery/claim", h.ClaimTaskGitHubPublicationRecovery)
+		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/github-publication-recovery/credential", h.UpdateTaskGitHubPublicationCredential)
+		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/github-publication-recovery/complete", h.CompleteTaskGitHubPublicationRecovery)
 		// Canonical machine-level batch claim (MUL-4257). `/claim` is a
 		// transitional alias; the daemon coordinator targets the canonical
 		// path.

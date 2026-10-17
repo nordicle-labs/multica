@@ -416,6 +416,7 @@ type AgentTaskResponse struct {
 	Agent                *TaskAgentData         `json:"agent,omitempty"`
 	ConnectedApps        []ConnectedAppData     `json:"connected_apps,omitempty"` // daemon-claim only: per-run app capabilities mounted through runtime MCP overlays
 	Repos                []RepoData             `json:"repos,omitempty"`
+	DeliveryIntent       string                 `json:"delivery_intent,omitempty"`     // allowlisted from persisted task context; absent/unknown fails closed
 	ProjectID            string                 `json:"project_id,omitempty"`          // issue's project, when present
 	ProjectTitle         string                 `json:"project_title,omitempty"`       // for surfacing in agent context
 	ProjectDescription   string                 `json:"project_description,omitempty"` // durable project-level context injected into the brief
@@ -828,6 +829,15 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		SystemRule string `json:"wakeup_system"`
 	}
 	_ = json.Unmarshal(t.Context, &wakeupContext)
+	var deliveryContext struct {
+		Intent string `json:"delivery_intent"`
+	}
+	_ = json.Unmarshal(t.Context, &deliveryContext)
+	switch deliveryContext.Intent {
+	case "none", "artifact", "publish":
+	default:
+		deliveryContext.Intent = "invalid"
+	}
 	handoffNote := ""
 	if t.HandoffNote.Valid {
 		handoffNote = t.HandoffNote.String
@@ -864,6 +874,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		WakeupID:               wakeupContext.ID,
 		WakeupSystemRule:       wakeupContext.SystemRule,
 		WakeupJoined:           service.JoinedWakeupNotes(t.Context),
+		DeliveryIntent:         deliveryContext.Intent,
 		WorkDir:                workDir,
 		RelativeWorkDir:        relativeWorkDir(workDir, workspaceID, uuidToString(t.ID)),
 		DurableWorkDir:         durableWorkDir,

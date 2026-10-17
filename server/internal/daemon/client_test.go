@@ -61,6 +61,7 @@ func TestClient_IdentityHeaders_PostJSON(t *testing.T) {
 			// Claim handlers key the GitHub credential lifecycle contract from
 			// this exact capability; pin the daemon and server to the same version.
 			protocol.DaemonCapabilityGitHubAppCredentialsV3,
+			protocol.DaemonCapabilityExplicitDeliveryV1,
 		} {
 			if !capabilities[want] {
 				t.Errorf("X-Client-Capabilities missing %q: %v", want, capabilities)

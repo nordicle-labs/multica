@@ -50,39 +50,38 @@ type Bootstrapper struct{ Broker Broker }
 
 // Check performs the complete remote preflight without mutation. A present
 // repository is returned only after template and protection readback succeeds.
-func (b Bootstrapper) Check(ctx context.Context, installationID int64, name, visibility, product string) (bool, BootstrapResult, error) {
-	name, err := NormalizeRepositoryName(name)
+func (b Bootstrapper) Check(ctx context.Context, installationID int64, name, visibility, product string) (exists bool, result BootstrapResult, err error) {
+	name, err = NormalizeRepositoryName(name)
 	if err != nil {
-		return false, BootstrapResult{}, err
+		return false, result, err
 	}
 	if err := ValidateVisibility(visibility); err != nil {
-		return false, BootstrapResult{}, err
+		return false, result, err
 	}
 	fingerprint, err := TemplateFingerprint()
 	if err != nil {
-		return false, BootstrapResult{}, err
+		return false, result, err
 	}
-	result := BootstrapResult{State: "unchanged", RepositoryURL: "https://github.com/" + BootstrapOwner + "/" + name, Branch: DefaultBranch, TemplateVersion: TemplateVersion, TemplateFingerprint: fingerprint}
+	result = BootstrapResult{State: "unchanged", RepositoryURL: "https://github.com/" + BootstrapOwner + "/" + name, Branch: DefaultBranch, TemplateVersion: TemplateVersion, TemplateFingerprint: fingerprint}
 	// A repository may not exist yet, so preflight needs an installation-wide
 	// read-only token. It is revoked before repository-scoped verification.
 	token, err := b.Broker.MintInstallation(ctx, installationID, Permissions{"metadata": "read"})
 	if err != nil {
 		return false, result, err
 	}
-	defer func() { _ = b.Broker.Revoke(context.Background(), token) }()
-	exists, err := b.repositoryExists(ctx, token, name)
+	defer func() { err = errors.Join(err, b.revokeToken(&token, result.RepositoryURL)) }()
+	exists, err = b.repositoryExists(ctx, token, name)
 	if err != nil || !exists {
 		return exists, result, err
 	}
-	if err := b.Broker.Revoke(ctx, token); err != nil {
+	if err := b.revokeToken(&token, result.RepositoryURL); err != nil {
 		return true, result, err
 	}
-	token = ""
 	credential, err := b.Broker.Mint(ctx, installationID, BootstrapOwner+"/"+name, Permissions{"administration": "read", "contents": "read", "metadata": "read"})
 	if err != nil {
 		return true, result, err
 	}
-	defer func() { _ = b.Broker.Revoke(context.Background(), credential.Token) }()
+	defer func() { err = errors.Join(err, b.revokeToken(&credential.Token, result.RepositoryURL)) }()
 	if err := b.verify(ctx, credential.Token, name, visibility, product, fingerprint, &result); err != nil {
 		return true, result, fmt.Errorf("existing repository is divergent: %w", err)
 	}
@@ -175,22 +174,21 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 	if err != nil {
 		return result, err
 	}
-	defer func() { _ = b.Broker.Revoke(context.Background(), token) }()
+	defer func() { err = errors.Join(err, b.revokeToken(&token, result.RepositoryURL)) }()
 
 	exists, err := b.repositoryExists(ctx, token, name)
 	if err != nil {
 		return result, err
 	}
 	if exists {
-		if err := b.Broker.Revoke(ctx, token); err != nil {
+		if err := b.revokeToken(&token, result.RepositoryURL); err != nil {
 			return result, err
 		}
-		token = ""
 		credential, mintErr := b.Broker.Mint(ctx, installationID, BootstrapOwner+"/"+name, Permissions{"administration": "read", "contents": "read", "metadata": "read"})
 		if mintErr != nil {
 			return result, mintErr
 		}
-		defer func() { _ = b.Broker.Revoke(context.Background(), credential.Token) }()
+		defer func() { err = errors.Join(err, b.revokeToken(&credential.Token, result.RepositoryURL)) }()
 		if err := b.verify(ctx, credential.Token, name, visibility, product, fingerprint, &result); err != nil {
 			return result, fmt.Errorf("existing repository is divergent: %w", err)
 		}
@@ -223,15 +221,14 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 	if err = b.attestRepository(ctx, token, name, result.RepositoryID); err != nil {
 		return result, err
 	}
-	if err = b.Broker.Revoke(ctx, token); err != nil {
+	if err = b.revokeToken(&token, result.RepositoryURL); err != nil {
 		return result, err
 	}
-	token = ""
 	credential, err := b.Broker.Mint(ctx, installationID, BootstrapOwner+"/"+name, Permissions{"administration": "write", "contents": "write", "metadata": "read"})
 	if err != nil {
 		return result, err
 	}
-	defer func() { _ = b.Broker.Revoke(context.Background(), credential.Token) }()
+	defer func() { err = errors.Join(err, b.revokeToken(&credential.Token, result.RepositoryURL)) }()
 	if err = b.writeTemplate(ctx, credential.Token, name, product, fingerprint); err != nil {
 		return result, err
 	}
@@ -245,7 +242,7 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 	return result, nil
 }
 
-func (b Bootstrapper) Delete(ctx context.Context, installationID int64, name string, expectedID int64) error {
+func (b Bootstrapper) Delete(ctx context.Context, installationID int64, name string, expectedID int64) (err error) {
 	if expectedID <= 0 {
 		return errors.New("delete repository: immutable repository ID is required")
 	}
@@ -253,7 +250,9 @@ func (b Bootstrapper) Delete(ctx context.Context, installationID int64, name str
 	if err != nil {
 		return err
 	}
-	defer func() { _ = b.Broker.Revoke(context.Background(), credential.Token) }()
+	defer func() {
+		err = errors.Join(err, b.revokeToken(&credential.Token, "https://github.com/"+BootstrapOwner+"/"+name))
+	}()
 	if err := b.attestRepository(ctx, credential.Token, name, expectedID); err != nil {
 		return fmt.Errorf("delete repository identity check: %w", err)
 	}
@@ -264,6 +263,20 @@ func (b Bootstrapper) Delete(ctx context.Context, installationID int64, name str
 	status, _, err = b.request(ctx, credential.Token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name, nil)
 	if err != nil || status != http.StatusNotFound {
 		return fmt.Errorf("verify repository deletion: github status %d: %w", status, err)
+	}
+	return nil
+}
+
+func (b Bootstrapper) revokeToken(token *string, repositoryURL string) error {
+	if *token == "" {
+		return nil
+	}
+	value := *token
+	*token = ""
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := b.Broker.Revoke(ctx, value); err != nil {
+		return fmt.Errorf("%w; token revocation unconfirmed; reconcile GitHub App credentials for %s", err, repositoryURL)
 	}
 	return nil
 }
@@ -286,7 +299,7 @@ func (b Bootstrapper) repositoryExists(ctx context.Context, token, name string) 
 func (b Bootstrapper) createRepository(ctx context.Context, token, name, visibility string) (int64, bool, error) {
 	status, raw, err := b.request(ctx, token, http.MethodPost, "/orgs/"+BootstrapOwner+"/repos", map[string]any{"name": name, "visibility": visibility, "private": visibility == "private", "auto_init": false})
 	if err != nil || status != http.StatusCreated {
-		return 0, err != nil || status == http.StatusCreated, fmt.Errorf("create repository: github status %d: %w", status, err)
+		return 0, err != nil || status == http.StatusCreated || status >= http.StatusInternalServerError, fmt.Errorf("create repository: github status %d: %w", status, err)
 	}
 	var repo struct {
 		ID int64 `json:"id"`

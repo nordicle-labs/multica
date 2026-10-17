@@ -1309,6 +1309,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		Context:              agentDeliveryContext(agent),
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1339,6 +1340,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 			RerunOfTaskID:        createParams.RerunOfTaskID,
 			TriggerEvidenceKind:  createParams.TriggerEvidenceKind,
 			TriggerEvidenceRefID: createParams.TriggerEvidenceRefID,
+			Context:              createParams.Context,
 			FireAt:               fireAt,
 		})
 	} else {
@@ -1482,6 +1484,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		Context:              agentDeliveryContext(agent),
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1507,6 +1510,29 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	return task, nil
 }
 
+// agentDeliveryContext snapshots server-owned policy at enqueue. Provider
+// output cannot grant publication authority, and later config edits cannot
+// change a queued task.
+func agentDeliveryContext(agent db.Agent) []byte {
+	contextJSON, _ := json.Marshal(map[string]string{"delivery_intent": agentDeliveryIntent(agent)})
+	return contextJSON
+}
+
+func agentDeliveryIntent(agent db.Agent) string {
+	var config struct {
+		DeliveryIntent string `json:"delivery_intent"`
+	}
+	if json.Unmarshal(agent.RuntimeConfig, &config) == nil {
+		switch config.DeliveryIntent {
+		case "none", "artifact", "publish":
+			return config.DeliveryIntent
+		case "":
+			return "none"
+		}
+	}
+	return "invalid"
+}
+
 // QuickCreateContext is the JSON payload stored on a quick-create task's
 // context column. The daemon detects this variant via Type == "quick_create"
 // and switches to the quick-create prompt template; the completion path
@@ -1524,15 +1550,16 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 // onto the agent's Instructions, matching the behavior of issue-bound
 // tasks assigned to the squad.
 type QuickCreateContext struct {
-	Type          string   `json:"type"`
-	Prompt        string   `json:"prompt"`
-	RequesterID   string   `json:"requester_id"`
-	WorkspaceID   string   `json:"workspace_id"`
-	Priority      string   `json:"priority,omitempty"`
-	DueDate       string   `json:"due_date,omitempty"`
-	ProjectID     string   `json:"project_id,omitempty"`
-	SquadID       string   `json:"squad_id,omitempty"`
-	AttachmentIDs []string `json:"attachment_ids,omitempty"`
+	Type           string   `json:"type"`
+	Prompt         string   `json:"prompt"`
+	RequesterID    string   `json:"requester_id"`
+	WorkspaceID    string   `json:"workspace_id"`
+	DeliveryIntent string   `json:"delivery_intent"`
+	Priority       string   `json:"priority,omitempty"`
+	DueDate        string   `json:"due_date,omitempty"`
+	ProjectID      string   `json:"project_id,omitempty"`
+	SquadID        string   `json:"squad_id,omitempty"`
+	AttachmentIDs  []string `json:"attachment_ids,omitempty"`
 	// ParentIssueID is the optional UUID of the parent issue the new issue
 	// should be filed under. Set when the user opens the modal from "Add
 	// sub issue" on an existing issue; the daemon claim handler resolves the
@@ -1591,12 +1618,13 @@ func (s *TaskService) enqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	}
 
 	payload := QuickCreateContext{
-		Type:        QuickCreateContextType,
-		Prompt:      prompt,
-		RequesterID: util.UUIDToString(requesterID),
-		WorkspaceID: util.UUIDToString(workspaceID),
-		Priority:    priority,
-		DueDate:     dueDate,
+		Type:           QuickCreateContextType,
+		Prompt:         prompt,
+		RequesterID:    util.UUIDToString(requesterID),
+		WorkspaceID:    util.UUIDToString(workspaceID),
+		DeliveryIntent: agentDeliveryIntent(agent),
+		Priority:       priority,
+		DueDate:        dueDate,
 	}
 	if projectID.Valid {
 		payload.ProjectID = util.UUIDToString(projectID)
@@ -2096,6 +2124,7 @@ func (s *TaskService) enqueueChatTaskTx(
 		OriginatorSource:     prepared.attrSource,
 		TriggerEvidenceKind:  prepared.attrEvidenceKind,
 		TriggerEvidenceRefID: chatSession.ID,
+		Context:              agentDeliveryContext(agent),
 		ChannelContextRevision: pgtype.Int8{
 			Int64: contextRevision, Valid: contextRevision > 0,
 		},
@@ -2401,6 +2430,7 @@ func (s *TaskService) SendDirectChatMessage(
 			OriginatorSource:     attrSource,
 			TriggerEvidenceKind:  attrEvidenceKind,
 			TriggerEvidenceRefID: attrEvidenceRef,
+			Context:              agentDeliveryContext(carrier),
 		})
 		if err != nil {
 			return fmt.Errorf("create direct chat task: %w", err)
@@ -6662,6 +6692,7 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			RuleVersionID:        ruleVersionID,
 			TriggerEvidenceKind:  pgtype.Text{String: string(attribution.EvidenceDelegatedFailure), Valid: true},
 			TriggerEvidenceRefID: target.failed.ID,
+			Context:              agentDeliveryContext(target.agent),
 			HeadSha:              headShaText(s.ResolveIssueReviewSHA(ctx, target.issue.ID)),
 		})
 		if err == nil {

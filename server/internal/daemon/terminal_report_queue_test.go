@@ -160,13 +160,17 @@ func TestTerminalReportReplaysAfterClientRetryWindow(t *testing.T) {
 		DaemonID:       "daemon-retry",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	report := terminalTaskReport{
-		kind:           terminalTaskReportComplete,
-		taskID:         "task-retry-window",
-		output:         "the original answer",
-		branchName:     "agent/recovered",
-		sessionID:      "session-1",
-		workDir:        "/tmp/work",
-		durableWorkDir: "/tmp/project",
+		kind:                   terminalTaskReportComplete,
+		taskID:                 "task-retry-window",
+		output:                 "the original answer",
+		branchName:             "agent/recovered",
+		sessionID:              "session-1",
+		workDir:                "/tmp/work",
+		durableWorkDir:         "/tmp/project",
+		recoveryRef:            "refs/multica/recovery/task-retry-window",
+		recoveryBundlePath:     "/tmp/recovery.bundle",
+		recoveryBundleVerified: true,
+		recoveryRepository:     "owner/repo",
 	}
 	if err := d.reportTerminalTask(context.Background(), report); err == nil {
 		t.Fatal("terminal report unexpectedly succeeded while server was offline")
@@ -189,7 +193,7 @@ func TestTerminalReportReplaysAfterClientRetryWindow(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for i, body := range bodies {
-		if body["output"] != report.output || body["branch_name"] != report.branchName || body["durable_work_dir"] != report.durableWorkDir {
+		if body["output"] != report.output || body["branch_name"] != report.branchName || body["durable_work_dir"] != report.durableWorkDir || body["recovery_repository"] != report.recoveryRepository {
 			t.Fatalf("attempt %d payload = %#v, want original report", i+1, body)
 		}
 	}

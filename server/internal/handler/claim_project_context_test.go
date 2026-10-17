@@ -218,7 +218,7 @@ func TestClaimTask_IssueProjectInForeignWorkspace_DegradesToWorkspaceRepos(t *te
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-claim-foreign-issue-project")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -261,11 +261,12 @@ func TestClaimTask_QuickCreateProjectInForeignWorkspace_DegradesToWorkspaceRepos
 
 	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
 	quickContext, _ := json.Marshal(map[string]any{
-		"type":         "quick_create",
-		"prompt":       "create a follow-up issue",
-		"requester_id": testUserID,
-		"workspace_id": testWorkspaceID,
-		"project_id":   foreignProjectID,
+		"type":            "quick_create",
+		"prompt":          "create a follow-up issue",
+		"requester_id":    testUserID,
+		"workspace_id":    testWorkspaceID,
+		"project_id":      foreignProjectID,
+		"delivery_intent": "none",
 	})
 	dbfx.Exec(t, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, context)
@@ -274,7 +275,7 @@ func TestClaimTask_QuickCreateProjectInForeignWorkspace_DegradesToWorkspaceRepos
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, daemonID)
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -356,7 +357,7 @@ func TestClaimTask_ProjectResourceFromForeignWorkspace_IsFilteredOut(t *testing.
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-claim-foreign-resource")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 

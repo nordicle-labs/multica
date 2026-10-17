@@ -464,10 +464,11 @@ func TestClaimTaskByRuntime_DefersGitHubCredentialMintUntilAfterFinalize(t *test
 	dbfx.Exec(t, `UPDATE agent_runtime SET daemon_id = 'deferred-github' WHERE id = $1`, runtimeID)
 	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Deferred GitHub agent")
 	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET context = '{"delivery_intent":"publish"}' WHERE id = $1`, taskID)
 	minted, _ := setupGitHubClaimRevocation(t, issueID)
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "deferred-github")
 	req = withURLParam(req, "runtimeId", runtimeID)
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	w := httptest.NewRecorder()
 	testHandler.ClaimTaskByRuntime(w, req)
 	var response struct {

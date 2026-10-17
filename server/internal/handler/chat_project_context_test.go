@@ -317,8 +317,8 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 	var taskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
-			agent_id, runtime_id, status, priority, chat_session_id
-		) VALUES ($1, $2, 'queued', 1000, $3)
+			agent_id, runtime_id, status, priority, chat_session_id, context
+		) VALUES ($1, $2, 'queued', 1000, $3, '{"delivery_intent":"none"}')
 		RETURNING id
 	`, agentID, runtimeID, sessionID).Scan(&taskID); err != nil {
 		t.Fatalf("create chat task: %v", err)
@@ -336,7 +336,7 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 		testWorkspaceID,
 		"chat-project-context-test",
 	)
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {

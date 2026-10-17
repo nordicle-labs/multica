@@ -2097,7 +2097,7 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 
 	setupGitHubClaimTestBroker(t, projectRepoURL)
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-project-repos")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -2289,7 +2289,7 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-daemon-claim")
-	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("runtimeId", runtimeID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -2698,6 +2698,27 @@ func TestClaimResponseAgentIdentityMatches(t *testing.T) {
 	}
 }
 
+func TestTaskToResponseReadsPersistedDeliveryIntentFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		context string
+		want    string
+	}{
+		{name: "none", context: `{"delivery_intent":"none"}`, want: "none"},
+		{name: "artifact", context: `{"delivery_intent":"artifact"}`, want: "artifact"},
+		{name: "publish", context: `{"delivery_intent":"publish"}`, want: "publish"},
+		{name: "legacy", context: `{}`, want: "invalid"},
+		{name: "unknown", context: `{"delivery_intent":"admin"}`, want: "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taskToResponse(db.AgentTaskQueue{Context: []byte(tc.context)}, "").DeliveryIntent
+			if got != tc.want {
+				t.Fatalf("delivery intent = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 type claimRuntimeGuardTask struct {
 	GitHubCredentialAck           string          `json:"github_credential_ack"`
 	PriorSessionID                string          `json:"prior_session_id"`
@@ -2716,7 +2737,7 @@ type claimRuntimeGuardTask struct {
 
 func claimTaskForRuntimeGuard(t *testing.T, runtimeID, daemonID string) *claimRuntimeGuardTask {
 	t.Helper()
-	return claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	return claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 }
 
 // claimTaskForRuntimeGuardWithCapabilities claims as a daemon advertising the
