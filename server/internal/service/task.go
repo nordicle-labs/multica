@@ -5903,6 +5903,20 @@ func (s *TaskService) RerunIssueWithDeliveryIntent(ctx context.Context, issueID 
 func (s *TaskService) enqueueRerunTaskWithDeliveryIntent(ctx context.Context, issue db.Issue, agent db.Agent, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, deliveryIntent string, canManage func(agent db.Agent) bool) (db.AgentTaskQueue, error) {
 	var task db.AgentTaskQueue
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		if _, err := qtx.LockWorkspaceForTaskRerun(ctx, issue.WorkspaceID); err != nil {
+			return fmt.Errorf("lock workspace for rerun: %w", err)
+		}
+		if !rerunOfTaskID.Valid && issue.AssigneeType.String == "squad" {
+			lockedSquad, err := qtx.LockSquadForAutopilotAssignment(ctx, db.LockSquadForAutopilotAssignmentParams{
+				ID: squadID, WorkspaceID: issue.WorkspaceID,
+			})
+			if err != nil {
+				return fmt.Errorf("lock assignee squad: %w", err)
+			}
+			if lockedSquad.ArchivedAt.Valid || util.UUIDToString(lockedSquad.LeaderID) != util.UUIDToString(agent.ID) {
+				return fmt.Errorf("issue squad leader changed during rerun")
+			}
+		}
 		lockedAgent, err := qtx.GetAgentForUpdate(ctx, agent.ID)
 		if err != nil {
 			return fmt.Errorf("lock target agent: %w", err)
@@ -5917,8 +5931,19 @@ func (s *TaskService) enqueueRerunTaskWithDeliveryIntent(ctx context.Context, is
 		if canManage == nil || !canManage(lockedAgent) {
 			return ErrRerunManageNotAllowed
 		}
-		if !rerunOfTaskID.Valid && (!lockedIssue.AssigneeID.Valid || util.UUIDToString(lockedIssue.AssigneeID) != util.UUIDToString(agent.ID)) {
-			return fmt.Errorf("issue assignment changed during rerun")
+		if !rerunOfTaskID.Valid {
+			assignmentMatches := lockedIssue.AssigneeID.Valid && lockedIssue.AssigneeType.Valid
+			switch lockedIssue.AssigneeType.String {
+			case "agent":
+				assignmentMatches = assignmentMatches && util.UUIDToString(lockedIssue.AssigneeID) == util.UUIDToString(agent.ID)
+			case "squad":
+				assignmentMatches = assignmentMatches && util.UUIDToString(lockedIssue.AssigneeID) == util.UUIDToString(squadID)
+			default:
+				assignmentMatches = false
+			}
+			if !assignmentMatches {
+				return fmt.Errorf("issue assignment changed during rerun")
+			}
 		}
 		pending, err := qtx.HasPendingTaskForIssueAndAgentInThread(ctx, db.HasPendingTaskForIssueAndAgentInThreadParams{
 			ThreadCommentID: triggerCommentID,
