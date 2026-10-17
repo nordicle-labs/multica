@@ -300,11 +300,21 @@ func TestRerunIssueDeliveryIntentRejectsAgentAndUnauthorizedMember(t *testing.T)
 	ctx := context.Background()
 	agentID, ownerID, _ := privateAgentTestFixture(t)
 	memberID := seedSecurityTestOwner(t, "rerun-intent-member")
-	if _, err := testPool.Exec(ctx, `
-		UPDATE agent SET permission_mode = 'public_to' WHERE id = $1;
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin agent invocation setup: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE agent SET permission_mode = 'public_to' WHERE id = $1`, agentID); err != nil {
+		t.Fatalf("set agent permission mode: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
 		VALUES ($1, 'member', $2)`, agentID, memberID); err != nil {
 		t.Fatalf("allow member to invoke agent: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit agent invocation setup: %v", err)
 	}
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
