@@ -24,6 +24,24 @@ import (
 	"github.com/multica-ai/multica/server/internal/handler"
 )
 
+func TestIssueRerunDeliveryIntentPayload(t *testing.T) {
+	for _, intent := range []string{"none", "artifact", "publish"} {
+		body, err := issueRerunPayload(intent)
+		if err != nil {
+			t.Fatalf("issueRerunPayload(%q): %v", intent, err)
+		}
+		if body["delivery_intent"] != intent {
+			t.Fatalf("payload = %#v", body)
+		}
+	}
+	if _, err := issueRerunPayload("ship"); err == nil {
+		t.Fatal("expected invalid delivery intent error")
+	}
+	if body, err := issueRerunPayload(""); err != nil || len(body) != 0 {
+		t.Fatalf("legacy payload = %#v, %v; want empty map", body, err)
+	}
+}
+
 // stderrCapture redirects os.Stderr through a pipe so a test can assert on
 // the human-facing strings runIssueCommentList prints alongside its JSON
 // output. Read() drains the pipe and is safe to call multiple times.

@@ -66,6 +66,11 @@ LIMIT $2 OFFSET $3;
 SELECT * FROM issue
 WHERE id = $1;
 
+-- name: LockIssueForRerun :one
+SELECT * FROM issue
+WHERE id = $1
+FOR UPDATE;
+
 -- name: CountIssuesInTriage :one
 -- How many of these issues are in Triage. The batch parent-write guard only
 -- needs "any", and a count keeps the check one round trip regardless of size.

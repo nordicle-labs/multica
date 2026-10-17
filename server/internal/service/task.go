@@ -5668,6 +5668,12 @@ func transferPendingSourceContextToRetry(ctx context.Context, q *db.Queries, par
 // to a structured 403 (no task was cancelled or created).
 var ErrRerunInvokeNotAllowed = errors.New("rerun: operator not allowed to invoke target agent")
 
+var (
+	ErrInvalidDeliveryIntent = errors.New("delivery_intent must be one of none, artifact, publish")
+	ErrRerunManageNotAllowed = errors.New("rerun: operator not allowed to manage target agent")
+	ErrRerunPendingSlot      = errors.New("rerun: target agent already has a pending task for this issue")
+)
+
 // Only tasks belonging to the target agent on this issue are cancelled.
 // Tasks owned by other agents on the same issue (e.g. a parallel
 // @-mention agent) are left alone — rerun must not collateral-cancel
@@ -5681,6 +5687,13 @@ var ErrRerunInvokeNotAllowed = errors.New("rerun: operator not allowed to invoke
 // rerun as a back door — and a blocked rerun mutates nothing. Pass nil only
 // from trusted internal callers (tests, backfill) that have already gated.
 func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourceTaskID pgtype.UUID, triggerCommentID pgtype.UUID, actorUserID pgtype.UUID, canInvoke func(agent db.Agent) bool) (*db.AgentTaskQueue, error) {
+	return s.RerunIssueWithDeliveryIntent(ctx, issueID, sourceTaskID, triggerCommentID, actorUserID, nil, canInvoke, nil)
+}
+
+func (s *TaskService) RerunIssueWithDeliveryIntent(ctx context.Context, issueID pgtype.UUID, sourceTaskID pgtype.UUID, triggerCommentID pgtype.UUID, actorUserID pgtype.UUID, deliveryIntent *string, canInvoke func(agent db.Agent) bool, canManage func(agent db.Agent) bool) (*db.AgentTaskQueue, error) {
+	if deliveryIntent != nil && *deliveryIntent != "none" && *deliveryIntent != "artifact" && *deliveryIntent != "publish" {
+		return nil, ErrInvalidDeliveryIntent
+	}
 	issue, err := s.Queries.GetIssue(ctx, issueID)
 	if err != nil {
 		return nil, fmt.Errorf("load issue: %w", err)
@@ -5783,14 +5796,24 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 	// so a since-reassigned issue can't be used to re-fire a private agent the
 	// operator may only view. A block fails closed: no prior task is cancelled,
 	// no new task is created.
-	if canInvoke != nil {
-		targetAgent, err := s.Queries.GetAgent(ctx, agentID)
+	var targetAgent db.Agent
+	if canInvoke != nil || deliveryIntent != nil {
+		targetAgent, err = s.Queries.GetAgent(ctx, agentID)
 		if err != nil {
 			return nil, fmt.Errorf("load target agent: %w", err)
 		}
-		if !canInvoke(targetAgent) {
+		if canInvoke != nil && !canInvoke(targetAgent) {
 			return nil, ErrRerunInvokeNotAllowed
 		}
+	}
+	if deliveryIntent != nil {
+		task, err := s.enqueueRerunTaskWithDeliveryIntent(ctx, issue, targetAgent, triggerCommentID, coalescedCommentIDs, isLeader, squadID, actorUserID, sourceTaskID, *deliveryIntent, canManage)
+		if err != nil {
+			return nil, err
+		}
+		s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
+		s.NotifyTaskEnqueued(ctx, task)
+		return &task, nil
 	}
 
 	// Clear only the tasks that have not begun executing. Those are the rows the
@@ -5875,6 +5898,68 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 		"cancelled_pending", cancelledCount,
 	)
 	return &task, nil
+}
+
+func (s *TaskService) enqueueRerunTaskWithDeliveryIntent(ctx context.Context, issue db.Issue, agent db.Agent, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, deliveryIntent string, canManage func(agent db.Agent) bool) (db.AgentTaskQueue, error) {
+	var task db.AgentTaskQueue
+	err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		lockedAgent, err := qtx.GetAgentForUpdate(ctx, agent.ID)
+		if err != nil {
+			return fmt.Errorf("lock target agent: %w", err)
+		}
+		lockedIssue, err := qtx.LockIssueForRerun(ctx, issue.ID)
+		if err != nil {
+			return fmt.Errorf("lock issue: %w", err)
+		}
+		if lockedAgent.ArchivedAt.Valid || !lockedAgent.RuntimeID.Valid {
+			return fmt.Errorf("target agent is unavailable")
+		}
+		if canManage == nil || !canManage(lockedAgent) {
+			return ErrRerunManageNotAllowed
+		}
+		if !rerunOfTaskID.Valid && (!lockedIssue.AssigneeID.Valid || util.UUIDToString(lockedIssue.AssigneeID) != util.UUIDToString(agent.ID)) {
+			return fmt.Errorf("issue assignment changed during rerun")
+		}
+		pending, err := qtx.HasPendingTaskForIssueAndAgentInThread(ctx, db.HasPendingTaskForIssueAndAgentInThreadParams{
+			ThreadCommentID: triggerCommentID,
+			IssueID:         issue.ID,
+			AgentID:         agent.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("check pending rerun slot: %w", err)
+		}
+		if pending {
+			return ErrRerunPendingSlot
+		}
+
+		attrKind := attribution.SourceDelegation
+		if lockedIssue.AssigneeType.String == "agent" && lockedIssue.AssigneeID.Valid && util.UUIDToString(lockedIssue.AssigneeID) == util.UUIDToString(agent.ID) {
+			attrKind = attribution.SourceCommentSource
+		}
+		attr := s.attributionForIssueTask(ctx, lockedIssue, triggerCommentID, attrKind, actorUserID)
+		attr, err = s.applyAttributionFallback(ctx, attr, lockedAgent)
+		if err != nil {
+			return err
+		}
+		overlay := s.buildRuntimeMCPOverlay(ctx, attr.UserID, lockedAgent)
+		attrSource, delegatedFrom, evidenceKind, evidenceRef := attributionCreateParams(attr)
+		contextJSON, _ := json.Marshal(map[string]string{"delivery_intent": deliveryIntent})
+		task, err = qtx.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+			ID: dbid.NewV7(), AgentID: agent.ID, RuntimeID: lockedAgent.RuntimeID, IssueID: issue.ID,
+			Priority: priorityToInt(lockedIssue.Priority), TriggerCommentID: triggerCommentID,
+			CoalescedCommentIds: coalescedCommentIDs, TriggerSummary: s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
+			ForceFreshSession: pgtype.Bool{Bool: true, Valid: true}, IsLeaderTask: pgtype.Bool{Bool: isLeader, Valid: isLeader}, SquadID: squadID,
+			OriginatorUserID: attr.UserID, AccountableUserID: attr.AccountableUserID, RuleVersionID: attr.RuleVersionID,
+			RerunOfTaskID: rerunOfTaskID, RuntimeMcpOverlay: overlay.Overlay, RuntimeConnectedApps: overlay.ConnectedApps,
+			OriginatorSource: attrSource, DelegatedFromTaskID: delegatedFrom, TriggerEvidenceKind: evidenceKind, TriggerEvidenceRefID: evidenceRef,
+			Context: contextJSON, HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
+		})
+		if isDuplicatePendingTaskErr(err) {
+			return ErrRerunPendingSlot
+		}
+		return err
+	})
+	return task, err
 }
 
 // promoteNewestSurvivingComment repairs a manual rerun whose original trigger

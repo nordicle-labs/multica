@@ -259,11 +259,14 @@ func TestRerunIssue_PrivateHistoricalAgent(t *testing.T) {
 	if got := origStatus(); got != beforeStatus {
 		t.Errorf("blocked rerun changed original task status: got %q, want %q", got, beforeStatus)
 	}
+	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, origID); err != nil {
+		t.Fatalf("complete source task before privileged rerun: %v", err)
+	}
 
 	// ALLOW: the HISTORICAL agent's owner may rerun it, and the new task must
 	// target the historical agent — not the issue's current assignee.
 	allowW := httptest.NewRecorder()
-	allowReq := withURLParam(newRequestAs(ownerID, "POST", "/api/issues/"+issueID+"/rerun", map[string]any{"task_id": origID}), "id", issueID)
+	allowReq := withURLParam(newRequestAs(ownerID, "POST", "/api/issues/"+issueID+"/rerun", map[string]any{"task_id": origID, "delivery_intent": "publish"}), "id", issueID)
 	testHandler.RerunIssue(allowW, allowReq)
 	if allowW.Code != http.StatusAccepted {
 		t.Fatalf("RerunIssue as historical agent owner: expected 202, got %d: %s", allowW.Code, allowW.Body.String())
@@ -280,5 +283,12 @@ func TestRerunIssue_PrivateHistoricalAgent(t *testing.T) {
 	}
 	if reran.ID == origID {
 		t.Errorf("expected a new task id, got the original %q", origID)
+	}
+	var deliveryIntent string
+	if err := testPool.QueryRow(ctx, `SELECT context->>'delivery_intent' FROM agent_task_queue WHERE id = $1`, reran.ID).Scan(&deliveryIntent); err != nil {
+		t.Fatalf("read rerun delivery intent: %v", err)
+	}
+	if deliveryIntent != "publish" {
+		t.Errorf("delivery_intent = %q, want publish", deliveryIntent)
 	}
 }
