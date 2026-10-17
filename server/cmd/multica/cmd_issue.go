@@ -700,6 +700,7 @@ func init() {
 
 	// issue rerun
 	issueRerunCmd.Flags().String("output", "json", "Output format: table or json")
+	issueRerunCmd.Flags().String("delivery-intent", "", "Task-scoped delivery intent: none, artifact, or publish")
 	// issue cancel-task
 	issueCancelTaskCmd.Flags().String("output", "json", "Output format: table or json")
 	issueCancelTaskCmd.Flags().String("issue", "", "Issue ID/key to scope short run ID prefix resolution")
@@ -2952,8 +2953,13 @@ func runIssueRerun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve issue: %w", err)
 	}
 
+	deliveryIntent, _ := cmd.Flags().GetString("delivery-intent")
+	body, err := issueRerunPayload(deliveryIntent)
+	if err != nil {
+		return err
+	}
 	var task map[string]any
-	if err := client.PostJSON(ctx, "/api/issues/"+issueRef.ID+"/rerun", map[string]any{}, &task); err != nil {
+	if err := client.PostJSON(ctx, "/api/issues/"+issueRef.ID+"/rerun", body, &task); err != nil {
 		return fmt.Errorf("rerun issue: %w", err)
 	}
 
@@ -2964,6 +2970,20 @@ func runIssueRerun(cmd *cobra.Command, args []string) error {
 	agent := loadActorDisplayLookup(ctx, client).agent(strVal(task, "agent_id"))
 	fmt.Fprintf(os.Stdout, "Re-enqueued run %s on agent %s\n", strVal(task, "id"), agent)
 	return nil
+}
+
+func issueRerunPayload(deliveryIntent string) (map[string]any, error) {
+	body := map[string]any{}
+	if deliveryIntent == "" {
+		return body, nil
+	}
+	switch deliveryIntent {
+	case "none", "artifact", "publish":
+		body["delivery_intent"] = deliveryIntent
+		return body, nil
+	default:
+		return nil, fmt.Errorf("invalid --delivery-intent %q; valid values: none, artifact, publish", deliveryIntent)
+	}
 }
 
 // runIssueCancelTask cancels a single task by ID. It accepts the short ID

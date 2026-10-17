@@ -433,6 +433,19 @@ func (q *Queries) LockWorkspaceForDelete(ctx context.Context, id pgtype.UUID) (p
 	return id_2, err
 }
 
+const lockWorkspaceForTaskRerun = `-- name: LockWorkspaceForTaskRerun :one
+SELECT id FROM workspace WHERE id = $1 FOR KEY SHARE
+`
+
+// First step of the task-owner fence order. Taking this before a squad lock
+// prevents workspace teardown from deadlocking with a task-scoped rerun.
+func (q *Queries) LockWorkspaceForTaskRerun(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockWorkspaceForTaskRerun, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const updateWorkspace = `-- name: UpdateWorkspace :one
 UPDATE workspace SET
     name = COALESCE($2, name),

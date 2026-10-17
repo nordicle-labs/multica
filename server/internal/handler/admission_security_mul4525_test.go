@@ -259,11 +259,14 @@ func TestRerunIssue_PrivateHistoricalAgent(t *testing.T) {
 	if got := origStatus(); got != beforeStatus {
 		t.Errorf("blocked rerun changed original task status: got %q, want %q", got, beforeStatus)
 	}
+	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, origID); err != nil {
+		t.Fatalf("complete source task before privileged rerun: %v", err)
+	}
 
 	// ALLOW: the HISTORICAL agent's owner may rerun it, and the new task must
 	// target the historical agent — not the issue's current assignee.
 	allowW := httptest.NewRecorder()
-	allowReq := withURLParam(newRequestAs(ownerID, "POST", "/api/issues/"+issueID+"/rerun", map[string]any{"task_id": origID}), "id", issueID)
+	allowReq := withURLParam(newRequestAs(ownerID, "POST", "/api/issues/"+issueID+"/rerun", map[string]any{"task_id": origID, "delivery_intent": "publish"}), "id", issueID)
 	testHandler.RerunIssue(allowW, allowReq)
 	if allowW.Code != http.StatusAccepted {
 		t.Fatalf("RerunIssue as historical agent owner: expected 202, got %d: %s", allowW.Code, allowW.Body.String())
@@ -281,4 +284,80 @@ func TestRerunIssue_PrivateHistoricalAgent(t *testing.T) {
 	if reran.ID == origID {
 		t.Errorf("expected a new task id, got the original %q", origID)
 	}
+	var deliveryIntent string
+	if err := testPool.QueryRow(ctx, `SELECT context->>'delivery_intent' FROM agent_task_queue WHERE id = $1`, reran.ID).Scan(&deliveryIntent); err != nil {
+		t.Fatalf("read rerun delivery intent: %v", err)
+	}
+	if deliveryIntent != "publish" {
+		t.Errorf("delivery_intent = %q, want publish", deliveryIntent)
+	}
+}
+
+func TestRerunIssueDeliveryIntentRejectsAgentAndUnauthorizedMember(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID, ownerID, _ := privateAgentTestFixture(t)
+	memberID := seedSecurityTestOwner(t, "rerun-intent-member")
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin agent invocation setup: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE agent SET permission_mode = 'public_to' WHERE id = $1`, agentID); err != nil {
+		t.Fatalf("set agent permission mode: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
+		VALUES ($1, 'member', $2)`, agentID, memberID); err != nil {
+		t.Fatalf("allow member to invoke agent: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit agent invocation setup: %v", err)
+	}
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, creator_type, creator_id, assignee_type, assignee_id, priority)
+		VALUES ($1, 'rerun intent authorization', 'member', $2, 'agent', $3, 'medium') RETURNING id`,
+		testWorkspaceID, ownerID, agentID).Scan(&issueID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+	countTasks := func() int {
+		var count int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, issueID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	t.Run("task token", func(t *testing.T) {
+		req := withURLParam(newRequest("POST", "/api/issues/"+issueID+"/rerun", map[string]any{"delivery_intent": "publish"}), "id", issueID)
+		req.Header.Set("X-Actor-Source", "task_token")
+		req.Header.Set("X-Agent-ID", agentID)
+		w := httptest.NewRecorder()
+		testHandler.RerunIssue(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		}
+		if got := countTasks(); got != 0 {
+			t.Fatalf("blocked task-token rerun created %d tasks", got)
+		}
+	})
+
+	t.Run("member without manage permission", func(t *testing.T) {
+		req := withURLParam(newRequestAs(memberID, "POST", "/api/issues/"+issueID+"/rerun", map[string]any{"delivery_intent": "publish"}), "id", issueID)
+		w := httptest.NewRecorder()
+		testHandler.RerunIssue(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		}
+		if got := countTasks(); got != 0 {
+			t.Fatalf("blocked member rerun created %d tasks", got)
+		}
+	})
 }

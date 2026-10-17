@@ -149,7 +149,8 @@ type RerunIssueRequest struct {
 	// (and reuses its leader/worker role) rather than the issue's current
 	// assignee — so clicking retry on row that belonged to a now-displaced
 	// agent re-fires that same agent, not the new assignee.
-	TaskID string `json:"task_id,omitempty"`
+	TaskID         string  `json:"task_id,omitempty"`
+	DeliveryIntent *string `json:"delivery_intent,omitempty"`
 }
 
 // RerunIssue manually re-enqueues an agent run for the issue. By default it
@@ -198,6 +199,10 @@ func (h *Handler) RerunIssue(w http.ResponseWriter, r *http.Request) {
 	workspaceID := uuidToString(issue.WorkspaceID)
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
 	actorUserID := memberActorUserID(actorType, actorID)
+	if req.DeliveryIntent != nil && actorType != "member" {
+		writeError(w, http.StatusForbidden, "only members can override delivery_intent")
+		return
+	}
 
 	// Re-validate the operator's invoke permission on the resolved target agent
 	// before cancelling / creating anything (MUL-4525). Issue visibility does not
@@ -207,10 +212,24 @@ func (h *Handler) RerunIssue(w http.ResponseWriter, r *http.Request) {
 	canInvoke := func(agent db.Agent) bool {
 		return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
 	}
+	canManage := func(agent db.Agent) bool {
+		member, err := h.Queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+			UserID: actorUserID, WorkspaceID: agent.WorkspaceID,
+		})
+		return err == nil && (roleAllowed(member.Role, "owner", "admin") || agent.OwnerID == actorUserID)
+	}
 
-	task, err := h.TaskService.RerunIssue(r.Context(), issue.ID, sourceTaskID, pgtype.UUID{}, actorUserID, canInvoke)
+	task, err := h.TaskService.RerunIssueWithDeliveryIntent(r.Context(), issue.ID, sourceTaskID, pgtype.UUID{}, actorUserID, req.DeliveryIntent, canInvoke, canManage)
 	if errors.Is(err, service.ErrRerunInvokeNotAllowed) {
 		h.writeDispatchBlocked(w, http.StatusForbidden, ReasonInvocationNotAllowed)
+		return
+	}
+	if errors.Is(err, service.ErrRerunManageNotAllowed) {
+		writeError(w, http.StatusForbidden, "only the agent owner or a workspace owner/admin can override delivery_intent")
+		return
+	}
+	if errors.Is(err, service.ErrRerunPendingSlot) {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	if errors.Is(err, service.ErrIssueInTriage) {

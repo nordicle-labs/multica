@@ -90,6 +90,11 @@ SELECT id FROM workspace WHERE id = $1 FOR UPDATE;
 -- implicit FOR KEY SHARE, which would vanish if that FK is dropped.
 SELECT id FROM workspace WHERE id = $1 FOR KEY SHARE;
 
+-- name: LockWorkspaceForTaskRerun :one
+-- First step of the task-owner fence order. Taking this before a squad lock
+-- prevents workspace teardown from deadlocking with a task-scoped rerun.
+SELECT id FROM workspace WHERE id = $1 FOR KEY SHARE;
+
 -- name: DeleteWorkspace :exec
 -- The channel_* tables (MUL-3515 §4), resource-label junctions, custom issue
 -- property definitions, and quick actions carry NO FK to workspace, so — unlike the CASCADE-backed
