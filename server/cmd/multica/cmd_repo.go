@@ -4,15 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/cli"
+	"github.com/multica-ai/multica/server/internal/daemon"
+	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/spf13/cobra"
 )
 
@@ -59,9 +63,20 @@ var repoCheckoutCmd = &cobra.Command{
 	RunE: runRepoCheckout,
 }
 
+var repoPublishCmd = &cobra.Command{
+	Use:   "publish",
+	Short: "Publish an immutable SHA with a GitHub App credential",
+	Args:  cobra.NoArgs,
+	RunE:  runRepoPublish,
+}
+
 var (
-	repoCheckoutRef   string
-	repoCheckoutFresh bool
+	repoCheckoutRef       string
+	repoCheckoutFresh     bool
+	repoPublishWorkDir    string
+	repoPublishRepository string
+	repoPublishBranch     string
+	repoPublishSHA        string
 )
 
 func init() {
@@ -76,11 +91,37 @@ func init() {
 
 	repoCheckoutCmd.Flags().StringVar(&repoCheckoutRef, "ref", "", "branch, tag, or commit to check out instead of the remote default branch")
 	repoCheckoutCmd.Flags().BoolVar(&repoCheckoutFresh, "fresh", false, "discard an existing checkout's uncommitted changes and untracked files and start over on a new branch from the latest default branch (or --ref); commits stay on the old branch")
+	repoPublishCmd.Flags().StringVar(&repoPublishWorkDir, "workdir", "", "local Git working tree")
+	repoPublishCmd.Flags().StringVar(&repoPublishRepository, "repository", "", "GitHub owner/repository")
+	repoPublishCmd.Flags().StringVar(&repoPublishBranch, "branch", "", "canonical branch to publish")
+	repoPublishCmd.Flags().StringVar(&repoPublishSHA, "sha", "", "immutable commit SHA to publish")
+	_ = repoPublishCmd.MarkFlagRequired("workdir")
+	_ = repoPublishCmd.MarkFlagRequired("repository")
+	_ = repoPublishCmd.MarkFlagRequired("branch")
+	_ = repoPublishCmd.MarkFlagRequired("sha")
 
 	repoCmd.AddCommand(repoListCmd)
 	repoCmd.AddCommand(repoAddCmd)
 	repoCmd.AddCommand(repoRemoveCmd)
 	repoCmd.AddCommand(repoCheckoutCmd)
+	repoCmd.AddCommand(repoPublishCmd)
+}
+
+func runRepoPublish(cmd *cobra.Command, _ []string) error {
+	token := os.Getenv("MULTICA_GITHUB_APP_TOKEN")
+	if token == "" {
+		return errors.New("MULTICA_GITHUB_APP_TOKEN is required")
+	}
+	ctx, cancel := cli.APIContext(cmd.Context())
+	defer cancel()
+	result, err := daemon.PublishGitHubAppSHA(ctx, daemon.GitHubPublication{
+		Repository: repoPublishRepository, WorkDir: repoPublishWorkDir,
+		Branch: repoPublishBranch, SHA: repoPublishSHA,
+	}, token)
+	if err != nil {
+		return err
+	}
+	return cli.PrintJSON(os.Stdout, result)
 }
 
 type workspaceRepo struct {
@@ -340,6 +381,68 @@ func runRepoRemove(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func repoCheckoutWorkDir() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+	hostRoot := strings.TrimSpace(os.Getenv(cli.TaskHostWorkDirEnv))
+	if hostRoot == "" {
+		return cwd, nil
+	}
+	if mapped, err := mapRepoCheckoutWorkDir(hostRoot, hostRoot, cwd); err == nil {
+		return mapped, nil
+	}
+	visibleRoot, err := repoCheckoutVisibleRoot(cwd)
+	if err != nil {
+		return "", fmt.Errorf("map checkout working directory: current directory %q is outside daemon-visible task root %q and no task marker identifies its visible root", cwd, hostRoot)
+	}
+	return mapRepoCheckoutWorkDir(hostRoot, visibleRoot, cwd)
+}
+
+func repoCheckoutVisibleRoot(cwd string) (string, error) {
+	agentID := strings.TrimSpace(os.Getenv("MULTICA_AGENT_ID"))
+	if agentID == "" {
+		return "", errors.New("MULTICA_AGENT_ID is required to identify the task root")
+	}
+	dir := filepath.Clean(cwd)
+	var root string
+	for {
+		data, err := os.ReadFile(filepath.Join(dir, execenv.TaskContextMarkerRelPath))
+		if err == nil {
+			var marker struct {
+				ManagedBy string `json:"managed_by"`
+				AgentID   string `json:"agent_id"`
+			}
+			if json.Unmarshal(data, &marker) == nil && marker.ManagedBy == execenv.TaskContextMarkerManagedBy && marker.AgentID == agentID {
+				// Keep walking: the task root is the outermost matching marker;
+				// repositories inside it may contain their own marker file.
+				root = dir
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	if root == "" {
+		return "", errors.New("no matching task marker")
+	}
+	return root, nil
+}
+
+func mapRepoCheckoutWorkDir(hostRoot, visibleRoot, cwd string) (string, error) {
+	rel, err := filepath.Rel(filepath.Clean(visibleRoot), filepath.Clean(cwd))
+	if err != nil {
+		return "", fmt.Errorf("map checkout working directory: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("map checkout working directory: %q escapes visible task root %q", cwd, visibleRoot)
+	}
+	return filepath.Join(filepath.Clean(hostRoot), rel), nil
+}
+
 func runRepoCheckout(cmd *cobra.Command, args []string) error {
 	repoURL := args[0]
 
@@ -356,10 +459,9 @@ func runRepoCheckout(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("MULTICA_TOKEN not set (repo checkout requires the active task credential)")
 	}
 
-	// Use current working directory as the checkout target.
-	workDir, err := os.Getwd()
+	workDir, err := repoCheckoutWorkDir()
 	if err != nil {
-		return fmt.Errorf("get working directory: %w", err)
+		return err
 	}
 
 	reqBody := map[string]any{

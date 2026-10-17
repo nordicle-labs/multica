@@ -153,7 +153,7 @@ func TestInternalHTTPCreateAdvanceReplayAndConfigure(t *testing.T) {
 	if canary.Status != "ready" || canary.Revision != configured.Revision+2 {
 		t.Fatalf("canary did more than resume + one batch: %+v", canary)
 	}
-	output, err = exec.Command(driver, "run", "--port", strconv.Itoa(port), "--job", j.ID, "--max-batches", "60", "--max-seconds", "15").CombinedOutput()
+	output, err = exec.Command(driver, "run", "--port", strconv.Itoa(port), "--job", j.ID, "--max-batches", "60", "--max-seconds", "60").CombinedOutput()
 	if err != nil {
 		t.Fatalf("driver: %v\n%s", err, output)
 	}

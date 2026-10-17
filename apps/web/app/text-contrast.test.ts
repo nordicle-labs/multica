@@ -166,6 +166,8 @@ const landingCss = () =>
 const scanRoots = ["packages/ui", "packages/views", "apps/web", "apps/desktop/src"];
 const skipDirs = new Set(["node_modules", ".next", "dist", "out", "build", ".turbo"]);
 const sourceExtensions = [".ts", ".tsx", ".css"];
+// Repository-wide structural lint: keep a local, bounded budget as the tree grows.
+const repositoryScanTimeout = 15_000;
 
 /**
  * Colours whose hierarchy is fully expressed by solid tokens, so a fraction of
@@ -515,5 +517,5 @@ describe("text contrast", () => {
       violations,
       `Transparency standing in for a text tone:\n${violations.join("\n")}`,
     ).toEqual([]);
-  });
+  }, repositoryScanTimeout);
 });

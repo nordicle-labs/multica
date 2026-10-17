@@ -26,29 +26,38 @@ const reposDirName = ".repos"
 // gcLoop periodically scans local workspace directories and applies the
 // configured retention policies.
 func (d *Daemon) gcLoop(ctx context.Context) {
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	if resumed, err := d.reconcileRecoveryManifests(ctx, recoveryRoot); err != nil {
+		d.logger.Warn("gc: recovery manifest resume incomplete", "resumed", resumed, "error", err)
+	} else if resumed > 0 {
+		d.logger.Info("gc: recovery manifests resumed before startup collection", "resumed", resumed)
+	}
 	if !d.cfg.GCEnabled {
-		d.logger.Info("gc: disabled")
-		return
-	}
-	d.logger.Info("gc: started",
-		"interval", d.cfg.GCInterval,
-		"ttl", d.cfg.GCTTL,
-		"completed_task_ttl", d.cfg.GCCompletedTaskTTL,
-		"orphan_ttl", d.cfg.GCOrphanTTL,
-		"artifact_ttl", d.cfg.GCArtifactTTL,
-		"repo_ttl", d.cfg.GCRepoTTL,
-		"repo_maintenance_enabled", d.cfg.GCRepoMaintenanceEnabled,
-		"artifact_patterns", d.cfg.GCArtifactPatterns,
-		"managed_artifact_subpaths", execenv.ManagedReclaimableArtifactSubpaths(),
-	)
+		d.logger.Info("gc: collection disabled; delivery recovery remains active")
+	} else {
+		d.logger.Info("gc: started",
+			"interval", d.cfg.GCInterval,
+			"ttl", d.cfg.GCTTL,
+			"completed_task_ttl", d.cfg.GCCompletedTaskTTL,
+			"orphan_ttl", d.cfg.GCOrphanTTL,
+			"artifact_ttl", d.cfg.GCArtifactTTL,
+			"repo_ttl", d.cfg.GCRepoTTL,
+			"repo_maintenance_enabled", d.cfg.GCRepoMaintenanceEnabled,
+			"artifact_patterns", d.cfg.GCArtifactPatterns,
+			"managed_artifact_subpaths", execenv.ManagedReclaimableArtifactSubpaths(),
+		)
 
-	// Run once at startup after a short delay (let the daemon finish initializing).
-	if err := sleepWithContext(ctx, 30*time.Second); err != nil {
-		return
+		// Run once at startup after a short delay (let the daemon finish initializing).
+		if err := sleepWithContext(ctx, 30*time.Second); err != nil {
+			return
+		}
+		d.runGC(ctx)
 	}
-	d.runGC(ctx)
-
-	ticker := time.NewTicker(d.cfg.GCInterval)
+	interval := d.cfg.GCInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -56,9 +65,171 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.runGC(ctx)
+			if resumed, err := d.reconcileRecoveryManifests(ctx, recoveryRoot); err != nil {
+				d.logger.Warn("gc: recovery manifest retry incomplete", "resumed", resumed, "error", err)
+			}
+			if d.cfg.GCEnabled {
+				d.runGC(ctx)
+			}
 		}
 	}
+}
+
+func (d *Daemon) reconcileRecoveryManifests(ctx context.Context, recoveryRoot string) (int, error) {
+	manifests, reconcileErr := execenv.LoadRecoveryManifests(recoveryRoot)
+	resumed := 0
+	now := time.Now()
+	if d.recoveryNow != nil {
+		now = d.recoveryNow()
+	}
+	for _, manifest := range manifests {
+		if manifest.HeadSHA == "" || !execenv.RecoveryRetryReady(manifest, now) {
+			continue
+		}
+		if err := d.reconcileRecoveryManifest(ctx, recoveryRoot, manifest); err != nil {
+			reconcileErr = errors.Join(reconcileErr, err)
+			continue
+		}
+		resumed++
+	}
+	return resumed, reconcileErr
+}
+
+// ReconcileRecoveryManifests resumes durable deliveries from an isolated root.
+func (d *Daemon) ReconcileRecoveryManifests(ctx context.Context, recoveryRoot string) (int, error) {
+	return d.reconcileRecoveryManifests(ctx, recoveryRoot)
+}
+
+func (d *Daemon) reconcileRecoveryManifest(ctx context.Context, recoveryRoot string, manifest execenv.RecoveryManifest) (returnErr error) {
+	release, claimed, err := execenv.ClaimRecoveryPublication(recoveryRoot, manifest.TaskID)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
+	}
+	defer release()
+	defer func() {
+		if returnErr != nil {
+			returnErr = errors.Join(returnErr, execenv.RecordRecoveryFailure(recoveryRoot, manifest.TaskID, returnErr))
+		}
+	}()
+	manifest, exists, err := execenv.ReadRecoveryManifest(recoveryRoot, manifest.TaskID)
+	if err != nil || !exists {
+		return err
+	}
+	bundle := filepath.Join(recoveryRoot, manifest.TaskID, "recovery.bundle")
+	if _, statErr := os.Stat(bundle); errors.Is(statErr, os.ErrNotExist) {
+		if err := execenv.VerifyRecoveryManifest(manifest); err != nil {
+			return err
+		}
+		if _, err := execenv.CreateRecoveryArtifact(manifest.GitRoot, recoveryRoot, manifest.TaskID, manifest.HeadSHA, d.logger); err != nil {
+			return err
+		}
+	} else if statErr != nil {
+		return statErr
+	}
+	if manifest.DeliveryIntent != "artifact" && manifest.DeliveryIntent != "publish" {
+		return fmt.Errorf("task %s recovery has invalid delivery intent %q", manifest.TaskID, manifest.DeliveryIntent)
+	}
+	if manifest.DeliveryIntent == "publish" {
+		if manifest.RuntimeID == "" {
+			return fmt.Errorf("task %s recovery publication has no runtime identity", manifest.TaskID)
+		}
+		repository := manifest.Repository
+		if repository == "" {
+			repository, err = githubRepositoryForWorkDir(manifest.GitRoot)
+			if err != nil {
+				return fmt.Errorf("resolve recovery repository for task %s: %w", manifest.TaskID, err)
+			}
+			manifest.Repository = repository
+			if err := execenv.WriteRecoveryManifest(recoveryRoot, manifest); err != nil {
+				return err
+			}
+		}
+		publicationReady := manifest.PublicationPhase == execenv.PublicationPRReadBack || manifest.PublicationPhase == execenv.PublicationCredentialRevoked
+		claim, err := d.client.ClaimGitHubPublicationRecovery(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, repository, publicationReady)
+		if err != nil {
+			var deferred *publicationRecoveryDeferredError
+			if errors.As(err, &deferred) {
+				return execenv.RecordRecoveryDeferral(recoveryRoot, manifest.TaskID, deferred.RetryAt)
+			}
+			var blocked *publicationRecoveryBlockedError
+			if errors.As(err, &blocked) {
+				return execenv.RecordRecoveryBlock(recoveryRoot, manifest.TaskID, blocked)
+			}
+			return fmt.Errorf("acquire recovery publication credential for task %s: %w", manifest.TaskID, err)
+		}
+		if claim.Completed {
+			return execenv.RemoveRecoveryManifest(recoveryRoot, manifest.TaskID)
+		}
+		if claim.ClaimID == "" {
+			return fmt.Errorf("task %s recovery publication returned no claim", manifest.TaskID)
+		}
+		if claim.RevocationConfirmed {
+			pullRequest := githubPullRequest{Number: manifest.PullRequestNumber, URL: manifest.PullRequestURL, HeadSHA: manifest.RemoteSHA}
+			if err := d.client.CompleteGitHubPublicationRecovery(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, repository, claim.ClaimID, claim.CredentialHandle, manifest.RemoteSHA, pullRequest); err != nil {
+				return fmt.Errorf("complete recovered task %s publication claim: %w", manifest.TaskID, err)
+			}
+			return execenv.RemoveRecoveryManifest(recoveryRoot, manifest.TaskID)
+		}
+		session, err := startGitHubCredentialSession(claim.Credentials)
+		if err != nil {
+			return err
+		}
+		if session == nil {
+			return fmt.Errorf("task %s recovery publication returned no credential", manifest.TaskID)
+		}
+		if _, err := d.client.UpdateGitHubPublicationCredential(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, claim.ClaimID, claim.CredentialHandle, "ack"); err != nil {
+			closeErr := session.close(context.Background())
+			action := "revoked"
+			if closeErr != nil {
+				action = "revoke"
+			}
+			_, _ = d.client.UpdateGitHubPublicationCredential(context.Background(), d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, claim.ClaimID, claim.CredentialHandle, action)
+			return errors.Join(fmt.Errorf("acknowledge recovered task %s credential: %w", manifest.TaskID, err), closeErr)
+		}
+		finishCredential := func() error {
+			closeErr := session.close(context.Background())
+			action := "revoked"
+			if closeErr != nil {
+				action = "revoke"
+			}
+			revocationConfirmed, reportErr := d.client.UpdateGitHubPublicationCredential(context.Background(), d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, claim.ClaimID, claim.CredentialHandle, action)
+			if closeErr != nil && (!revocationConfirmed || reportErr != nil) {
+				return errors.Join(fmt.Errorf("revoke recovered task %s credential: %w", manifest.TaskID, closeErr), reportErr)
+			}
+			if reportErr != nil {
+				return fmt.Errorf("record recovered task %s credential revocation: %w", manifest.TaskID, reportErr)
+			}
+			return nil
+		}
+		publicationRepo, err := execenv.MaterializeRecoveryRepository(recoveryRoot, manifest)
+		if err != nil {
+			return errors.Join(fmt.Errorf("materialize recovery bundle for task %s: %w", manifest.TaskID, err), finishCredential())
+		}
+		if err := execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, execenv.PublicationCredentialMinted, "", 0, ""); err != nil {
+			return errors.Join(err, finishCredential())
+		}
+		remoteSHA, pullRequest, publishErr := session.finalizePublicationWithProgress(ctx, publicationRepo, manifest.CanonicalBranch, manifest.HeadSHA,
+			func(phase, remoteSHA string, pr githubPullRequest) error {
+				return execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, phase, remoteSHA, pr.Number, pr.URL)
+			})
+		revocationErr := finishCredential()
+		if publishErr != nil || revocationErr != nil {
+			if publishErr != nil {
+				publishErr = fmt.Errorf("publish recovered task %s: %w", manifest.TaskID, publishErr)
+			}
+			return errors.Join(publishErr, revocationErr)
+		}
+		if err := execenv.AdvanceRecoveryManifest(recoveryRoot, manifest.TaskID, execenv.PublicationCredentialRevoked, remoteSHA, pullRequest.Number, pullRequest.URL); err != nil {
+			return err
+		}
+		if err := d.client.CompleteGitHubPublicationRecovery(ctx, d.cfg.DaemonID, manifest.RuntimeID, manifest.TaskID, repository, claim.ClaimID, claim.CredentialHandle, remoteSHA, pullRequest); err != nil {
+			return fmt.Errorf("complete recovered task %s publication claim: %w", manifest.TaskID, err)
+		}
+	}
+	return execenv.RemoveRecoveryManifest(recoveryRoot, manifest.TaskID)
 }
 
 // gcStats accumulates byte counts and per-pattern hit counts for one GC cycle.

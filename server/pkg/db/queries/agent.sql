@@ -330,11 +330,13 @@ SELECT
     COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE),
     sqlc.narg(handoff_note),
     sqlc.narg(squad_id),
-    CASE
-        WHEN COALESCE(sqlc.narg('head_sha')::text, '') <> ''
-        THEN jsonb_build_object('head_sha', sqlc.narg('head_sha')::text)
-        ELSE NULL
-    END,
+    NULLIF(
+        COALESCE(sqlc.narg('context')::jsonb, '{}'::jsonb) ||
+        jsonb_strip_nulls(jsonb_build_object(
+            'head_sha', NULLIF(COALESCE(sqlc.narg('head_sha')::text, ''), '')
+        )),
+        '{}'::jsonb
+    ),
     sqlc.narg(originator_user_id),
     sqlc.narg(accountable_user_id),
     sqlc.narg(runtime_mcp_overlay),
@@ -373,7 +375,7 @@ SELECT
     COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE),
     sqlc.narg(handoff_note),
     sqlc.narg(squad_id),
-    jsonb_strip_nulls(jsonb_build_object(
+    COALESCE(sqlc.narg('context')::jsonb, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
         'head_sha', NULLIF(COALESCE(sqlc.narg('head_sha')::text, ''), ''),
         'channel_issue_media_pending', TRUE
     )),
@@ -2436,16 +2438,21 @@ WHERE atq.runtime_id = ANY(@runtime_ids::uuid[])
   )
 ORDER BY atq.priority DESC, atq.created_at ASC;
 
--- name: NextDeferredTaskFireAtForRuntimes :one
+-- name: NextDeferredTaskDelayMillisForRuntimes :one
 -- Returns the next future deferred task for a daemon's authorized runtime set,
 -- or an eligible task that crossed fire_at during this claim. Overdue tasks
 -- whose runtime is offline/stale or that are blocked by an existing issue+agent
 -- occupant are omitted so they cannot cause a tight poll loop. Keep both fences
 -- in sync with PromoteDueDeferredTasksForRuntimes: a task that cannot be
--- promoted must not advertise an immediate follow-up claim. The response
--- converts the timestamp to a relative delay, avoiding any dependency on
--- daemon/server clock synchronization.
-SELECT MIN(fire_at)::timestamptz
+-- promoted must not advertise an immediate follow-up claim. PostgreSQL computes
+-- the relative delay so the protocol never compares database and host clocks;
+-- -1 preserves the handler's existing "no deferred task" omitted-field shape.
+SELECT COALESCE(MIN(
+  GREATEST(
+    1000::bigint,
+    CEIL(EXTRACT(EPOCH FROM (fire_at - clock_timestamp())) * 1000)::bigint
+  )
+), -1)::bigint
 FROM agent_task_queue t
 WHERE t.runtime_id = ANY(@runtime_ids::uuid[])
   AND t.status = 'deferred'

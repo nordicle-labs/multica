@@ -36,7 +36,7 @@ func createDaemonTestRepo(t *testing.T) string {
 		{"-C", dir, "commit", "--allow-empty", "-m", "initial"},
 	} {
 		cmd := exec.Command("git", args...)
-		cmd.Env = append(os.Environ(),
+		cmd.Env = isolatedGitTestEnv(
 			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
 			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
 		)
@@ -45,6 +45,22 @@ func createDaemonTestRepo(t *testing.T) string {
 		}
 	}
 	return dir
+}
+
+func isolatedGitTestEnv(overrides ...string) []string {
+	blocked := map[string]bool{"GIT_CONFIG_COUNT": true}
+	for _, override := range overrides {
+		blocked[strings.SplitN(override, "=", 2)[0]] = true
+	}
+	env := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, value := range os.Environ() {
+		key := strings.SplitN(value, "=", 2)[0]
+		if blocked[key] || strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		env = append(env, value)
+	}
+	return append(env, overrides...)
 }
 
 func TestNormalizeServerBaseURL(t *testing.T) {
@@ -547,11 +563,12 @@ func TestTaskMulticaEnvironmentIncludesPrivateConfigRoot(t *testing.T) {
 		AgentID:     "agent-test",
 		WorkspaceID: "workspace-test",
 	}
-	env := taskMulticaEnvironment(task, "agent-name", fakeToken, taskRoot, workspacesRoot, "https://task.example", 19514, 3, "/task/tmp")
+	env := taskMulticaEnvironment(task, "agent-name", fakeToken, taskRoot, workspacesRoot, "/host/task/workdir", "https://task.example", 19514, 3, "/task/tmp")
 
 	want := map[string]string{
 		"MULTICA_TOKEN":                fakeToken,
 		"MULTICA_TASK_CONFIG_ROOT":     taskRoot,
+		"MULTICA_TASK_HOST_WORKDIR":    "/host/task/workdir",
 		"MULTICA_TASK_WORKSPACES_ROOT": workspacesRoot,
 		"MULTICA_SERVER_URL":           "https://task.example",
 		"MULTICA_DAEMON_PORT":          "19514",

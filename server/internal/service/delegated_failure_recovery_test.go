@@ -63,6 +63,38 @@ func TestPendingDelegatedFailureSweepDoesNotStarveOtherWorkspaces(t *testing.T) 
 	}
 }
 
+func TestDelegatedFailureRecoveryPersistsCoordinatorDeliveryIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name, config, want string
+	}{
+		{"none", `{}`, "none"},
+		{"artifact", `{"delivery_intent":"artifact"}`, "artifact"},
+		{"publish", `{"delivery_intent":"publish"}`, "publish"},
+		{"legacy", `{"delivery_mode":"publish"}`, "none"},
+		{"unknown", `{"delivery_intent":"provider-value"}`, "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f, svc := seedDelegatedFailureFixture(t)
+			fx := dbfx.New(f.pool, f.workspaceID, f.userID)
+			fx.Exec(t, `UPDATE agent SET runtime_config=$2::jsonb WHERE id=$1`, f.coordinator, tc.config)
+			failedID := f.insertWorkerTask(t, "failed", "comment", 1, 2)
+			fx.Exec(t, `UPDATE agent_task_queue SET context='{"delivery_intent":"publish"}', result='{"delivery_intent":"publish"}' WHERE id=$1`, failedID)
+			if _, _, err := svc.ensureDelegatedFailureRecoveryComment(ctx, failedID); err != nil {
+				t.Fatal(err)
+			}
+			if result, err := svc.RecoverPendingDelegatedFailures(ctx, 100); err != nil || result.Replayed != 1 {
+				t.Fatalf("recovery sweep = %+v, %v", result, err)
+			}
+			var contextJSON []byte
+			if err := f.pool.QueryRow(ctx, `SELECT context FROM agent_task_queue WHERE trigger_evidence_kind='delegated_failure' AND trigger_evidence_ref_id=$1`, failedID).Scan(&contextJSON); err != nil {
+				t.Fatal(err)
+			}
+			assertDeliveryIntent(t, contextJSON, tc.want)
+		})
+	}
+}
+
 func TestDelegatedFailureRecoveryStatusEligibility(t *testing.T) {
 	for _, seeded := range []bool{true, false} {
 		name := "seeded_catalog"

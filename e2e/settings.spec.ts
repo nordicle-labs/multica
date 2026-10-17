@@ -1,6 +1,26 @@
 import { test, expect } from "@playwright/test";
 import { loginAsDefault, waitForPageText } from "./helpers";
 
+async function enableComposioMcpApps(page: import("@playwright/test").Page) {
+  await page.route("**/api/config", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as {
+      feature_flags?: Record<string, boolean>;
+      [key: string]: unknown;
+    };
+    await route.fulfill({
+      response,
+      json: {
+        ...body,
+        feature_flags: {
+          ...body.feature_flags,
+          composio_mcp_apps: true,
+        },
+      },
+    });
+  });
+}
+
 test.describe("Settings", () => {
   test("updating workspace name reflects in sidebar immediately", async ({
     page,
@@ -14,28 +34,36 @@ test.describe("Settings", () => {
     await page.goto(`/${workspaceSlug}/settings?tab=workspace`, { waitUntil: "domcontentloaded" });
     await waitForPageText(page, "General");
 
-    // Change workspace name
-    const nameInput = page
-      .locator('input[type="text"]')
-      .first();
-    await nameInput.clear();
+    const nameInput = page.getByRole("textbox", { name: "Name", exact: true });
+    const saveName = async (name: string) => {
+      if ((await nameInput.inputValue()) === name) return;
+      const saved = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return (
+          response.request().method() === "PATCH" &&
+          /\/api\/workspaces\/[^/]+$/.test(url.pathname) &&
+          response.ok()
+        );
+      });
+      await nameInput.fill(name);
+      await nameInput.blur();
+      await saved;
+      await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+    };
+
     const newName = "Renamed WS " + Date.now();
-    await nameInput.fill(newName);
-
-    // Save
-    await page.locator("button", { hasText: "Save" }).click();
-
-    await expect(page.getByText("Workspace settings saved").first()).toBeVisible({ timeout: 5000 });
-
-    // Sidebar should reflect the new name WITHOUT page refresh
-    await expect(page.getByRole("button", { name: new RegExp(newName) }).first()).toBeVisible();
-
-    // Restore original name so other tests aren't affected
-    await nameInput.clear();
-    await nameInput.fill(originalName.trim());
-    await page.locator("button", { hasText: "Save" }).click();
-    await expect(page.getByText("Workspace settings saved").first()).toBeVisible({ timeout: 5000 });
-    await expect(page.getByRole("button", { name: new RegExp(originalName) }).first()).toBeVisible();
+    try {
+      await saveName(newName);
+      await expect(
+        page.getByRole("button", { name: new RegExp(newName) }).first(),
+      ).toBeVisible();
+    } finally {
+      // Restore the shared workspace even when an assertion above fails.
+      await saveName(originalName.trim());
+      await expect(
+        page.getByRole("button", { name: new RegExp(originalName) }).first(),
+      ).toBeVisible();
+    }
   });
 
   // Composio connect flow, fully mocked at the network boundary so it runs
@@ -46,6 +74,7 @@ test.describe("Settings", () => {
   test("connecting a Composio toolkit shows a toast and refreshes the list", async ({
     page,
   }) => {
+    await enableComposioMcpApps(page);
     const workspaceSlug = await loginAsDefault(page);
     const settingsUrl = `/${workspaceSlug}/settings?tab=integrations&integration=composio`;
 
@@ -101,13 +130,15 @@ test.describe("Settings", () => {
     });
 
     await page.goto(settingsUrl, { waitUntil: "domcontentloaded" });
-    await waitForPageText(page, "Composio");
+    await waitForPageText(page, "Connected apps");
 
     // Notion starts disconnected → click Connect.
     await page.getByRole("button", { name: /^Connect$/ }).first().click();
 
     // Success toast from the simulated callback redirect.
-    await expect(page.getByText("Connected").first()).toBeVisible({ timeout: 10000 });
+    await expect(
+      page.locator("[data-sonner-toast]").getByText("Connected", { exact: true }),
+    ).toBeVisible({ timeout: 10000 });
 
     // List refreshed without a manual reload: the Notion card now offers
     // Disconnect, and the one-shot ?connected param has been stripped.

@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // The claim path resolves project context from a SOFT reference: issue.project_id,
@@ -87,12 +88,101 @@ func assertNoForeignContext(t *testing.T, body string, extra ...string) {
 }
 
 type claimProjectFields struct {
-	WorkspaceID        string                `json:"workspace_id"`
-	Repos              []RepoData            `json:"repos"`
-	ProjectID          string                `json:"project_id"`
-	ProjectTitle       string                `json:"project_title"`
-	ProjectDescription string                `json:"project_description"`
-	ProjectResources   []ProjectResourceData `json:"project_resources"`
+	GitHubCredentialAck string                `json:"github_credential_ack"`
+	WorkspaceID         string                `json:"workspace_id"`
+	Repos               []RepoData            `json:"repos"`
+	ProjectID           string                `json:"project_id"`
+	ProjectTitle        string                `json:"project_title"`
+	ProjectDescription  string                `json:"project_description"`
+	ProjectResources    []ProjectResourceData `json:"project_resources"`
+}
+
+func TestClaimTask_ExistingProjectWithoutGitHubRepoDoesNotUseWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "https://github.com/first-owner/first-repo"},
+		{"url": "https://github.com/second-owner/second-repo"},
+	})
+	projectID := dbfx.Project(t, "Local-only project")
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id":    projectID,
+		"workspace_id":  testWorkspaceID,
+		"resource_type": "local_directory",
+		"resource_ref":  `{"daemon_id":"local-daemon","local_path":"/srv/local-only","execution_mode":"in_place"}`,
+		"position":      0,
+	})
+
+	var agentID, runtimeID string
+	dbfx.QueryRow(t,
+		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
+		testWorkspaceID,
+	).Scan(&agentID, &runtimeID)
+	issueID := dbfx.Issue(t, "issue in a local-only project", testutil.Cols{
+		"project_id": projectID,
+		"priority":   "medium",
+		"number":     88100,
+	})
+	dbfx.Task(t, agentID, testutil.Cols{"runtime_id": runtimeID, "issue_id": issueID})
+
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
+		testWorkspaceID, "test-claim-local-only-project")
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	req = withURLParam(req, "runtimeId", runtimeID)
+	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
+
+	var resp struct {
+		Task *claimProjectFields `json:"task"`
+	}
+	w.JSON(&resp)
+	if resp.Task == nil {
+		t.Fatal("expected task in response")
+	}
+	if resp.Task.ProjectID != projectID || len(resp.Task.ProjectResources) != 1 {
+		t.Fatalf("project context = %+v, want local-only project %s", resp.Task, projectID)
+	}
+	if len(resp.Task.Repos) != 0 {
+		t.Fatalf("repos = %+v, want none for an existing project without github_repo resources", resp.Task.Repos)
+	}
+	if resp.Task.GitHubCredentialAck != "" {
+		t.Fatalf("github credential plan = %q, want none", resp.Task.GitHubCredentialAck)
+	}
+}
+
+func TestResolveClaimProjectContext_NoProjectUsesWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setHandlerTestWorkspaceRepos(t, []map[string]string{{"url": localFallbackRepoURL}})
+
+	got, err := testHandler.resolveClaimProjectContext(context.Background(), db.Project{}.ID, parseUUID(testWorkspaceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 1 || got.Repos[0].URL != localFallbackRepoURL {
+		t.Fatalf("repos = %+v, want workspace fallback", got.Repos)
+	}
+}
+
+func TestResolveClaimProjectContext_StaleProjectUsesWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	setHandlerTestWorkspaceRepos(t, []map[string]string{{"url": localFallbackRepoURL}})
+
+	got, err := testHandler.resolveClaimProjectContext(
+		context.Background(),
+		parseUUID("00000000-0000-0000-0000-000000000001"),
+		parseUUID(testWorkspaceID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 1 || got.Repos[0].URL != localFallbackRepoURL {
+		t.Fatalf("repos = %+v, want workspace fallback", got.Repos)
+	}
 }
 
 // An issue whose project_id points at another workspace's project must degrade
@@ -107,6 +197,7 @@ func TestClaimTask_IssueProjectInForeignWorkspace_DegradesToWorkspaceRepos(t *te
 	setHandlerTestWorkspaceRepos(t, []map[string]string{
 		{"url": localFallbackRepoURL, "description": "local"},
 	})
+	setupGitHubClaimTestBroker(t, localFallbackRepoURL)
 	_, foreignProjectID := foreignWorkspaceWithProject(t, "foreign-issue-project-ws", "FIP")
 
 	var agentID, runtimeID string
@@ -127,6 +218,7 @@ func TestClaimTask_IssueProjectInForeignWorkspace_DegradesToWorkspaceRepos(t *te
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-claim-foreign-issue-project")
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -148,6 +240,7 @@ func TestClaimTask_IssueProjectInForeignWorkspace_DegradesToWorkspaceRepos(t *te
 	if len(resp.Task.Repos) != 1 || resp.Task.Repos[0].URL != localFallbackRepoURL {
 		t.Fatalf("repos = %+v, want only the local workspace fallback", resp.Task.Repos)
 	}
+	completeGitHubClaimForTest(t, resp.Task.GitHubCredentialAck)
 }
 
 // The quick-create branch resolves its project from the task context JSONB
@@ -163,15 +256,17 @@ func TestClaimTask_QuickCreateProjectInForeignWorkspace_DegradesToWorkspaceRepos
 	setHandlerTestWorkspaceRepos(t, []map[string]string{
 		{"url": localFallbackRepoURL, "description": "local"},
 	})
+	setupGitHubClaimTestBroker(t, localFallbackRepoURL)
 	_, foreignProjectID := foreignWorkspaceWithProject(t, "foreign-qc-project-ws", "FQP")
 
 	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
 	quickContext, _ := json.Marshal(map[string]any{
-		"type":         "quick_create",
-		"prompt":       "create a follow-up issue",
-		"requester_id": testUserID,
-		"workspace_id": testWorkspaceID,
-		"project_id":   foreignProjectID,
+		"type":            "quick_create",
+		"prompt":          "create a follow-up issue",
+		"requester_id":    testUserID,
+		"workspace_id":    testWorkspaceID,
+		"project_id":      foreignProjectID,
+		"delivery_intent": "none",
 	})
 	dbfx.Exec(t, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, status, priority, context)
@@ -180,6 +275,7 @@ func TestClaimTask_QuickCreateProjectInForeignWorkspace_DegradesToWorkspaceRepos
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, daemonID)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -201,6 +297,7 @@ func TestClaimTask_QuickCreateProjectInForeignWorkspace_DegradesToWorkspaceRepos
 	if len(resp.Task.Repos) != 1 || resp.Task.Repos[0].URL != localFallbackRepoURL {
 		t.Fatalf("quick-create repos = %+v, want only the local workspace fallback", resp.Task.Repos)
 	}
+	completeGitHubClaimForTest(t, resp.Task.GitHubCredentialAck)
 }
 
 // A project_resource row carries its own workspace_id, so a resource can
@@ -216,6 +313,7 @@ func TestClaimTask_ProjectResourceFromForeignWorkspace_IsFilteredOut(t *testing.
 	foreignWorkspaceID, _ := foreignWorkspaceWithProject(t, "foreign-resource-ws", "FRW")
 
 	const localRepoURL = "https://github.com/example/local-project-repo"
+	setupGitHubClaimTestBroker(t, localRepoURL)
 	projectID := dbfx.Project(t, "Project with a mismatched resource row")
 	dbfx.Insert(t, "project_resource", testutil.Cols{
 		"project_id":    projectID,
@@ -259,6 +357,7 @@ func TestClaimTask_ProjectResourceFromForeignWorkspace_IsFilteredOut(t *testing.
 
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-claim-foreign-resource")
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
@@ -269,6 +368,7 @@ func TestClaimTask_ProjectResourceFromForeignWorkspace_IsFilteredOut(t *testing.
 	if resp.Task == nil {
 		t.Fatal("expected task in response")
 	}
+	completeGitHubClaimForTest(t, resp.Task.GitHubCredentialAck)
 	assertNoForeignContext(t, w.Text())
 
 	if resp.Task.ProjectID != projectID {

@@ -20,25 +20,40 @@ set +a
 
 # shellcheck disable=SC1091
 . scripts/local-env.sh
+# shellcheck disable=SC1091
+. scripts/check-e2e-process.sh
 
 BACKEND_PID=""
 FRONTEND_PID=""
 STARTED_BACKEND=false
 STARTED_FRONTEND=false
 EXIT_CODE=0
+NEXT_ENV_FILE="apps/web/next-env.d.ts"
+NEXT_ENV_BACKUP=""
+NEXT_ENV_EXISTED=false
 
 # --------------------------------------------------------------------------
 # Cleanup: kill only services this script started
 # --------------------------------------------------------------------------
 cleanup() {
+  if [ -n "$NEXT_ENV_BACKUP" ]; then
+    if [ "$NEXT_ENV_EXISTED" = true ]; then
+      cp "$NEXT_ENV_BACKUP" "$NEXT_ENV_FILE"
+    else
+      rm -f "$NEXT_ENV_FILE"
+    fi
+    rm -f "$NEXT_ENV_BACKUP"
+  fi
   echo ""
   if [ "$STARTED_BACKEND" = true ] && [ -n "$BACKEND_PID" ]; then
-    kill "$BACKEND_PID" 2>/dev/null && wait "$BACKEND_PID" 2>/dev/null || true
-    echo "    Stopped backend (PID $BACKEND_PID)"
+    terminate_process_tree "$BACKEND_PID" TERM
+    wait "$BACKEND_PID" 2>/dev/null || true
+    echo "    Stopped backend tree (root PID $BACKEND_PID)"
   fi
   if [ "$STARTED_FRONTEND" = true ] && [ -n "$FRONTEND_PID" ]; then
-    kill "$FRONTEND_PID" 2>/dev/null && wait "$FRONTEND_PID" 2>/dev/null || true
-    echo "    Stopped frontend (PID $FRONTEND_PID)"
+    terminate_process_tree "$FRONTEND_PID" TERM
+    wait "$FRONTEND_PID" 2>/dev/null || true
+    echo "    Stopped frontend tree (root PID $FRONTEND_PID)"
   fi
   echo ""
   if [ "$EXIT_CODE" -eq 0 ]; then
@@ -68,6 +83,12 @@ wait_for_port() {
   done
   echo "    $name ready (${elapsed}s)"
 }
+
+echo "==> Checking E2E service ports..."
+bash scripts/check-e2e-preflight.sh || { EXIT_CODE=1; exit 1; }
+bash scripts/check-e2e-preflight.test.sh || { EXIT_CODE=1; exit 1; }
+bash scripts/check-e2e-process.test.sh || { EXIT_CODE=1; exit 1; }
+bash scripts/check-e2e-frontend-mode.test.sh || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
 # Step 0: Ensure DB
@@ -102,30 +123,33 @@ echo "==> Running database migrations..."
 bash scripts/test-go.sh || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
-# Step 4: Start services for E2E (only if not already running)
+# Step 4: Build frontend and start services for E2E
 # --------------------------------------------------------------------------
 echo ""
-echo "==> [4/5] Starting services for E2E..."
+echo "==> [4/5] Building frontend and starting services for E2E..."
 
-if curl -sf "http://localhost:${PORT}/health" > /dev/null 2>&1; then
-  echo "    Backend already running on :$PORT"
-else
-  echo "    Starting backend..."
-  (cd server && go run ./cmd/server) > /tmp/multica-check-backend.log 2>&1 &
-  BACKEND_PID=$!
-  STARTED_BACKEND=true
-  wait_for_port "$PORT" "Backend" 90 "/health"
+echo "    Building frontend production bundle..."
+# Next rewrites this tracked generated declaration between dev and production
+# modes. Preserve the caller's exact pre-gate state so verification is
+# read-only even when the build succeeds or exits early.
+NEXT_ENV_BACKUP="$(mktemp "${TMPDIR:-/tmp}/multica-next-env.XXXXXX")"
+if [ -f "$NEXT_ENV_FILE" ]; then
+  NEXT_ENV_EXISTED=true
+  cp "$NEXT_ENV_FILE" "$NEXT_ENV_BACKUP"
 fi
+STANDALONE=false pnpm --filter @multica/web build || { EXIT_CODE=1; exit 1; }
 
-if curl -sf "http://localhost:${FRONTEND_PORT}" > /dev/null 2>&1; then
-  echo "    Frontend already running on :$FRONTEND_PORT"
-else
-  echo "    Starting frontend..."
-  pnpm dev:web > /tmp/multica-check-frontend.log 2>&1 &
-  FRONTEND_PID=$!
-  STARTED_FRONTEND=true
-  wait_for_port "$FRONTEND_PORT" "Frontend" 120 "/"
-fi
+echo "    Starting backend..."
+(cd server && exec go run ./cmd/server) > /tmp/multica-check-backend.log 2>&1 &
+BACKEND_PID=$!
+STARTED_BACKEND=true
+wait_for_port "$PORT" "Backend" 90 "/health"
+
+echo "    Starting frontend..."
+(cd apps/web && exec ./node_modules/.bin/next start --port "$FRONTEND_PORT") > /tmp/multica-check-frontend.log 2>&1 &
+FRONTEND_PID=$!
+STARTED_FRONTEND=true
+wait_for_port "$FRONTEND_PORT" "Frontend" 120 "/"
 
 # --------------------------------------------------------------------------
 # Step 5: E2E tests (Playwright)

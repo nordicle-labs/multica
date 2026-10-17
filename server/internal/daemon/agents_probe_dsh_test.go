@@ -59,6 +59,7 @@ func TestProbeDshMulticaProfile(t *testing.T) {
 		body     string
 		manifest bool
 		want     dshProbeVerdict
+		timeout  time.Duration
 	}{
 		{
 			name: "compatible", body: dshProbeOKFrame, manifest: true, want: dshProbeOK,
@@ -79,7 +80,7 @@ func TestProbeDshMulticaProfile(t *testing.T) {
 		},
 		{
 			name: "manifest present but the probe times out",
-			body: `exec sleep 30`, manifest: true, want: dshProbeUnavailable,
+			body: `exec sleep 30`, manifest: true, want: dshProbeUnavailable, timeout: 300 * time.Millisecond,
 		},
 		{
 			// The case the whole classification turns on. Asked for a profile
@@ -87,7 +88,7 @@ func TestProbeDshMulticaProfile(t *testing.T) {
 			// nothing. Calling that transient made a missing profile
 			// undetectable on the one host the automatic install exists for.
 			name: "probe hangs with no manifest",
-			body: `exec sleep 30`, want: dshProbeMissingProfile,
+			body: `exec sleep 30`, want: dshProbeMissingProfile, timeout: 300 * time.Millisecond,
 		},
 		{
 			name: "exit 0 printing nothing, no manifest",
@@ -120,17 +121,13 @@ func TestProbeDshMulticaProfile(t *testing.T) {
 			manifest: true, want: dshProbeIncompatible,
 		},
 	}
-	origTimeout := dshProbeTimeout
-	t.Cleanup(func() { dshProbeTimeout = origTimeout })
-	dshProbeTimeout = 2 * time.Second
-
 	// A cancelled round says nothing about the profile, whatever the manifest
 	// says: the probe never got to finish on its own terms.
 	t.Run("a cancelled round stays transient", func(t *testing.T) {
 		path := dshProbeFixture(t, `exec sleep 30`, false)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if got := probeDshMulticaProfile(ctx, path); got != dshProbeUnavailable {
+		if got := probeDshMulticaProfileWithin(ctx, path, 15*time.Second); got != dshProbeUnavailable {
 			t.Fatalf("probeDshMulticaProfile() = %v, want %v", got, dshProbeUnavailable)
 		}
 	})
@@ -138,7 +135,11 @@ func TestProbeDshMulticaProfile(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			path := dshProbeFixture(t, tc.body, tc.manifest)
-			if got := probeDshMulticaProfile(context.Background(), path); got != tc.want {
+			timeout := tc.timeout
+			if timeout == 0 {
+				timeout = 15 * time.Second
+			}
+			if got := probeDshMulticaProfileWithin(context.Background(), path, timeout); got != tc.want {
 				t.Fatalf("probeDshMulticaProfile() = %v, want %v", got, tc.want)
 			}
 		})

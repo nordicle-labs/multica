@@ -3,11 +3,46 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 )
+
+type checkedJSONWriteFailure struct {
+	header   http.Header
+	writeErr error
+	flushErr error
+}
+
+func (w *checkedJSONWriteFailure) Header() http.Header { return w.header }
+func (*checkedJSONWriteFailure) WriteHeader(int)       {}
+func (w *checkedJSONWriteFailure) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return len(p), nil
+}
+func (w *checkedJSONWriteFailure) FlushError() error { return w.flushErr }
+
+func TestWriteJSONAndFlushReturnsSerializationWriteAndFlushErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		w    *checkedJSONWriteFailure
+		v    any
+	}{
+		{name: "serialization", w: &checkedJSONWriteFailure{header: make(http.Header)}, v: make(chan int)},
+		{name: "write", w: &checkedJSONWriteFailure{header: make(http.Header), writeErr: errors.New("write failed")}, v: map[string]string{"ok": "yes"}},
+		{name: "flush", w: &checkedJSONWriteFailure{header: make(http.Header), flushErr: errors.New("flush failed")}, v: map[string]string{"ok": "yes"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := writeJSONAndFlush(tc.w, http.StatusOK, tc.v); err == nil {
+				t.Fatal("writeJSONAndFlush returned nil error")
+			}
+		})
+	}
+}
 
 func TestWriteFeatureDisabledIsNonRetryable(t *testing.T) {
 	rec := httptest.NewRecorder()

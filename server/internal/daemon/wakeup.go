@@ -33,11 +33,17 @@ const (
 	taskWakeupReadLimit int64 = 64 << 20
 )
 
-var (
-	taskWakeupPongWait          = 60 * time.Second
-	taskWakeupWriteWait         = 10 * time.Second
-	taskWakeupBackoffResetAfter = 10 * time.Second
-)
+type taskWakeupTimings struct {
+	pongWait          time.Duration
+	writeWait         time.Duration
+	backoffResetAfter time.Duration
+}
+
+var defaultTaskWakeupTimings = taskWakeupTimings{
+	pongWait:          60 * time.Second,
+	writeWait:         10 * time.Second,
+	backoffResetAfter: 10 * time.Second,
+}
 
 type taskWakeup struct {
 	runtimeID string
@@ -58,7 +64,7 @@ func (d *Daemon) taskWakeupLoop(ctx context.Context, taskWakeups chan<- taskWake
 			backoff = time.Second
 			continue
 		}
-		if shouldResetTaskWakeupBackoff(connectedFor) {
+		if shouldResetTaskWakeupBackoff(connectedFor, d.taskWakeupTimings.backoffResetAfter) {
 			backoff = time.Second
 		}
 		if err != nil {
@@ -77,11 +83,11 @@ func (d *Daemon) taskWakeupLoop(ctx context.Context, taskWakeups chan<- taskWake
 	}
 }
 
-func shouldResetTaskWakeupBackoff(connectedFor time.Duration) bool {
+func shouldResetTaskWakeupBackoff(connectedFor, resetAfter time.Duration) bool {
 	if connectedFor <= 0 {
 		return false
 	}
-	return taskWakeupBackoffResetAfter <= 0 || connectedFor >= taskWakeupBackoffResetAfter
+	return resetAfter <= 0 || connectedFor >= resetAfter
 }
 
 func jitterDuration(d time.Duration) time.Duration {
@@ -476,12 +482,12 @@ func (d *Daemon) configureTaskWakeupReadLiveness(conn *websocket.Conn) {
 		if err := d.extendTaskWakeupReadDeadline(conn); err != nil {
 			return err
 		}
-		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(taskWakeupWriteWait))
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(d.taskWakeupTimings.writeWait))
 	})
 }
 
 func (d *Daemon) extendTaskWakeupReadDeadline(conn *websocket.Conn) error {
-	return conn.SetReadDeadline(time.Now().Add(taskWakeupPongWait))
+	return conn.SetReadDeadline(time.Now().Add(d.taskWakeupTimings.pongWait))
 }
 
 func (d *Daemon) handleRuntimeProfilesChanged(payload protocol.RuntimeProfilesChangedPayload) {

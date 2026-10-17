@@ -61,7 +61,11 @@ test("members see the child-done system rule and create a wakeup", async ({ page
 
     const created = page.getByRole("button", { name: /When this issue receives a new comment/ });
     await expect(created).toBeVisible();
-    await expect(created).toContainText("Wake Wakeup Emacs · Trigger once · 2d 23h left");
+    // The exact rounded label can straddle the creation-time boundary ("3
+    // days" versus "2d 23h"). Assert the user contract here; the database
+    // assertion below proves the exact three-day duration.
+    await expect(created).toContainText("Wake Wakeup Emacs · Trigger once");
+    await expect(created).toContainText(/left$/);
     const stored = await db.query<{ expiry_seconds: string; on_timeout: string; created_by: string }>(
       `SELECT expiry_seconds, on_timeout, created_by FROM issue_wakeup WHERE issue_id = $1 AND system_rule IS NULL`,
       [parent.id],

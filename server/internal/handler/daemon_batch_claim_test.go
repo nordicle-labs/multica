@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -33,8 +32,8 @@ func seedQueuedIssueTask(t *testing.T, ctx context.Context, agentID, runtimeID, 
 	t.Helper()
 	var id string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
-		VALUES ($1, $2, $3, 'queued', 0)
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, context)
+		VALUES ($1, $2, $3, 'queued', 0, '{"delivery_intent":"none"}')
 		RETURNING id
 	`, agentID, runtimeID, issueID).Scan(&id); err != nil {
 		t.Fatalf("seed queued task: %v", err)
@@ -99,7 +98,7 @@ func TestClaimTasksByRuntime_ClaimPollHintSchedulesNextDeferredTask(t *testing.T
 	}
 }
 
-func TestNextDeferredTaskFireAtForRuntimes_OmitsIneligibleOverdueTasks(t *testing.T) {
+func TestNextDeferredTaskDelayMillisForRuntimes_OmitsIneligibleOverdueTasks(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -138,37 +137,77 @@ func TestNextDeferredTaskFireAtForRuntimes_OmitsIneligibleOverdueTasks(t *testin
 				})
 			}
 
-			next, err := testHandler.Queries.NextDeferredTaskFireAtForRuntimes(t.Context(), db.NextDeferredTaskFireAtForRuntimesParams{
+			next, err := testHandler.Queries.NextDeferredTaskDelayMillisForRuntimes(t.Context(), db.NextDeferredTaskDelayMillisForRuntimesParams{
 				RuntimeIds:       []pgtype.UUID{parseUUID(runtimeID)},
 				RuntimeStaleSecs: service.RuntimeClaimFreshnessSeconds,
 			})
 			if err != nil {
-				t.Fatalf("NextDeferredTaskFireAtForRuntimes: %v", err)
+				t.Fatalf("NextDeferredTaskDelayMillisForRuntimes: %v", err)
 			}
-			if next.Valid != tt.wantHint {
-				t.Fatalf("hint validity = %v, want %v", next.Valid, tt.wantHint)
+			if gotHint := next >= 0; gotHint != tt.wantHint {
+				t.Fatalf("hint validity = %v, want %v", gotHint, tt.wantHint)
 			}
 		})
 	}
 }
 
-func TestClaimPollHintDelayHasOneSecondFloor(t *testing.T) {
-	now := time.Unix(1_000, 0)
-	for _, tt := range []struct {
-		name   string
-		fireAt time.Time
-		want   time.Duration
-	}{
-		{name: "overdue", fireAt: now.Add(-time.Minute), want: time.Second},
-		{name: "sub-second", fireAt: now.Add(100 * time.Millisecond), want: time.Second},
-		{name: "future", fireAt: now.Add(5 * time.Second), want: 5 * time.Second},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := claimPollHintDelay(now, tt.fireAt); got != tt.want {
-				t.Fatalf("claimPollHintDelay() = %s, want %s", got, tt.want)
-			}
-		})
+func TestNextDeferredTaskDelayMillisForRuntimes_UsesDatabaseClock(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
 	}
+
+	query := func(t *testing.T, runtimeIDs ...string) int64 {
+		t.Helper()
+		ids := make([]pgtype.UUID, len(runtimeIDs))
+		for i, id := range runtimeIDs {
+			ids[i] = parseUUID(id)
+		}
+		delay, err := testHandler.Queries.NextDeferredTaskDelayMillisForRuntimes(t.Context(), db.NextDeferredTaskDelayMillisForRuntimesParams{
+			RuntimeIds:       ids,
+			RuntimeStaleSecs: service.RuntimeClaimFreshnessSeconds,
+		})
+		if err != nil {
+			t.Fatalf("NextDeferredTaskDelayMillisForRuntimes: %v", err)
+		}
+		return delay
+	}
+	seed := func(t *testing.T, name, fireAt string) string {
+		t.Helper()
+		runtimeID := dbfx.Runtime(t, name, nil)
+		agentID := dbfx.Agent(t, name, runtimeID)
+		dbfx.Task(t, agentID, testutil.Cols{
+			"runtime_id": runtimeID,
+			"status":     "deferred",
+			"fire_at":    testutil.Raw(fireAt),
+		})
+		return runtimeID
+	}
+
+	t.Run("future", func(t *testing.T) {
+		delay := query(t, seed(t, "future database delay", "now() + interval '5 seconds'"))
+		if delay <= 0 || delay > 5000 {
+			t.Fatalf("delay = %+v, want 1..5000ms", delay)
+		}
+	})
+	t.Run("due", func(t *testing.T) {
+		delay := query(t, seed(t, "due database delay", "now() - interval '1 second'"))
+		if delay != 1000 {
+			t.Fatalf("delay = %+v, want 1000ms floor", delay)
+		}
+	})
+	t.Run("no task", func(t *testing.T) {
+		if delay := query(t, dbfx.Runtime(t, "no deferred task", nil)); delay != -1 {
+			t.Fatalf("delay = %d, want no-task sentinel", delay)
+		}
+	})
+	t.Run("multiple runtimes", func(t *testing.T) {
+		slower := seed(t, "slower database delay", "now() + interval '8 seconds'")
+		sooner := seed(t, "sooner database delay", "now() + interval '3 seconds'")
+		delay := query(t, slower, sooner)
+		if delay <= 0 || delay > 3000 {
+			t.Fatalf("delay = %+v, want earliest runtime in 1..3000ms", delay)
+		}
+	})
 }
 
 // TestClaimTasksByRuntime_RoutesAcrossRuntimesAndMintsTokens covers the happy

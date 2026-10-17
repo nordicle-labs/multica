@@ -25,6 +25,10 @@ test.describe("Comments", () => {
   test("can add a comment on an issue", async ({ page }) => {
     await page.goto(`/${workspaceSlug}/issues/${issueId}`, { waitUntil: "domcontentloaded" });
     await waitForPageText(page, issueTitle);
+    // The UUID route canonicalizes to the human issue identifier. Wait for
+    // that replacement before interacting so the route remount cannot detach
+    // the readonly shell or its editor midway through an action.
+    await expect(page).toHaveURL(/\/issues\/[^/]+-\d+$/);
 
     // Wait for issue detail to load
     await expect(page.locator("text=Properties")).toBeVisible();
@@ -38,10 +42,12 @@ test.describe("Comments", () => {
     // Type a comment
     const commentText = "E2E comment " + Date.now();
     const editor = page
-      .locator('.ProseMirror[data-placeholder="Leave a comment..."], .ProseMirror:has([data-placeholder="Leave a comment..."])')
+      .locator('.ProseMirror:has([data-placeholder="Leave a comment..."])')
       .first();
     await expect(editor).toBeVisible();
-    await editor.click({ force: true });
+    // fill() resolves the current editable node and focuses it itself. An
+    // extra click races the readonly-shell swap and can retain a detached
+    // ProseMirror node while React reconciles the composer.
     await editor.fill(commentText);
 
     await page.keyboard.press("ControlOrMeta+Enter");

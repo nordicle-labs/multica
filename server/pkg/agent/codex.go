@@ -1523,7 +1523,10 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			} else if runCtx.Err() != nil {
 				// processCtx deliberately outlives runCtx so active turns can use
 				// turn/interrupt. Initialize has no interruptible turn, so a parent
-				// cancellation must take the fast process-tree cleanup path.
+				// cancellation must synchronously kill the process tree before the
+				// bounded drain. Context cancellation invokes cmd.Cancel from an
+				// os/exec watcher goroutine and can be delayed under scheduler load.
+				signalProcessGroup(cmd, syscall.SIGKILL)
 				stopProcess()
 			}
 			drainAndWait() // flush os/exec stderr goroutine before sampling Tail

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -14,6 +15,19 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+func assertDeliveryIntent(t *testing.T, context []byte, want string) {
+	t.Helper()
+	var got struct {
+		DeliveryIntent string `json:"delivery_intent"`
+	}
+	if err := json.Unmarshal(context, &got); err != nil {
+		t.Fatalf("decode delivery context: %v", err)
+	}
+	if got.DeliveryIntent != want {
+		t.Fatalf("delivery intent = %q, want %q", got.DeliveryIntent, want)
+	}
+}
 
 // seedAttributionFixture creates the minimal user/workspace/member/runtime/agent
 // graph plus a member-created issue assigned to the agent, and returns the ids
@@ -832,12 +846,14 @@ func TestDispatchRunOnlyScheduleStampsRuleOwnerRow(t *testing.T) {
 	}
 
 	var source pgtype.Text
+	var taskContext []byte
 	var originator, accountable, ruleVersion pgtype.UUID
 	if err := pool.QueryRow(ctx, `
-		SELECT originator_source, originator_user_id, accountable_user_id, rule_version_id
-		FROM agent_task_queue WHERE autopilot_run_id = $1`, run.ID).Scan(&source, &originator, &accountable, &ruleVersion); err != nil {
+		SELECT originator_source, originator_user_id, accountable_user_id, rule_version_id, context
+		FROM agent_task_queue WHERE autopilot_run_id = $1`, run.ID).Scan(&source, &originator, &accountable, &ruleVersion, &taskContext); err != nil {
 		t.Fatalf("read stored attribution: %v", err)
 	}
+	assertDeliveryIntent(t, taskContext, "none")
 	if source.String != string(attribution.SourceRuleOwner) {
 		t.Errorf("originator_source = %q, want rule_owner", source.String)
 	}
@@ -1277,6 +1293,7 @@ func TestEnqueueChatTaskStampsChatEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueChatTask: %v", err)
 	}
+	assertDeliveryIntent(t, task.Context, "none")
 
 	var source, evidenceKind pgtype.Text
 	var originator, accountable, evidenceRef pgtype.UUID

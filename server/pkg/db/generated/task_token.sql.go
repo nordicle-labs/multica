@@ -60,6 +60,15 @@ func (q *Queries) DeleteExpiredTaskTokens(ctx context.Context) error {
 	return err
 }
 
+const deleteTaskTokenByID = `-- name: DeleteTaskTokenByID :exec
+DELETE FROM task_token WHERE id = $1
+`
+
+func (q *Queries) DeleteTaskTokenByID(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteTaskTokenByID, id)
+	return err
+}
+
 const deleteTaskTokensByTask = `-- name: DeleteTaskTokensByTask :exec
 DELETE FROM task_token WHERE task_id = $1
 `

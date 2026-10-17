@@ -3,7 +3,6 @@
 package agent
 
 import (
-	"errors"
 	"log/slog"
 	"os/exec"
 	"syscall"
@@ -57,6 +56,24 @@ func signalProcessGroup(cmd *exec.Cmd, sig syscall.Signal) {
 	if err := syscall.Kill(-cmd.Process.Pid, sig); err != nil {
 		_ = cmd.Process.Signal(sig)
 	}
+	if sig != syscall.SIGKILL {
+		return
+	}
+	// A single group signal can race a concurrent fork in the child — for
+	// example a shell spawning a descendant right as the task is cancelled —
+	// and strand a process that still holds the stdout/stderr pipes, keeping
+	// the reader from ever seeing EOF. SIGKILL is idempotent, so re-send it a
+	// bounded number of times with a short settle. A descendant that finished
+	// forking just after the first delivery is caught by the next one; a fixed
+	// retry count avoids depending on platform-specific "is the group gone"
+	// semantics (macOS reports EPERM for a zombie-only group, Linux counts an
+	// unreaped zombie leader as present until Wait reaps it).
+	for i := 0; i < 5; i++ {
+		time.Sleep(4 * time.Millisecond)
+		if err := syscall.Kill(-cmd.Process.Pid, sig); err != nil {
+			_ = cmd.Process.Signal(sig)
+		}
+	}
 }
 
 func waitProcessGroupGone(cmd *exec.Cmd, timeout time.Duration) bool {
@@ -65,8 +82,11 @@ func waitProcessGroupGone(cmd *exec.Cmd, timeout time.Duration) bool {
 	}
 	deadline := time.Now().Add(timeout)
 	for {
-		err := syscall.Kill(-cmd.Process.Pid, 0)
-		if errors.Is(err, syscall.ESRCH) {
+		// Passive probe: the caller owns the kill (reapKill/signalProcessGroup)
+		// and re-signals until gone. On macOS a group whose only member is an
+		// unreaped zombie reports EPERM (not ESRCH) from kill(pid, 0), so any
+		// error means the group has no signalable member left.
+		if err := syscall.Kill(-cmd.Process.Pid, 0); err != nil {
 			return true
 		}
 		if time.Now().After(deadline) {

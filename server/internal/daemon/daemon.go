@@ -175,10 +175,11 @@ func taskScopedAuthToken(task Task) (string, error) {
 	return token, nil
 }
 
-func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesRoot, serverURL string, healthPort, slot int, tempDir string) map[string]string {
+func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesRoot, hostWorkDir, serverURL string, healthPort, slot int, tempDir string) map[string]string {
 	return map[string]string{
 		"MULTICA_TOKEN":        token,
 		cli.TaskConfigRootEnv:  configRoot,
+		cli.TaskHostWorkDirEnv: hostWorkDir,
 		TaskWorkspacesRootEnv:  workspacesRoot,
 		"MULTICA_SERVER_URL":   serverURL,
 		"MULTICA_DAEMON_PORT":  strconv.Itoa(healthPort),
@@ -227,15 +228,20 @@ const (
 // reportTerminalTask gives the durable outbox one insertion point without
 // revisiting every task exit when it is added.
 type terminalTaskReport struct {
-	kind           terminalTaskReportKind
-	taskID         string
-	output         string
-	branchName     string
-	errorMessage   string
-	sessionID      string
-	workDir        string
-	durableWorkDir string
-	failureReason  string
+	kind                   terminalTaskReportKind
+	taskID                 string
+	output                 string
+	branchName             string
+	errorMessage           string
+	sessionID              string
+	workDir                string
+	durableWorkDir         string
+	recoveryRef            string
+	recoveryBundlePath     string
+	recoveryBundleVerified bool
+	recoveryRepository     string
+	recoveryHeadSHA        string
+	failureReason          string
 	// sessionRolloutMissing is true when the daemon withheld this task's Codex
 	// session because its rollout was not in the store (MUL-5305). The server
 	// clears the resume pointer and flags the continuity gap for the next claim.
@@ -397,6 +403,7 @@ type Daemon struct {
 	terminalReportSend   terminalReportSendFunc
 	terminalReportWakeup chan struct{}
 	terminalReportNow    func() time.Time
+	recoveryNow          func() time.Time
 	terminalReportMu     sync.Mutex
 	terminalReportFlight map[string]struct{}
 
@@ -551,6 +558,9 @@ type Daemon struct {
 	// connection in runTaskWakeupConnection and detached on disconnect; when
 	// detached, callers fall back to HTTP.
 	wsRPC *wsRPCClient
+	// taskWakeupTimings is immutable in production and per-daemon so focused
+	// websocket tests can shorten deadlines without racing other tests.
+	taskWakeupTimings taskWakeupTimings
 
 	// batchClaimUnsupported is set once a batch claim gets a 404 from the
 	// server (no /api/daemon/tasks/claim route — an un-upgraded server), so
@@ -661,7 +671,8 @@ type Daemon struct {
 	// them to drain before tearing the daemon down. Without this the bg
 	// goroutine can race against t.TempDir cleanup, leaving a partially
 	// deleted bare clone and an unrelated `not empty` cleanup failure.
-	bgSyncs sync.WaitGroup
+	bgSyncs              sync.WaitGroup
+	gitCredentialHelpers map[string]string // task id -> credential-cache helper; guarded by mu
 
 	runner             taskRunner    // executes agent tasks; set to d.runTask by New(), overridable in tests
 	cancelPollInterval time.Duration // how often handleTask polls for server-side cancellation; overridable in tests
@@ -719,6 +730,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		terminalReports:             newTerminalReportStore(cfg),
 		terminalReportWakeup:        make(chan struct{}, 1),
 		terminalReportNow:           time.Now,
+		recoveryNow:                 time.Now,
 		terminalReportFlight:        make(map[string]struct{}),
 		workspaces:                  make(map[string]*workspaceState),
 		runtimeIndex:                make(map[string]Runtime),
@@ -749,6 +761,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		reconcile:                   newReconcileBroadcaster(),
 		workspaceChanges:            newWorkspaceChangeSignal(),
 		wsRPC:                       newWSRPCClient(wsRPCResponseGrace),
+		taskWakeupTimings:           defaultTaskWakeupTimings,
 	}
 	d.activeEnvRootsCond = sync.NewCond(&d.activeEnvRootsMu)
 	d.activeStoresCond = sync.NewCond(&d.activeStoresMu)
@@ -5743,6 +5756,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		return
 	}
 	provider := rt.Provider
+	stripGitHubCredentials(&task)
 
 	// Task-scoped logger. The task id goes in whole: it is the key every
 	// other surface prints (task JSON, env-root ownership manifest, server
@@ -5876,6 +5890,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// run errors stay discarded: on a cancelled run they are expected
 		// noise (context canceled, killed process), and persisting them would
 		// stamp a bogus reason on every ordinary mid-run cancel.
+		d.recoverTaskArtifact(task, result, "cancel", taskLog)
 		ack := TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}
 		var preserved *worktreePreservedError
 		if errors.As(err, &preserved) {
@@ -5889,7 +5904,101 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	default:
 	}
 
+	publicationRecoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	if err == nil && len(task.Repos) == 0 && (task.DeliveryIntent == "artifact" || task.DeliveryIntent == "publish") {
+		err = errors.New("repository delivery requires an authorized task repository")
+	}
+	if err == nil && len(task.Repos) > 0 && task.DeliveryIntent != "none" &&
+		(result.DurableWorkDir == "" || result.BranchName == "" || result.CommitSHA == "") {
+		err = errors.New("repository delivery required but finalized delivery is missing workdir, branch, or SHA")
+	}
+	if err == nil && len(task.Repos) > 0 && task.DeliveryIntent != "none" {
+		if repository, repositoryErr := githubRepositoryForTask(result.DurableWorkDir, task.Repos); repositoryErr != nil {
+			err = fmt.Errorf("repository delivery scope validation failed: %w", repositoryErr)
+		} else if artifactErr := preserveRepositoryArtifact(ctx, publicationRecoveryRoot, task.ID, &result, taskLog); artifactErr != nil {
+			err = artifactErr
+		} else {
+			result.RecoveryRepository = repository
+		}
+	}
+	if err == nil && len(task.Repos) > 0 && task.DeliveryIntent == "publish" {
+		descriptor := deriveRepositoryDescriptor(ctx, result.DurableWorkDir)
+		repository, repositoryErr := githubRepositoryForTask(result.DurableWorkDir, task.Repos)
+		if repositoryErr != nil {
+			err = fmt.Errorf("host-side GitHub publication remote changed before acquisition: %w", repositoryErr)
+		}
+		if err == nil {
+			err = execenv.WriteFinalizedRecoveryManifest(publicationRecoveryRoot, execenv.RecoveryManifest{
+				TaskID: task.ID, RuntimeID: task.RuntimeID, DeliveryIntent: task.DeliveryIntent, Repository: repository, GitRoot: descriptor.GitRoot,
+				CanonicalBranch: result.BranchName, BaseSHA: result.CommitSHA,
+				ExpectedRefSHA: result.CommitSHA, HeadSHA: result.CommitSHA,
+			})
+		}
+		var releasePublication func()
+		if err == nil {
+			var claimed bool
+			releasePublication, claimed, err = execenv.ClaimRecoveryPublication(publicationRecoveryRoot, task.ID)
+			if err == nil && !claimed {
+				err = errors.New("host-side GitHub publication is already claimed")
+			}
+			if releasePublication != nil {
+				defer releasePublication()
+			}
+		}
+		var credentials []GitHubCredential
+		if err == nil {
+			credentials, err = d.client.AcquireGitHubCredentials(ctx, task, repository)
+		}
+		var credentialSession *githubCredentialSession
+		if err == nil {
+			credentialSession, err = startGitHubCredentialSession(credentials)
+			if err == nil && credentialSession == nil {
+				err = errors.New("host-side GitHub publication returned no credential")
+			}
+		}
+		if err == nil {
+			err = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationCredentialMinted, "", 0, "")
+		}
+		if credentialSession != nil {
+			defer func() {
+				if credentialSession != nil {
+					_ = credentialSession.close(context.Background())
+				}
+			}()
+		}
+		if err == nil {
+			remoteSHA, pullRequest, publishErr := credentialSession.finalizePublicationWithProgress(ctx, result.DurableWorkDir, result.BranchName, result.CommitSHA,
+				func(phase, remoteSHA string, pr githubPullRequest) error {
+					return execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, phase, remoteSHA, pr.Number, pr.URL)
+				})
+			revokeErr := credentialSession.close(context.Background())
+			if revokeErr == nil {
+				credentialSession = nil
+			}
+			if publishErr != nil {
+				err = fmt.Errorf("host-side GitHub publication failed (phase=publish canonical_branch=%s head_sha=%s remote_sha=%s runtime_id=%s): %w", result.BranchName, result.CommitSHA, remoteSHA, task.RuntimeID, publishErr)
+			} else if revokeErr != nil {
+				err = fmt.Errorf("host-side GitHub publication failed (phase=revoke canonical_branch=%s head_sha=%s remote_sha=%s runtime_id=%s): %w", result.BranchName, result.CommitSHA, remoteSHA, task.RuntimeID, revokeErr)
+			} else {
+				err = execenv.AdvanceRecoveryManifest(publicationRecoveryRoot, task.ID, execenv.PublicationCredentialRevoked, remoteSHA, pullRequest.Number, pullRequest.URL)
+			}
+		}
+		if err == nil {
+			err = execenv.RemoveRecoveryManifest(publicationRecoveryRoot, task.ID)
+		}
+	}
+	if err == nil && len(task.Repos) > 0 && task.DeliveryIntent != "none" && task.DeliveryIntent != "artifact" && task.DeliveryIntent != "publish" {
+		err = fmt.Errorf("repository delivery rejected unknown intent %q", task.DeliveryIntent)
+	}
+
 	if err != nil {
+		d.recoverTaskArtifact(task, result, "finalize", taskLog)
+		if task.DeliveryIntent == "publish" && result.RecoveryBundleVerified && result.RecoveryRepository != "" {
+			taskLog.Error("publication deferred to durable recovery", "error", err, "repository", result.RecoveryRepository)
+			result.Status = "completed"
+			d.reportTaskResult(ctx, task.ID, result, taskLog)
+			return
+		}
 		taskLog.Error("task failed", "error", err)
 		// runTask may have reached worktree finalization before returning the
 		// error. Preserve any delivery metadata that defer attached to the named
@@ -5931,6 +6040,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// completed/failed rows the complete/fail callback is the
 		// authoritative channel and a stale run's late ack must not touch
 		// them.
+		d.recoverTaskArtifact(task, result, "cancel", taskLog)
 		if ackErr := d.client.AckTaskCancelled(ctx, task.ID, TaskCancelAck{BranchName: result.BranchName, DurableWorkDir: result.DurableWorkDir}); ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
@@ -5967,6 +6077,24 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			}
 		}
 	}
+}
+
+func (d *Daemon) recoverTaskArtifact(task Task, result TaskResult, phase string, taskLog *slog.Logger) {
+	if result.CommitSHA == "" || result.DurableWorkDir == "" {
+		return
+	}
+	recovery, err := execenv.CreateRecoveryArtifact(result.DurableWorkDir, filepath.Join(d.cfg.WorkspacesRoot, "recovery"), task.ID, result.CommitSHA, taskLog)
+	if err != nil {
+		taskLog.Error("task recovery artifact failed", "phase", phase, "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "runtime_id", task.RuntimeID, "error", err)
+		return
+	}
+	if task.DeliveryIntent != "publish" {
+		if err := execenv.RemoveRecoveryManifest(filepath.Join(d.cfg.WorkspacesRoot, "recovery"), task.ID); err != nil {
+			taskLog.Error("task recovery manifest cleanup failed", "phase", phase, "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "recovery_ref", recovery.Ref, "bundle_verified", recovery.BundleVerified, "runtime_id", task.RuntimeID, "error", err)
+			return
+		}
+	}
+	taskLog.Error("task artifact preserved for recovery", "phase", phase, "canonical_branch", result.BranchName, "head_sha", result.CommitSHA, "recovery_ref", recovery.Ref, "bundle_verified", recovery.BundleVerified, "runtime_id", task.RuntimeID)
 }
 
 // worktreePreservedError marks a task error that must survive the cancel path:
@@ -6258,15 +6386,20 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 	case "completed":
 		taskLog.Info("task completed", "status", result.Status)
 		err := d.reportTerminalTask(ctx, terminalTaskReport{
-			kind:                  terminalTaskReportComplete,
-			taskID:                taskID,
-			output:                result.Comment,
-			branchName:            result.BranchName,
-			sessionID:             result.SessionID,
-			workDir:               result.WorkDir,
-			durableWorkDir:        result.DurableWorkDir,
-			sessionRolloutMissing: result.SessionRolloutMissing,
-			retiredSessionID:      result.RetiredSessionID,
+			kind:                   terminalTaskReportComplete,
+			taskID:                 taskID,
+			output:                 result.Comment,
+			branchName:             result.BranchName,
+			sessionID:              result.SessionID,
+			workDir:                result.WorkDir,
+			durableWorkDir:         result.DurableWorkDir,
+			recoveryRef:            result.RecoveryRef,
+			recoveryBundlePath:     result.RecoveryBundlePath,
+			recoveryBundleVerified: result.RecoveryBundleVerified,
+			recoveryRepository:     result.RecoveryRepository,
+			recoveryHeadSHA:        result.CommitSHA,
+			sessionRolloutMissing:  result.SessionRolloutMissing,
+			retiredSessionID:       result.RetiredSessionID,
 		})
 		if err == nil {
 			return
@@ -6410,7 +6543,7 @@ func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTask
 	}
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
+		return d.client.completeTaskWithRetrySchedule(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.recoveryRef, report.recoveryBundlePath, report.recoveryBundleVerified, report.recoveryRepository, report.recoveryHeadSHA, schedule)
 	case terminalTaskReportFail:
 		return d.client.failTaskWithRetrySchedule(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, schedule)
 	default:
@@ -7698,6 +7831,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// `multica repo checkout` would reject project-only URLs that aren't also
 	// bound at the workspace level.
 	d.registerTaskRepos(task.WorkspaceID, task.ID, task.Repos)
+	if task.GitCredentialHelper != "" {
+		repoCtx := repocache.WithGitCredentialHelper(prepareCtx, task.GitCredentialHelper)
+		d.syncWorkspaceReposContext(repoCtx, task.WorkspaceID, task.Repos)
+	}
 	defer d.clearTaskRepoRefs(task.WorkspaceID, task.ID)
 
 	entry, ok := d.agents()[provider]
@@ -8248,6 +8385,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// In-place local_directory runs never enter this block: their WorkDir is
 	// already durable, so DurableWorkDir deliberately stays absent instead of
 	// duplicating the same path under two lifecycle meanings.
+	recoveryRoot := filepath.Join(d.cfg.WorkspacesRoot, "recovery")
+	recoveryManifestWritten := false
 	if env.LocalWorktree != nil {
 		defer func() {
 			if taskResult.WorkDir == "" {
@@ -8259,13 +8398,20 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			outcome, finalizeErr := env.LocalWorktree.Finalize(taskLog)
 			if outcome.Branch != "" {
 				taskResult.BranchName = outcome.Branch
+				taskResult.CommitSHA = outcome.HeadSHA
+			}
+			if recoveryManifestWritten && outcome.HeadSHA != "" {
+				if manifestErr := execenv.WriteRecoveryManifest(recoveryRoot, execenv.RecoveryManifest{
+					TaskID: task.ID, RuntimeID: task.RuntimeID, DeliveryIntent: task.DeliveryIntent, GitRoot: env.LocalWorktree.GitRoot, CanonicalBranch: env.LocalWorktree.Branch,
+					BaseSHA: env.LocalWorktree.BaseCommit, ExpectedRefSHA: env.LocalWorktree.CanonicalRefExpected, HeadSHA: outcome.HeadSHA,
+				}); manifestErr != nil {
+					taskLog.Error("local_directory: update recovery manifest after finalize", "error", manifestErr)
+				}
 			}
 			if finalizeErr == nil {
 				// The configured local_directory becomes authoritative only after
 				// Finalize confirms the disposable task worktree is actually gone.
-				if localAssignment != nil {
-					taskResult.DurableWorkDir = localAssignment.AbsPath
-				}
+				taskResult.DurableWorkDir = env.LocalWorktree.GitRoot
 				return
 			}
 			// Finalize could not complete its delivery contract, so the task
@@ -8288,6 +8434,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				returnErr = wrapped
 			} else {
 				returnErr = errors.Join(returnErr, wrapped)
+			}
+		}()
+	}
+	if len(task.Repos) > 0 && !localAssignment.UsesWorktree() {
+		defer func() {
+			if returnErr != nil || taskResult.Status != "completed" {
+				return
+			}
+			if err := attachRepositoryDelivery(ctx, env.WorkDir, &taskResult); err != nil {
+				returnErr = fmt.Errorf("finalize github_repo delivery: %w", err)
 			}
 		}()
 	}
@@ -8377,6 +8533,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			taskLog.Warn("task temp dir cleanup failed", "path", taskTempDir, "error", cerr)
 		}
 	}()
+	if env.LocalWorktree != nil && (task.DeliveryIntent == "artifact" || task.DeliveryIntent == "publish") {
+		if err := execenv.WriteRecoveryManifest(recoveryRoot, execenv.RecoveryManifest{
+			TaskID: task.ID, RuntimeID: task.RuntimeID, DeliveryIntent: task.DeliveryIntent, GitRoot: env.LocalWorktree.GitRoot, CanonicalBranch: env.LocalWorktree.Branch,
+			BaseSHA: env.LocalWorktree.BaseCommit, ExpectedRefSHA: env.LocalWorktree.CanonicalRefExpected,
+		}); err != nil {
+			return TaskResult{}, fmt.Errorf("write recovery manifest before provider launch: %w", err)
+		}
+		recoveryManifestWritten = true
+	}
 
 	// Issue #3999 race A: now that env.WorkDir is on disk, transition the
 	// server-side state machine dispatched (or waiting_local_directory) →
@@ -8393,7 +8558,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if agent.SupportsTaskSupplement(provider, resolvedVersion) && task.IssueID != "" {
 		taskCapabilities = append(taskCapabilities, protocol.DaemonCapabilityTaskSupplementV1)
 	}
-	taskSupplementNegotiated, err := d.client.StartTask(prepareCtx, task, taskCapabilities...)
+	deliveryPreflight := buildDeliveryPreflight(prepareCtx, env.WorkDir, localAssignment != nil, task.AuthToken != "", env.LocalWorktree)
+	taskSupplementNegotiated, err := d.client.StartTaskWithDeliveryPreflight(prepareCtx, task, &deliveryPreflight, taskCapabilities...)
 	if err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
@@ -8431,7 +8597,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
-	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
+	// A local repository is a deliverable, not runtime scratch: keep its tracked
+	// context files byte-identical and carry the brief inline instead.
+	runtimeBrief, err := prepareRuntimeBrief(env, provider, taskCtx)
 	if err != nil {
 		d.logger.Warn("execenv: inject runtime config failed (non-fatal)", "error", err)
 	}
@@ -8465,7 +8633,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		taskLog.Error("task auth token invalid; refusing to start agent", "error", err)
 		return TaskResult{}, err
 	}
-	agentEnv := taskMulticaEnvironment(task, agentName, agentToken, env.MulticaConfigRoot, d.cfg.WorkspacesRoot, d.cfg.ServerBaseURL, d.cfg.HealthPort, slot, taskTempDir)
+	agentEnv := taskMulticaEnvironment(task, agentName, agentToken, env.MulticaConfigRoot, d.cfg.WorkspacesRoot, env.WorkDir, d.cfg.ServerBaseURL, d.cfg.HealthPort, slot, taskTempDir)
 	if checkoutMode := repoCheckoutModeFor(provider, runtime.GOOS); checkoutMode != "" {
 		agentEnv[repoCheckoutModeEnv] = checkoutMode
 	}
@@ -8543,6 +8711,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		agentCustomEnv = task.Agent.CustomEnv
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+	if env.LocalWorktree != nil {
+		// Set after custom_env layering so the provider can read, but not replace,
+		// the canonical delivery name acknowledged by StartTask above.
+		agentEnv["MULTICA_TASK_BRANCH"] = env.LocalWorktree.Branch
+	}
 	if provider == "reasonix" {
 		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.Profile, task.RuntimeID, task.AgentID)
 		if err != nil {
@@ -8719,7 +8892,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// as always included, and a real kiro-cli 2.13.0 ACP smoke confirms it.
 	// Prepending the full runtime brief into the ACP user prompt duplicates that
 	// context and bloats every turn.
-	if providerNeedsInlineSystemPrompt(provider) {
+	if providerNeedsInlineSystemPrompt(provider) || env.LocalDirectory || env.LocalWorktree != nil {
 		execOpts.SystemPrompt = runtimeBrief
 	}
 

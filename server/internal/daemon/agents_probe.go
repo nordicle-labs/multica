@@ -434,8 +434,16 @@ func parseDshProbeFrame(output string) (dshProbeFrame, bool) {
 // whole DSH process, and a round abandoned by a shutting-down daemon should not
 // go on holding one for the rest of the timeout — once per retry, per provider.
 func probeDshMulticaProfile(ctx context.Context, executablePath string) dshProbeVerdict {
+	return probeDshMulticaProfileWithin(ctx, executablePath, dshProbeTimeout)
+}
+
+// probeDshMulticaProfileWithin lets classification tests use a short deadline
+// only for fixtures that deliberately hang. Healthy shell fixtures retain the
+// production budget so scheduler load cannot turn a protocol verdict into a
+// timeout verdict.
+func probeDshMulticaProfileWithin(ctx context.Context, executablePath string, timeout time.Duration) dshProbeVerdict {
 	parent := ctx
-	ctx, cancel := context.WithTimeout(parent, dshProbeTimeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, executablePath, "--profile", dshMulticaProfileName, "--probe")
 	// processtree, not cmd.Output: `--probe` boots a whole DSH profile, so the

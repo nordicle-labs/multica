@@ -9,12 +9,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/deliverycontract"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
@@ -29,6 +32,22 @@ type requestError struct {
 
 func (e *requestError) Error() string {
 	return fmt.Sprintf("%s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+type publicationRecoveryDeferredError struct {
+	RetryAt time.Time
+}
+
+func (e *publicationRecoveryDeferredError) Error() string {
+	return "publication credential lease is still outstanding"
+}
+
+type publicationRecoveryBlockedError struct {
+	Reason string
+}
+
+func (e *publicationRecoveryBlockedError) Error() string {
+	return e.Reason
 }
 
 var errInvalidResponseBody = errors.New("invalid response body")
@@ -202,7 +221,7 @@ func daemonHTTPClientCapabilities() string {
 }
 
 func daemonCommonCapabilities() []string {
-	return []string{
+	capabilities := []string{
 		protocol.DaemonCapabilitySkillBundlesV1,
 		protocol.DaemonCapabilityCoalescedCommentsV1,
 		protocol.DaemonCapabilityExecutionManifestV1,
@@ -214,7 +233,39 @@ func daemonCommonCapabilities() []string {
 		protocol.DaemonCapabilityPlatformSkillV1,
 		protocol.DaemonCapabilityCheckoutKeepsWorkV1,
 		protocol.DaemonCapabilityJoinedWakeupsV1,
+		protocol.DaemonCapabilityGitHubAppCredentialsV1,
 	}
+	if gitSupportsCredentialIsolation() {
+		capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV2)
+	}
+	capabilities = append(capabilities, protocol.DaemonCapabilityGitHubAppCredentialsV3)
+	capabilities = append(capabilities, protocol.DaemonCapabilityExplicitDeliveryV1)
+	return capabilities
+}
+
+var gitCredentialIsolationSupport = sync.OnceValue(func() bool {
+	out, err := exec.Command("git", "version").Output()
+	return err == nil && gitSupportsCredentialIsolationFor(runtime.GOOS, string(out))
+})
+
+func gitSupportsCredentialIsolation() bool { return gitCredentialIsolationSupport() }
+
+func gitSupportsCredentialIsolationFor(goos, version string) bool {
+	return goos != "windows" && gitVersionAtLeast(version, 2, 31)
+}
+
+func gitVersionAtLeast(version string, wantMajor, wantMinor int) bool {
+	fields := strings.Fields(version)
+	if len(fields) < 3 {
+		return false
+	}
+	parts := strings.Split(fields[2], ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	return majorErr == nil && minorErr == nil && (major > wantMajor || major == wantMajor && minor >= wantMinor)
 }
 
 // SetToken sets the auth token for authenticated requests.
@@ -235,6 +286,83 @@ func (c *Client) ClaimTask(ctx context.Context, runtimeID string) (*Task, error)
 		return nil, err
 	}
 	return resp.Task, nil
+}
+
+func (c *Client) ackGitHubCredentials(ctx context.Context, task *Task) error {
+	if task == nil || task.GitHubCredentialAck == "" {
+		return nil
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/claim-ack", url.PathEscape(task.RuntimeID), url.PathEscape(task.ID))
+	if err := c.postJSON(ctx, path, map[string]string{"ack": task.GitHubCredentialAck}, nil); err != nil {
+		task.GitHubCredentials = nil
+		return fmt.Errorf("acknowledge GitHub App credentials: %w", err)
+	}
+	task.GitHubCredentialAck = ""
+	return nil
+}
+
+// AcquireGitHubCredentials asks the server to mint the short-lived publication
+// token after provider execution and host-side worktree finalization.
+func (c *Client) AcquireGitHubCredentials(ctx context.Context, task Task, repository string) ([]GitHubCredential, error) {
+	var response struct {
+		Credentials []GitHubCredential `json:"credentials"`
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-credentials",
+		url.PathEscape(task.RuntimeID), url.PathEscape(task.ID))
+	if err := c.postJSONWithToken(ctx, path, task.RemoteMCPDaemonToken, map[string]string{"repository": repository}, &response); err != nil {
+		return nil, fmt.Errorf("acquire GitHub App publication credentials: %w", err)
+	}
+	return response.Credentials, nil
+}
+
+type publicationRecoveryClaim struct {
+	ClaimID             string             `json:"claim_id"`
+	CredentialHandle    string             `json:"credential_handle"`
+	Credentials         []GitHubCredential `json:"credentials"`
+	RevocationConfirmed bool               `json:"revocation_confirmed"`
+	Completed           bool               `json:"completed"`
+}
+
+func (c *Client) ClaimGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository string, publicationReady bool) (publicationRecoveryClaim, error) {
+	var response publicationRecoveryClaim
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/claim", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	if err := c.postJSON(ctx, path, map[string]any{"daemon_id": daemonID, "repository": repository, "publication_ready": publicationReady}, &response); err != nil {
+		var reqErr *requestError
+		var body struct {
+			Code    string    `json:"code"`
+			Error   string    `json:"error"`
+			RetryAt time.Time `json:"retry_at"`
+		}
+		if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict && json.Unmarshal([]byte(reqErr.Body), &body) == nil {
+			switch {
+			case body.Code == "publication_credential_outstanding" && !body.RetryAt.IsZero():
+				return response, &publicationRecoveryDeferredError{RetryAt: body.RetryAt}
+			case body.Code == "publication_credential_expiry_unknown":
+				return response, &publicationRecoveryBlockedError{Reason: body.Error}
+			}
+		}
+		return response, fmt.Errorf("claim GitHub publication recovery: %w", err)
+	}
+	return response, nil
+}
+
+func (c *Client) UpdateGitHubPublicationCredential(ctx context.Context, daemonID, runtimeID, taskID, claimID, credentialHandle, action string) (bool, error) {
+	var response struct {
+		RevocationConfirmed bool `json:"revocation_confirmed"`
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/credential", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	err := c.postJSON(ctx, path, map[string]string{"daemon_id": daemonID, "claim_id": claimID, "credential_handle": credentialHandle, "credential_action": action}, &response)
+	return response.RevocationConfirmed, err
+}
+
+func (c *Client) CompleteGitHubPublicationRecovery(ctx context.Context, daemonID, runtimeID, taskID, repository, claimID, credentialHandle, remoteSHA string, pullRequest githubPullRequest) error {
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/github-publication-recovery/complete", url.PathEscape(runtimeID), url.PathEscape(taskID))
+	return c.postJSON(ctx, path, map[string]any{
+		"daemon_id": daemonID, "repository": repository, "claim_id": claimID, "credential_handle": credentialHandle,
+		"remote_sha": remoteSHA, "pull_request_number": pullRequest.Number,
+		"pull_request_url": pullRequest.URL, "readback_head_sha": pullRequest.HeadSHA,
+		"revocation_confirmed": true,
+	}, nil)
 }
 
 func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, taskID, contributionID string) (http.Header, error) {
@@ -478,6 +606,10 @@ const (
 var errStartClaimRejected = errors.New("task start claim rejected")
 
 func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...string) (bool, error) {
+	return c.StartTaskWithDeliveryPreflight(ctx, task, nil, capabilities...)
+}
+
+func (c *Client) StartTaskWithDeliveryPreflight(ctx context.Context, task Task, preflight *deliverycontract.Preflight, capabilities ...string) (bool, error) {
 	var negotiated bool
 	var decodeResponse responseDecoder = func(r io.Reader) error {
 		data, err := io.ReadAll(io.LimitReader(r, maxStartTaskResponseBytes+1))
@@ -503,7 +635,11 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 	path := fmt.Sprintf("/api/daemon/tasks/%s/start", task.ID)
 	if !task.StartClaimSupported {
 		// Old servers have no safe replay contract. Preserve one attempt.
-		err := c.postJSON(ctx, path, map[string]any{"capabilities": capabilities}, decodeResponse)
+		body := map[string]any{"capabilities": capabilities}
+		if preflight != nil {
+			body["delivery_preflight"] = preflight
+		}
+		err := c.postJSON(ctx, path, body, decodeResponse)
 		return err == nil && negotiated, err
 	}
 	if task.RuntimeID == "" || task.DispatchedAt == "" {
@@ -511,11 +647,15 @@ func (c *Client) StartTask(ctx context.Context, task Task, capabilities ...strin
 	}
 	ctx, cancel := context.WithTimeout(ctx, startTaskTimeout)
 	defer cancel()
-	err := c.postJSONWithRetry(ctx, path, map[string]any{
+	body := map[string]any{
 		"runtime_id":    task.RuntimeID,
 		"capabilities":  capabilities,
 		"dispatched_at": task.DispatchedAt,
-	}, decodeResponse, startTaskRetrySchedule)
+	}
+	if preflight != nil {
+		body["delivery_preflight"] = preflight
+	}
+	err := c.postJSONWithRetry(ctx, path, body, decodeResponse, startTaskRetrySchedule)
 	var reqErr *requestError
 	if errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusConflict {
 		return false, fmt.Errorf("%w: %w", errStartClaimRejected, err)
@@ -619,10 +759,10 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 }
 
 func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, defaultTerminalRetrySchedule)
+	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, "", "", false, "", "", defaultTerminalRetrySchedule)
 }
 
-func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, schedule []time.Duration) error {
+func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir, recoveryRef, recoveryBundlePath string, recoveryBundleVerified bool, recoveryRepository, recoveryHeadSHA string, schedule []time.Duration) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -635,6 +775,13 @@ func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, outp
 	}
 	if durableWorkDir != "" {
 		body["durable_work_dir"] = durableWorkDir
+	}
+	if recoveryRef != "" {
+		body["recovery_ref"] = recoveryRef
+		body["recovery_bundle_path"] = recoveryBundlePath
+		body["recovery_bundle_verified"] = recoveryBundleVerified
+		body["recovery_repository"] = recoveryRepository
+		body["recovery_head_sha"] = recoveryHeadSHA
 	}
 	if sessionRolloutMissing {
 		body["session_rollout_missing"] = true

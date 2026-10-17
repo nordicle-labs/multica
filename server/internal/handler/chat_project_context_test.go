@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 func createChatProjectTestProject(t *testing.T, workspaceID, title, description string) string {
@@ -316,8 +317,8 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 	var taskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
-			agent_id, runtime_id, status, priority, chat_session_id
-		) VALUES ($1, $2, 'queued', 1000, $3)
+			agent_id, runtime_id, status, priority, chat_session_id, context
+		) VALUES ($1, $2, 'queued', 1000, $3, '{"delivery_intent":"none"}')
 		RETURNING id
 	`, agentID, runtimeID, sessionID).Scan(&taskID); err != nil {
 		t.Fatalf("create chat task: %v", err)
@@ -326,6 +327,7 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
 	})
 
+	setupGitHubClaimTestBroker(t, projectRepoURL)
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest(
 		http.MethodPost,
@@ -334,6 +336,7 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 		testWorkspaceID,
 		"chat-project-context-test",
 	)
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {
@@ -342,12 +345,13 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 
 	var response struct {
 		Task *struct {
-			ID                 string                `json:"id"`
-			ProjectID          string                `json:"project_id"`
-			ProjectTitle       string                `json:"project_title"`
-			ProjectDescription string                `json:"project_description"`
-			ProjectResources   []ProjectResourceData `json:"project_resources"`
-			Repos              []RepoData            `json:"repos"`
+			GitHubCredentialAck string                `json:"github_credential_ack"`
+			ID                  string                `json:"id"`
+			ProjectID           string                `json:"project_id"`
+			ProjectTitle        string                `json:"project_title"`
+			ProjectDescription  string                `json:"project_description"`
+			ProjectResources    []ProjectResourceData `json:"project_resources"`
+			Repos               []RepoData            `json:"repos"`
 		} `json:"task"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
@@ -356,6 +360,7 @@ func TestClaimTaskByRuntime_ChatProjectContext(t *testing.T) {
 	if response.Task == nil || response.Task.ID != taskID {
 		t.Fatalf("claimed task = %+v, want %s", response.Task, taskID)
 	}
+	completeGitHubClaimForTest(t, response.Task.GitHubCredentialAck)
 	if response.Task.ProjectID != projectID {
 		t.Fatalf("project_id = %q, want %q", response.Task.ProjectID, projectID)
 	}

@@ -67,6 +67,22 @@ func TestGitEnv(t *testing.T) {
 	}
 }
 
+func TestGitEnvCredentialHelperIsContextScoped(t *testing.T) {
+	const helper = "cache --socket=/tmp/task-only.sock"
+	env := gitEnvContext(WithGitCredentialHelper(context.Background(), helper))
+	joined := strings.Join(env, "\n")
+	if !strings.Contains(joined, "credential.helper") || !strings.Contains(joined, helper) || !strings.Contains(joined, "credential.useHttpPath") {
+		t.Fatalf("credential helper config missing from git environment: %q", joined)
+	}
+	if !strings.Contains(joined, "GIT_CONFIG_KEY_1=credential.helper\nGIT_CONFIG_VALUE_1=\n") ||
+		!strings.Contains(joined, "GIT_CONFIG_KEY_2=credential.helper\nGIT_CONFIG_VALUE_2="+helper) {
+		t.Fatalf("task helper does not reset inherited credential helpers first: %q", joined)
+	}
+	if strings.Contains(strings.Join(gitEnv(), "\n"), helper) {
+		t.Fatal("task credential helper leaked into the general git environment")
+	}
+}
+
 func TestGitEnvPreservesExistingConfig(t *testing.T) {
 	// GIT_CONFIG_COUNT env vars are process-wide; cannot use t.Setenv in
 	// parallel tests, so run sequentially.
@@ -1701,6 +1717,93 @@ func TestCreateWorktreePathCollisionDoesNotLeakBranch(t *testing.T) {
 	}
 	if leaked := strings.TrimSpace(string(out)); leaked != "" {
 		t.Errorf("branch leaked into bare repo after path-collision failure:\n%s", leaked)
+	}
+}
+
+func TestCreateUniqueTaskBranchClassifiesArbitraryErrorByExactRef(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	const branch = "agent/test-agent/localized-collision"
+	runGitAuthored(t, repo, "branch", branch, gitHead(t, repo))
+
+	attempts := 0
+	got, err := createUniqueTaskBranch(context.Background(), repo, branch, func(candidate string) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("erreur Git localisée arbitraire")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("createUniqueTaskBranch failed: %v", err)
+	}
+	if attempts != 2 || got == branch {
+		t.Fatalf("attempts = %d, branch = %q; want one exact-ref retry", attempts, got)
+	}
+}
+
+func TestCreateUniqueTaskBranchPreservesErrorWhenExactRefIsAbsent(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	wantErr := errors.New("unrelated Git failure")
+	attempts := 0
+
+	_, err := createUniqueTaskBranch(context.Background(), repo, "agent/test-agent/no-ref", func(string) error {
+		attempts++
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) || attempts != 1 {
+		t.Fatalf("error = %v, attempts = %d; want original error after one attempt", err, attempts)
+	}
+}
+
+func TestCreateUniqueTaskBranchPreservesCancellation(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts := 0
+
+	_, err := createUniqueTaskBranch(ctx, repo, "agent/test-agent/cancelled", func(string) error {
+		attempts++
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) || attempts != 1 {
+		t.Fatalf("error = %v, attempts = %d; want cancellation after one attempt", err, attempts)
+	}
+}
+
+func TestCheckoutNewBranchHandlesRepeatedBranchCollisions(t *testing.T) {
+	t.Parallel()
+	repo := createTestRepo(t)
+	base := gitHead(t, repo)
+	const branch = "agent/test-agent/reused-task"
+
+	first, err := checkoutNewBranch(repo, branch, base)
+	if err != nil {
+		t.Fatalf("first checkoutNewBranch failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "local.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("write local commit: %v", err)
+	}
+	runGitAuthored(t, repo, "add", "local.txt")
+	runGitAuthored(t, repo, "commit", "-m", "local work")
+	localCommit := gitHead(t, repo)
+
+	// Seed the timestamp range used by the old one-shot collision retry.
+	now := time.Now().Unix()
+	for suffix := now - 2; suffix <= now+10; suffix++ {
+		runGitAuthored(t, repo, "branch", fmt.Sprintf("%s-%d", branch, suffix), base)
+	}
+	second, err := checkoutNewBranch(repo, branch, base)
+	if err != nil {
+		t.Fatalf("checkoutNewBranch after repeated collisions failed: %v", err)
+	}
+	if first == second {
+		t.Fatalf("branches are not unique: %q", first)
+	}
+	if got := gitRefCommit(t, repo, "refs/heads/"+first); got != localCommit {
+		t.Fatalf("first branch = %s, want preserved local commit %s", got, localCommit)
 	}
 }
 

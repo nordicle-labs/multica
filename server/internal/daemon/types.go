@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/pkg/remotemcp"
@@ -79,8 +80,8 @@ type Task struct {
 	WorkspaceSlug        string                 `json:"workspace_slug,omitempty"`
 	IssueIdentifier      string                 `json:"issue_identifier,omitempty"`
 	RemoteMCPConnections []remotemcp.Connection `json:"remote_mcp_connections,omitempty"`
-	// RemoteMCPDaemonToken stays inside the daemon and authenticates the local
-	// broker's credential-resolution calls. It must never enter agent env/config.
+	// RemoteMCPDaemonToken stays inside the daemon and authenticates host-side
+	// task operations. It must never enter agent env/config.
 	RemoteMCPDaemonToken string `json:"remote_mcp_daemon_token,omitempty"`
 	// PluginHookTools are this workspace's agent-trigger plugin hooks, which
 	// the local MCP server presents to the agent as tools. Resolved by the
@@ -102,10 +103,14 @@ type Task struct {
 	Agent                         *AgentData             `json:"agent,omitempty"`
 	ConnectedApps                 []ConnectedAppData     `json:"connected_apps,omitempty"` // per-run app capabilities mounted through runtime MCP overlays
 	Repos                         []RepoData             `json:"repos,omitempty"`
-	ProjectID                     string                 `json:"project_id,omitempty"`                       // active project for this task, when present
-	ProjectTitle                  string                 `json:"project_title,omitempty"`                    // human-readable project title for context injection
-	ProjectDescription            string                 `json:"project_description,omitempty"`              // durable project-level context injected into the brief
-	ProjectResources              []ProjectResourceData  `json:"project_resources,omitempty"`                // project-scoped resources to expose to the agent
+	DeliveryIntent                string                 `json:"delivery_intent,omitempty"`     // allowlisted server-persisted policy; absent/unknown fails closed
+	ProjectID                     string                 `json:"project_id,omitempty"`          // active project for this task, when present
+	ProjectTitle                  string                 `json:"project_title,omitempty"`       // human-readable project title for context injection
+	ProjectDescription            string                 `json:"project_description,omitempty"` // durable project-level context injected into the brief
+	ProjectResources              []ProjectResourceData  `json:"project_resources,omitempty"`   // project-scoped resources to expose to the agent
+	GitHubCredentials             []GitHubCredential     `json:"github_credentials,omitempty"`
+	GitHubCredentialAck           string                 `json:"github_credential_ack,omitempty"`
+	GitCredentialHelper           string                 `json:"-"`
 	IsLeaderTask                  bool                   `json:"is_leader_task,omitempty"`                   // true when executing in the squad-leader coordinator role
 	LeaderRoleResolved            bool                   `json:"leader_role_resolved,omitempty"`             // server capability: IsLeaderTask/SquadID authoritatively answer "is this a leader run". Absent on servers predating it — those before #4951 never sent is_leader_task at all, later ones send it without this guarantee — so taskIsSquadLeader falls back to the briefing marker for both (MUL-5811)
 	PriorSessionID                string                 `json:"prior_session_id,omitempty"`                 // Claude session ID from a previous task on this issue
@@ -178,6 +183,12 @@ type Task struct {
 	// Empty or non-task-scoped values are fatal for writable agent tasks; the
 	// daemon must not fall back to its own token. See MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
+}
+
+type GitHubCredential struct {
+	Repository string    `json:"repository"`
+	Token      string    `json:"token"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon
@@ -293,14 +304,20 @@ type TaskResult struct {
 	Status     string `json:"status"`
 	Comment    string `json:"comment"`
 	BranchName string `json:"branch_name,omitempty"`
+	CommitSHA  string `json:"-"`
+	TreeSHA    string `json:"-"`
 	EnvType    string `json:"env_type,omitempty"`
 	SessionID  string `json:"session_id,omitempty"` // Claude session ID for future resumption
 	WorkDir    string `json:"work_dir,omitempty"`   // working directory used during execution
 	// DurableWorkDir replaces WorkDir only after a disposable local worktree
 	// was finalized and its removal was confirmed. Empty keeps WorkDir authoritative.
-	DurableWorkDir string `json:"durable_work_dir,omitempty"`
-	EnvRoot        string `json:"-"` // env root dir for writing GC metadata (not sent to server)
-	FailureReason  string `json:"-"` // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
+	DurableWorkDir         string `json:"durable_work_dir,omitempty"`
+	RecoveryRef            string `json:"recovery_ref,omitempty"`
+	RecoveryBundlePath     string `json:"recovery_bundle_path,omitempty"`
+	RecoveryBundleVerified bool   `json:"recovery_bundle_verified,omitempty"`
+	RecoveryRepository     string `json:"recovery_repository,omitempty"`
+	EnvRoot                string `json:"-"` // env root dir for writing GC metadata (not sent to server)
+	FailureReason          string `json:"-"` // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
 	// SessionRolloutMissing is set when the daemon withheld this task's Codex
 	// session because its rollout was not in the store (MUL-5305). Forwarded to
 	// the terminal report so the server clears the resume pointer and flags the

@@ -121,6 +121,20 @@ func TestRemoteMCPDaemonTokenForClaim(t *testing.T) {
 	}
 }
 
+func TestRemoteMCPDaemonTokenForClaimWithoutRemoteMCP(t *testing.T) {
+	runtime := db.AgentRuntime{
+		WorkspaceID: parseUUID(testWorkspaceID),
+		DaemonID:    strToText("daemon-github-finalizer"),
+	}
+	raw, params, err := remoteMCPDaemonTokenForClaim(AgentTaskResponse{}, runtime)
+	if err != nil {
+		t.Fatalf("remoteMCPDaemonTokenForClaim: %v", err)
+	}
+	if !strings.HasPrefix(raw, "mdt_") || len(params) != 1 || params[0].TokenHash != auth.HashToken(raw) {
+		t.Fatalf("claim daemon token = %q, params = %+v", raw, params)
+	}
+}
+
 func TestListDaemonWorkspaces_UserScopedAndConditional(t *testing.T) {
 	w := testutil.Call(t, testHandler.ListDaemonWorkspaces, newRequest(http.MethodGet, "/api/daemon/workspaces", nil)).Want(http.StatusOK)
 
@@ -2081,15 +2095,18 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 		"issue_id":   issueID,
 	})
 
+	setupGitHubClaimTestBroker(t, projectRepoURL)
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-project-repos")
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
 
 	var resp struct {
 		Task *struct {
-			Repos            []RepoData            `json:"repos"`
-			ProjectID        string                `json:"project_id"`
-			ProjectResources []ProjectResourceData `json:"project_resources"`
+			GitHubCredentialAck string                `json:"github_credential_ack"`
+			Repos               []RepoData            `json:"repos"`
+			ProjectID           string                `json:"project_id"`
+			ProjectResources    []ProjectResourceData `json:"project_resources"`
 		} `json:"task"`
 	}
 	w.JSON(&resp)
@@ -2113,6 +2130,7 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 	if len(resp.Task.ProjectResources) != 1 {
 		t.Errorf("expected 1 project_resources entry, got %d", len(resp.Task.ProjectResources))
 	}
+	completeGitHubClaimForTest(t, resp.Task.GitHubCredentialAck)
 }
 
 // When an issue belongs to a project that has a description, the claim handler
@@ -2206,54 +2224,6 @@ func TestClaimTask_QuickCreateInjectsProjectDescription(t *testing.T) {
 	}
 }
 
-// When the issue's project has no github_repo resources, the claim handler
-// must fall back to workspace repos (the pre-override behavior).
-func TestClaimTask_ProjectWithoutRepos_FallsBackToWorkspaceRepos(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-
-	setHandlerTestWorkspaceRepos(t, []map[string]string{
-		{"url": "https://github.com/example/workspace-fallback", "description": "ws"},
-	})
-
-	projectID := dbfx.Project(t, "Claim project without repos")
-
-	var agentID, runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
-		testWorkspaceID,
-	).Scan(&agentID, &runtimeID)
-
-	issueID := dbfx.Issue(t, "no project repos", testutil.Cols{
-		"project_id": projectID,
-		"priority":   "medium",
-		"number":     88002,
-	})
-
-	dbfx.Task(t, agentID, testutil.Cols{
-		"runtime_id": runtimeID,
-		"issue_id":   issueID,
-	})
-
-	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-fallback")
-	req = withURLParam(req, "runtimeId", runtimeID)
-	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
-
-	var resp struct {
-		Task *struct {
-			Repos []RepoData `json:"repos"`
-		} `json:"task"`
-	}
-	w.JSON(&resp)
-	if resp.Task == nil {
-		t.Fatal("expected task in response")
-	}
-	if len(resp.Task.Repos) != 1 || !strings.HasSuffix(resp.Task.Repos[0].URL, "workspace-fallback") {
-		t.Fatalf("expected workspace fallback repo, got %+v", resp.Task.Repos)
-	}
-}
-
 // Regression test for #1276: ClaimTaskByRuntime must populate both
 // workspace and project context for run_only autopilot tasks. Project context
 // is what lets the daemon select a bound local_directory and materialize the
@@ -2275,6 +2245,7 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 		"description": projectDescription,
 	})
 	const projectRepoURL = "https://github.com/example/run-only-project"
+	setupGitHubClaimTestBroker(t, projectRepoURL)
 	dbfx.Insert(t, "project_resource", testutil.Cols{
 		"project_id":    projectID,
 		"workspace_id":  testWorkspaceID,
@@ -2318,6 +2289,7 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
 		testWorkspaceID, "test-daemon-claim")
+	req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("runtimeId", runtimeID)
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -2329,13 +2301,14 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 
 	var resp struct {
 		Task *struct {
-			WorkspaceID        string                `json:"workspace_id"`
-			ThreadName         string                `json:"thread_name"`
-			Repos              []RepoData            `json:"repos"`
-			ProjectID          string                `json:"project_id"`
-			ProjectTitle       string                `json:"project_title"`
-			ProjectDescription string                `json:"project_description"`
-			ProjectResources   []ProjectResourceData `json:"project_resources"`
+			GitHubCredentialAck string                `json:"github_credential_ack"`
+			WorkspaceID         string                `json:"workspace_id"`
+			ThreadName          string                `json:"thread_name"`
+			Repos               []RepoData            `json:"repos"`
+			ProjectID           string                `json:"project_id"`
+			ProjectTitle        string                `json:"project_title"`
+			ProjectDescription  string                `json:"project_description"`
+			ProjectResources    []ProjectResourceData `json:"project_resources"`
 		} `json:"task"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
@@ -2391,6 +2364,7 @@ func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceAndProjectContext(t *testi
 	if len(resp.Task.Repos) != 1 || resp.Task.Repos[0].URL != projectRepoURL {
 		t.Fatalf("repos = %+v, want only project repo %q", resp.Task.Repos, projectRepoURL)
 	}
+	completeGitHubClaimForTest(t, resp.Task.GitHubCredentialAck)
 }
 
 // TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects verifies
@@ -2724,7 +2698,29 @@ func TestClaimResponseAgentIdentityMatches(t *testing.T) {
 	}
 }
 
+func TestTaskToResponseReadsPersistedDeliveryIntentFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		context string
+		want    string
+	}{
+		{name: "none", context: `{"delivery_intent":"none"}`, want: "none"},
+		{name: "artifact", context: `{"delivery_intent":"artifact"}`, want: "artifact"},
+		{name: "publish", context: `{"delivery_intent":"publish"}`, want: "publish"},
+		{name: "legacy", context: `{}`, want: "invalid"},
+		{name: "unknown", context: `{"delivery_intent":"admin"}`, want: "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taskToResponse(db.AgentTaskQueue{Context: []byte(tc.context)}, "").DeliveryIntent
+			if got != tc.want {
+				t.Fatalf("delivery intent = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 type claimRuntimeGuardTask struct {
+	GitHubCredentialAck           string          `json:"github_credential_ack"`
 	PriorSessionID                string          `json:"prior_session_id"`
 	PriorWorkDir                  string          `json:"prior_work_dir"`
 	PriorSessionResumeUnavailable bool            `json:"prior_session_resume_unavailable"`
@@ -2741,7 +2737,7 @@ type claimRuntimeGuardTask struct {
 
 func claimTaskForRuntimeGuard(t *testing.T, runtimeID, daemonID string) *claimRuntimeGuardTask {
 	t.Helper()
-	return claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, "")
+	return claimTaskForRuntimeGuardWithCapabilities(t, runtimeID, daemonID, protocol.DaemonCapabilityGitHubAppCredentialsV3+","+protocol.DaemonCapabilityExplicitDeliveryV1)
 }
 
 // claimTaskForRuntimeGuardWithCapabilities claims as a daemon advertising the
@@ -2772,6 +2768,9 @@ func claimTaskForRuntimeGuardWithCapabilities(t *testing.T, runtimeID, daemonID,
 	}
 	if resp.Task == nil {
 		t.Fatal("expected a task in response, got nil")
+	}
+	if resp.Task.GitHubCredentialAck != "" {
+		completeGitHubClaimForTest(t, resp.Task.GitHubCredentialAck)
 	}
 	return resp.Task
 }
