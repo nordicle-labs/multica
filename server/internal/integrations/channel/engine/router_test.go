@@ -645,6 +645,13 @@ func TestRouter_TelegramProductIntakeFailsClosedAndRetriesReceipt(t *testing.T) 
 	if h.dedup.marks() != 0 || h.dedup.releases() != 1 {
 		t.Fatalf("receipt failure did not remain replayable: marks=%d releases=%d", h.dedup.marks(), h.dedup.releases())
 	}
+	h.replier.durableErr = nil
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("redeliver product intake receipt: %v", err)
+	}
+	if h.dedup.marks() != 1 || h.dedup.releases() != 1 {
+		t.Fatalf("successful redelivery was not finalized: marks=%d releases=%d", h.dedup.marks(), h.dedup.releases())
+	}
 }
 
 func TestRouter_InstallationNotFound_Drops(t *testing.T) {
