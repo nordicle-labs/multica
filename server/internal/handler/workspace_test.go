@@ -227,10 +227,17 @@ VALUES ($1, 'head-a', 0, 'backend', 'completed', 'success', false)
 		"status":       "planned",
 		"priority":     "none",
 	})
+	squadID := dbfx.Insert(t, "squad", testutil.Cols{
+		"workspace_id": wsID,
+		"name":         "Workspace delete intake squad",
+		"leader_id":    agentID,
+		"creator_id":   testUserID,
+	})
 	dbfx.Insert(t, "product_intake_binding", testutil.Cols{
 		"workspace_id": wsID, "source_type": "multica_chat", "source_id": "delete-source",
 		"conversation_id": "delete-conversation", "actor_id": testUserID, "target_agent_id": agentID,
-		"product_key": "delete-product", "project_id": projectID, "risk_policy": "targeted_check",
+		"product_key": "delete-product", "project_id": projectID, "squad_id": squadID,
+		"required_capability": "engineering", "risk_policy": "targeted_check",
 		"revision": 1, "status": "active", "valid_until": testutil.Raw("now() + interval '1 hour'"),
 		"created_by": testUserID, "change_reason": "workspace deletion coverage",
 	})
