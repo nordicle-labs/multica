@@ -316,6 +316,14 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 		task, taskErr := qtx.GetLatestProductIntakeTaskForIssue(ctx, db.GetLatestProductIntakeTaskForIssueParams{
 			IssueID: issue.ID, AgentID: in.TargetAgentID,
 		})
+		if errors.Is(taskErr, pgx.ErrNoRows) {
+			task, taskErr = s.Tasks.EnqueueTaskForSquadLeaderByActor(ctx, issue, in.TargetAgentID, binding.SquadID, in.ActorID)
+			if errors.Is(taskErr, ErrDuplicatePendingTask) {
+				task, taskErr = qtx.GetLatestProductIntakeTaskForIssue(ctx, db.GetLatestProductIntakeTaskForIssueParams{
+					IssueID: issue.ID, AgentID: in.TargetAgentID,
+				})
+			}
+		}
 		if taskErr != nil {
 			return ProductIntakeResult{}, fmt.Errorf("recover product intake task: %w", taskErr)
 		}

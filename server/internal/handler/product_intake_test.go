@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -269,6 +270,59 @@ func TestTonyProductIntakeRecoversMessageIDAfterDeliveryPersistenceGap(t *testin
 	}
 	if issues != 1 || tasks != 1 {
 		t.Fatalf("MessageID recovery counts: issues=%d tasks=%d", issues, tasks)
+	}
+}
+
+func TestTonyProductIntakeRepairsIssueWithoutTask(t *testing.T) {
+	agentID := dbfx.Agent(t, "Tony issue-only recovery", testRuntimeID, testutil.Cols{"system_key": service.TonySystemKey})
+	projectID := dbfx.Project(t, "Tony issue-only recovery")
+	sessionID := dbfx.ChatSession(t, agentID, testutil.Cols{"explicitly_created_at": testutil.Raw("now()")})
+	binding := createProductIntakeBinding(t, service.IntakeSourceMulticaChat, sessionID, sessionID, agentID, projectID, "tests_review")
+	intakeID := uuid.NewString()
+	originKey := strings.Join([]string{testWorkspaceID, service.IntakeSourceMulticaChat, sessionID, sessionID, testUserID, agentID, intakeID}, "\x1f")
+	originID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(originKey)).String()
+	issueID := dbfx.Issue(t, "crashed before task enqueue", testutil.Cols{
+		"project_id": projectID, "assignee_type": "squad", "assignee_id": uuidToString(binding.SquadID),
+		"origin_type": service.IntakeSourceMulticaChat, "origin_id": originID,
+	})
+	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID)
+	dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, issueID)
+	var tasksBeforeRetry int
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1`, issueID).Scan(&tasksBeforeRetry); err != nil {
+		t.Fatal(err)
+	}
+	if tasksBeforeRetry != 0 {
+		t.Fatalf("crash gap has %d tasks before retry, want 0", tasksBeforeRetry)
+	}
+
+	result, err := testHandler.ProductIntake.Process(context.Background(), service.ProductIntakeRequest{
+		WorkspaceID: util.MustParseUUID(testWorkspaceID), ActorID: util.MustParseUUID(testUserID),
+		SourceType: service.IntakeSourceMulticaChat, SourceID: sessionID, ConversationID: sessionID,
+		TargetAgentID: util.MustParseUUID(agentID), MessageID: intakeID, Text: "feature: retry after issue commit",
+	})
+	if err != nil {
+		t.Fatalf("retry issue-only intake: %v", err)
+	}
+	if uuidToString(result.Issue.ID) != issueID || !result.Resumed {
+		t.Fatalf("retry did not resume canonical issue: %+v", result)
+	}
+	var issues, tasks int
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM issue WHERE id=$1`, issueID).Scan(&issues); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1`, issueID).Scan(&tasks); err != nil {
+		t.Fatal(err)
+	}
+	if issues != 1 || tasks != 1 {
+		t.Fatalf("issue-only recovery counts: issues=%d tasks=%d", issues, tasks)
+	}
+	claimed, err := testHandler.TaskService.ClaimTask(context.Background(), util.MustParseUUID(agentID))
+	if err != nil || claimed == nil || claimed.ID != result.Task.ID {
+		t.Fatalf("claim repaired intake task: task=%+v err=%v", claimed, err)
+	}
+	started, err := testHandler.TaskService.StartTask(context.Background(), claimed.ID)
+	if err != nil || started == nil || !started.StartedAt.Valid {
+		t.Fatalf("start repaired intake task: task=%+v err=%v", started, err)
 	}
 }
 
