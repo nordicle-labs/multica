@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -54,10 +55,13 @@ func TestTonyChatProductIntakeCanaryCreatesAndResumesRealTask(t *testing.T) {
 	}
 	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, first.IssueID)
 	dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, first.IssueID)
-	if _, err := testPool.Exec(context.Background(), `
-		UPDATE agent_task_queue SET status = 'running', started_at = now() WHERE id = $1
-	`, first.TaskID); err != nil {
-		t.Fatalf("start canary task: %v", err)
+	claimed, err := testHandler.TaskService.ClaimTask(context.Background(), util.MustParseUUID(agentID))
+	if err != nil || claimed == nil || uuidToString(claimed.ID) != first.TaskID {
+		t.Fatalf("claim canary task: task=%+v err=%v", claimed, err)
+	}
+	started, err := testHandler.TaskService.StartTask(context.Background(), claimed.ID)
+	if err != nil || started == nil || !started.StartedAt.Valid {
+		t.Fatalf("start canary task through runtime service: task=%+v err=%v", started, err)
 	}
 
 	resumed := send(uuid.NewString())
@@ -104,16 +108,17 @@ func TestTonyChatProductIntakeConcurrentDeliveryKeepsOneIssueAndTask(t *testing.
 	createProductIntakeBinding(t, service.IntakeSourceMulticaChat, sessionID, sessionID, agentID, projectID, "tests_review")
 
 	start := make(chan struct{})
+	intakeID := uuid.NewString()
 	results := make(chan SendChatMessageResponse, 2)
 	errs := make(chan string, 2)
 	var wg sync.WaitGroup
-	for range 2 {
+	for i := range 2 {
 		wg.Add(1)
-		go func() {
+		go func(index int) {
 			defer wg.Done()
 			<-start
 			req := newRequest(http.MethodPost, "/api/chat/sessions/"+sessionID+"/messages", map[string]any{
-				"content": "feature: one canonical concurrent intake", "intake_id": uuid.NewString(),
+				"content": fmt.Sprintf("feature: title %d", index), "intake_id": intakeID,
 			})
 			req = withChatTestWorkspaceCtx(t, withURLParam(req, "sessionId", sessionID))
 			w := httptest.NewRecorder()
@@ -128,7 +133,7 @@ func TestTonyChatProductIntakeConcurrentDeliveryKeepsOneIssueAndTask(t *testing.
 				return
 			}
 			results <- out
-		}()
+		}(i)
 	}
 	close(start)
 	wg.Wait()
@@ -148,16 +153,27 @@ func TestTonyChatProductIntakeConcurrentDeliveryKeepsOneIssueAndTask(t *testing.
 	dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, got[0].IssueID)
 }
 
-func TestTonyReleaseRequiresApprovalFromAuthenticatedMember(t *testing.T) {
+func TestTonyReleaseRequiresDistinctImmutableSHAApproval(t *testing.T) {
 	agentID := dbfx.Agent(t, "Tony release", testRuntimeID, testutil.Cols{"system_key": service.TonySystemKey})
 	projectID := dbfx.Project(t, "Tony release")
 	sessionID := dbfx.ChatSession(t, agentID, testutil.Cols{"explicitly_created_at": testutil.Raw("now()")})
-	createProductIntakeBinding(t, service.IntakeSourceMulticaChat, sessionID, sessionID, agentID, projectID, "explicit_approval_rollback")
+	binding := createProductIntakeBinding(t, service.IntakeSourceMulticaChat, sessionID, sessionID, agentID, projectID, "explicit_approval_rollback")
+	approverID := dbfx.User(t, "Tony approver", "tony-approver-"+uuid.NewString()+"@example.test")
+	dbfx.Member(t, testWorkspaceID, approverID, "admin")
+	intakeID := uuid.NewString()
+	approval, err := testHandler.ProductIntake.CreateApproval(context.Background(), service.ProductIntakeApprovalRequest{
+		WorkspaceID: util.MustParseUUID(testWorkspaceID), BindingID: binding.ID,
+		ApproverID: util.MustParseUUID(approverID), MessageID: intakeID,
+		ArtifactSHA: "0123456789abcdef0123456789abcdef01234567", Decision: "approved",
+	})
+	if err != nil {
+		t.Fatalf("create distinct approval: %v", err)
+	}
 
 	send := func(approvalID string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := newRequest(http.MethodPost, "/api/chat/sessions/"+sessionID+"/messages", map[string]any{
-			"content": "release: candidate", "intake_id": uuid.NewString(), "approval_id": approvalID,
+			"content": "release: candidate", "intake_id": intakeID, "approval_id": approvalID,
 		})
 		req = withChatTestWorkspaceCtx(t, withURLParam(req, "sessionId", sessionID))
 		w := httptest.NewRecorder()
@@ -165,10 +181,10 @@ func TestTonyReleaseRequiresApprovalFromAuthenticatedMember(t *testing.T) {
 		return w
 	}
 
-	if w := send(uuid.NewString()); w.Code != http.StatusConflict {
+	if w := send(testUserID); w.Code != http.StatusConflict {
 		t.Fatalf("forged approval: expected 409, got %d: %s", w.Code, w.Body.String())
 	}
-	w := send(testUserID)
+	w := send(uuidToString(approval.ID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("authenticated approval: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -178,6 +194,9 @@ func TestTonyReleaseRequiresApprovalFromAuthenticatedMember(t *testing.T) {
 	}
 	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, out.IssueID)
 	dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, out.IssueID)
+	if _, err := testPool.Exec(context.Background(), `UPDATE product_intake_approval SET decision='denied' WHERE id=$1`, approval.ID); err == nil {
+		t.Fatal("approval decision was mutable")
+	}
 }
 
 func TestProductIntakeBindingRevisionIsMonotoneAndAudited(t *testing.T) {
@@ -253,10 +272,13 @@ func TestTonyProductIntakeRevalidatesBindingScopeClassificationAndRole(t *testin
 
 func createProductIntakeBinding(t *testing.T, sourceType, sourceID, conversationID, agentID, projectID, policy string) db.ProductIntakeBinding {
 	t.Helper()
+	squadID := dbfx.Squad(t, "intake-"+uuid.NewString(), agentID)
+	dbfx.SquadMember(t, squadID, "agent", agentID, testutil.Cols{"role": "product-engineering"})
 	binding, err := testHandler.ProductIntake.CreateBindingRevision(context.Background(), service.ProductIntakeBindingRevisionRequest{
 		WorkspaceID: util.MustParseUUID(testWorkspaceID), ActorID: util.MustParseUUID(testUserID), SourceType: sourceType,
 		SourceID: sourceID, ConversationID: conversationID, TargetAgentID: util.MustParseUUID(agentID),
-		ProductKey: "operating-system", ProjectID: util.MustParseUUID(projectID), RiskPolicy: policy,
+		ProductKey: "operating-system", ProjectID: util.MustParseUUID(projectID), SquadID: util.MustParseUUID(squadID),
+		RequiredCapability: "product-engineering", RiskPolicy: policy,
 		ValidUntil: time.Now().Add(time.Hour), CreatedBy: util.MustParseUUID(testUserID), ChangeReason: "test binding",
 	})
 	if err != nil {

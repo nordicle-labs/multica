@@ -94,7 +94,7 @@ func (q *Queries) GetLatestActiveProductIntakeTask(ctx context.Context, arg GetL
 }
 
 const getLatestProductIntakeBinding = `-- name: GetLatestProductIntakeBinding :one
-SELECT id, workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, product_key, project_id, risk_policy, revision, status, valid_from, valid_until, created_by, change_reason, created_at, revoked_by, revoked_at
+SELECT id, workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, product_key, project_id, squad_id, required_capability, risk_policy, revision, status, valid_from, valid_until, created_by, change_reason, created_at, revoked_by, revoked_at
 FROM product_intake_binding
 WHERE workspace_id = $1
   AND source_type = $2
@@ -135,6 +135,8 @@ func (q *Queries) GetLatestProductIntakeBinding(ctx context.Context, arg GetLate
 		&i.TargetAgentID,
 		&i.ProductKey,
 		&i.ProjectID,
+		&i.SquadID,
+		&i.RequiredCapability,
 		&i.RiskPolicy,
 		&i.Revision,
 		&i.Status,
@@ -145,6 +147,121 @@ func (q *Queries) GetLatestProductIntakeBinding(ctx context.Context, arg GetLate
 		&i.CreatedAt,
 		&i.RevokedBy,
 		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const getProductIntakeApproval = `-- name: GetProductIntakeApproval :one
+SELECT id, workspace_id, binding_id, message_id, approver_id, artifact_sha, decision, created_at FROM product_intake_approval
+WHERE id = $1 AND workspace_id = $2 AND binding_id = $3
+  AND message_id = $4
+`
+
+type GetProductIntakeApprovalParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	BindingID   pgtype.UUID `json:"binding_id"`
+	MessageID   string      `json:"message_id"`
+}
+
+func (q *Queries) GetProductIntakeApproval(ctx context.Context, arg GetProductIntakeApprovalParams) (ProductIntakeApproval, error) {
+	row := q.db.QueryRow(ctx, getProductIntakeApproval,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.BindingID,
+		arg.MessageID,
+	)
+	var i ProductIntakeApproval
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.BindingID,
+		&i.MessageID,
+		&i.ApproverID,
+		&i.ArtifactSha,
+		&i.Decision,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getProductIntakeBinding = `-- name: GetProductIntakeBinding :one
+SELECT id, workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, product_key, project_id, squad_id, required_capability, risk_policy, revision, status, valid_from, valid_until, created_by, change_reason, created_at, revoked_by, revoked_at FROM product_intake_binding WHERE id = $1
+`
+
+func (q *Queries) GetProductIntakeBinding(ctx context.Context, id pgtype.UUID) (ProductIntakeBinding, error) {
+	row := q.db.QueryRow(ctx, getProductIntakeBinding, id)
+	var i ProductIntakeBinding
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SourceType,
+		&i.SourceID,
+		&i.ConversationID,
+		&i.ActorID,
+		&i.TargetAgentID,
+		&i.ProductKey,
+		&i.ProjectID,
+		&i.SquadID,
+		&i.RequiredCapability,
+		&i.RiskPolicy,
+		&i.Revision,
+		&i.Status,
+		&i.ValidFrom,
+		&i.ValidUntil,
+		&i.CreatedBy,
+		&i.ChangeReason,
+		&i.CreatedAt,
+		&i.RevokedBy,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const getProductIntakeDelivery = `-- name: GetProductIntakeDelivery :one
+SELECT id, workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, message_id, binding_id, issue_id, task_id, approval_id, artifact_sha, created_at FROM product_intake_delivery
+WHERE workspace_id = $1 AND source_type = $2
+  AND source_id = $3 AND conversation_id = $4
+  AND actor_id = $5 AND target_agent_id = $6
+  AND message_id = $7
+`
+
+type GetProductIntakeDeliveryParams struct {
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	SourceType     string      `json:"source_type"`
+	SourceID       string      `json:"source_id"`
+	ConversationID string      `json:"conversation_id"`
+	ActorID        pgtype.UUID `json:"actor_id"`
+	TargetAgentID  pgtype.UUID `json:"target_agent_id"`
+	MessageID      string      `json:"message_id"`
+}
+
+func (q *Queries) GetProductIntakeDelivery(ctx context.Context, arg GetProductIntakeDeliveryParams) (ProductIntakeDelivery, error) {
+	row := q.db.QueryRow(ctx, getProductIntakeDelivery,
+		arg.WorkspaceID,
+		arg.SourceType,
+		arg.SourceID,
+		arg.ConversationID,
+		arg.ActorID,
+		arg.TargetAgentID,
+		arg.MessageID,
+	)
+	var i ProductIntakeDelivery
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SourceType,
+		&i.SourceID,
+		&i.ConversationID,
+		&i.ActorID,
+		&i.TargetAgentID,
+		&i.MessageID,
+		&i.BindingID,
+		&i.IssueID,
+		&i.TaskID,
+		&i.ApprovalID,
+		&i.ArtifactSha,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -220,33 +337,74 @@ func (q *Queries) GetProductIntakeTask(ctx context.Context, id pgtype.UUID) (Age
 	return i, err
 }
 
+const insertProductIntakeApproval = `-- name: InsertProductIntakeApproval :one
+INSERT INTO product_intake_approval (
+    workspace_id, binding_id, message_id, approver_id, artifact_sha, decision
+) VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, workspace_id, binding_id, message_id, approver_id, artifact_sha, decision, created_at
+`
+
+type InsertProductIntakeApprovalParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	BindingID   pgtype.UUID `json:"binding_id"`
+	MessageID   string      `json:"message_id"`
+	ApproverID  pgtype.UUID `json:"approver_id"`
+	ArtifactSha string      `json:"artifact_sha"`
+	Decision    string      `json:"decision"`
+}
+
+func (q *Queries) InsertProductIntakeApproval(ctx context.Context, arg InsertProductIntakeApprovalParams) (ProductIntakeApproval, error) {
+	row := q.db.QueryRow(ctx, insertProductIntakeApproval,
+		arg.WorkspaceID,
+		arg.BindingID,
+		arg.MessageID,
+		arg.ApproverID,
+		arg.ArtifactSha,
+		arg.Decision,
+	)
+	var i ProductIntakeApproval
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.BindingID,
+		&i.MessageID,
+		&i.ApproverID,
+		&i.ArtifactSha,
+		&i.Decision,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertProductIntakeBindingRevision = `-- name: InsertProductIntakeBindingRevision :one
 INSERT INTO product_intake_binding (
     workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id,
-    product_key, project_id, risk_policy, revision, status, valid_from,
+    product_key, project_id, squad_id, required_capability, risk_policy, revision, status, valid_from,
     valid_until, created_by, change_reason
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
-    $7, $8, $9, $10, 'active', now(),
-    $11, $12, $13
+    $7, $8, $9, $10, $11, $12, 'active', now(),
+    $13, $14, $15
 )
-RETURNING id, workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, product_key, project_id, risk_policy, revision, status, valid_from, valid_until, created_by, change_reason, created_at, revoked_by, revoked_at
+RETURNING id, workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, product_key, project_id, squad_id, required_capability, risk_policy, revision, status, valid_from, valid_until, created_by, change_reason, created_at, revoked_by, revoked_at
 `
 
 type InsertProductIntakeBindingRevisionParams struct {
-	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
-	SourceType     string             `json:"source_type"`
-	SourceID       string             `json:"source_id"`
-	ConversationID string             `json:"conversation_id"`
-	ActorID        pgtype.UUID        `json:"actor_id"`
-	TargetAgentID  pgtype.UUID        `json:"target_agent_id"`
-	ProductKey     string             `json:"product_key"`
-	ProjectID      pgtype.UUID        `json:"project_id"`
-	RiskPolicy     string             `json:"risk_policy"`
-	Revision       int64              `json:"revision"`
-	ValidUntil     pgtype.Timestamptz `json:"valid_until"`
-	CreatedBy      pgtype.UUID        `json:"created_by"`
-	ChangeReason   string             `json:"change_reason"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	SourceType         string             `json:"source_type"`
+	SourceID           string             `json:"source_id"`
+	ConversationID     string             `json:"conversation_id"`
+	ActorID            pgtype.UUID        `json:"actor_id"`
+	TargetAgentID      pgtype.UUID        `json:"target_agent_id"`
+	ProductKey         string             `json:"product_key"`
+	ProjectID          pgtype.UUID        `json:"project_id"`
+	SquadID            pgtype.UUID        `json:"squad_id"`
+	RequiredCapability string             `json:"required_capability"`
+	RiskPolicy         string             `json:"risk_policy"`
+	Revision           int64              `json:"revision"`
+	ValidUntil         pgtype.Timestamptz `json:"valid_until"`
+	CreatedBy          pgtype.UUID        `json:"created_by"`
+	ChangeReason       string             `json:"change_reason"`
 }
 
 func (q *Queries) InsertProductIntakeBindingRevision(ctx context.Context, arg InsertProductIntakeBindingRevisionParams) (ProductIntakeBinding, error) {
@@ -259,6 +417,8 @@ func (q *Queries) InsertProductIntakeBindingRevision(ctx context.Context, arg In
 		arg.TargetAgentID,
 		arg.ProductKey,
 		arg.ProjectID,
+		arg.SquadID,
+		arg.RequiredCapability,
 		arg.RiskPolicy,
 		arg.Revision,
 		arg.ValidUntil,
@@ -276,6 +436,8 @@ func (q *Queries) InsertProductIntakeBindingRevision(ctx context.Context, arg In
 		&i.TargetAgentID,
 		&i.ProductKey,
 		&i.ProjectID,
+		&i.SquadID,
+		&i.RequiredCapability,
 		&i.RiskPolicy,
 		&i.Revision,
 		&i.Status,
@@ -286,6 +448,70 @@ func (q *Queries) InsertProductIntakeBindingRevision(ctx context.Context, arg In
 		&i.CreatedAt,
 		&i.RevokedBy,
 		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const insertProductIntakeDelivery = `-- name: InsertProductIntakeDelivery :one
+INSERT INTO product_intake_delivery (
+    id, workspace_id, source_type, source_id, conversation_id, actor_id,
+    target_agent_id, message_id, binding_id, issue_id, task_id, approval_id, artifact_sha
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9, $10, $11,
+    $12, $13
+)
+RETURNING id, workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, message_id, binding_id, issue_id, task_id, approval_id, artifact_sha, created_at
+`
+
+type InsertProductIntakeDeliveryParams struct {
+	ID             pgtype.UUID `json:"id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	SourceType     string      `json:"source_type"`
+	SourceID       string      `json:"source_id"`
+	ConversationID string      `json:"conversation_id"`
+	ActorID        pgtype.UUID `json:"actor_id"`
+	TargetAgentID  pgtype.UUID `json:"target_agent_id"`
+	MessageID      string      `json:"message_id"`
+	BindingID      pgtype.UUID `json:"binding_id"`
+	IssueID        pgtype.UUID `json:"issue_id"`
+	TaskID         pgtype.UUID `json:"task_id"`
+	ApprovalID     pgtype.UUID `json:"approval_id"`
+	ArtifactSha    pgtype.Text `json:"artifact_sha"`
+}
+
+func (q *Queries) InsertProductIntakeDelivery(ctx context.Context, arg InsertProductIntakeDeliveryParams) (ProductIntakeDelivery, error) {
+	row := q.db.QueryRow(ctx, insertProductIntakeDelivery,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.SourceType,
+		arg.SourceID,
+		arg.ConversationID,
+		arg.ActorID,
+		arg.TargetAgentID,
+		arg.MessageID,
+		arg.BindingID,
+		arg.IssueID,
+		arg.TaskID,
+		arg.ApprovalID,
+		arg.ArtifactSha,
+	)
+	var i ProductIntakeDelivery
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SourceType,
+		&i.SourceID,
+		&i.ConversationID,
+		&i.ActorID,
+		&i.TargetAgentID,
+		&i.MessageID,
+		&i.BindingID,
+		&i.IssueID,
+		&i.TaskID,
+		&i.ApprovalID,
+		&i.ArtifactSha,
+		&i.CreatedAt,
 	)
 	return i, err
 }

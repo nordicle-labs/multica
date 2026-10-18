@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx_product_intake_delivery_id ON product_intake_delivery(id);

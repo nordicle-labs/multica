@@ -25,6 +25,8 @@ func TestRouter_TelegramProductIntakeCanaryUsesRealIssueAndTaskServices(t *testi
 	runtimeID := fx.Runtime(t, "telegram-intake-"+tag)
 	agentID := fx.Agent(t, "telegram-intake-"+tag, runtimeID)
 	projectID := fx.Project(t, "telegram-intake-"+tag)
+	squadID := fx.Squad(t, "telegram-intake-"+tag, agentID)
+	fx.SquadMember(t, squadID, "agent", agentID, dbfx.Cols{"role": "product-engineering"})
 	installationID := uuid.NewString()
 
 	queries := db.New(pool)
@@ -36,7 +38,8 @@ func TestRouter_TelegramProductIntakeCanaryUsesRealIssueAndTaskServices(t *testi
 		WorkspaceID: util.MustParseUUID(fx.WorkspaceID), ActorID: util.MustParseUUID(fx.UserID),
 		SourceType: service.IntakeSourceTelegram, SourceID: installationID, ConversationID: "chat-42:topic-7",
 		TargetAgentID: util.MustParseUUID(agentID), ProductKey: "operating-system",
-		ProjectID: util.MustParseUUID(projectID), RiskPolicy: "tests_review",
+		ProjectID: util.MustParseUUID(projectID), SquadID: util.MustParseUUID(squadID),
+		RequiredCapability: "product-engineering", RiskPolicy: "tests_review",
 		ValidUntil: time.Now().Add(time.Hour), CreatedBy: util.MustParseUUID(fx.UserID), ChangeReason: "integration canary",
 	}); err != nil {
 		t.Fatalf("create Telegram intake binding: %v", err)
@@ -88,6 +91,14 @@ func TestRouter_TelegramProductIntakeCanaryUsesRealIssueAndTaskServices(t *testi
 	})
 	if !task.ID.Valid || task.IssueID != issue.ID || task.AgentID != util.MustParseUUID(agentID) {
 		t.Fatalf("Telegram intake task is not correlated: %+v", task)
+	}
+	claimed, err := tasks.ClaimTask(context.Background(), util.MustParseUUID(agentID))
+	if err != nil || claimed == nil || claimed.ID != task.ID {
+		t.Fatalf("claim Telegram intake task: task=%+v err=%v", claimed, err)
+	}
+	started, err := tasks.StartTask(context.Background(), claimed.ID)
+	if err != nil || started == nil || !started.StartedAt.Valid {
+		t.Fatalf("start Telegram intake task: task=%+v err=%v", started, err)
 	}
 	if h.binder.ensureCalls != 0 || h.dedup.marks() != 1 {
 		t.Fatalf("Telegram intake crossed into Chat or lost dedup: ensure=%d marks=%d", h.binder.ensureCalls, h.dedup.marks())

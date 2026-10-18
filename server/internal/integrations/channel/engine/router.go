@@ -280,7 +280,9 @@ func (r *Router) Handle(ctx context.Context, msg channel.InboundMessage) error {
 			set.Typing.OnIngested(tctx, inst, msg, res.ChatSessionID)
 		}()
 	}
-	r.scheduleReply(set, inst, msg, res)
+	if !res.replyDelivered {
+		r.scheduleReply(set, inst, msg, res)
+	}
 	return nil
 }
 
@@ -322,6 +324,18 @@ func (r *Router) dispatch(ctx context.Context, set ResolverSet, msg channel.Inbo
 	}
 
 	res, finalize, err := r.processClaimed(ctx, set, msg, inst, claimToken, bareFresh, startChat)
+	if err == nil && res.Outcome == OutcomeProductIntake && finalize == finalizeMark {
+		replier, ok := set.Replier.(DurableOutboundReplier)
+		if !ok {
+			finalize = finalizeRelease
+			err = errors.New("product intake requires durable outbound replier")
+		} else if replyErr := replier.ReplyDurable(ctx, inst, msg, res); replyErr != nil {
+			finalize = finalizeRelease
+			err = fmt.Errorf("deliver product intake receipt: %w", replyErr)
+		} else {
+			res.replyDelivered = true
+		}
+	}
 
 	if claimed && finalize != finalizeNone {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(ctx), dedupFinalizeTimeout)
@@ -394,10 +408,8 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		}, finalizeMark, nil
 	}
 
-	// Telegram intake keeps using the channel engine for transport identity and
-	// dedup. A missing binding means an ordinary Telegram Chat; once a binding
-	// exists, stale identity, classification, policy, and gate failures are
-	// terminal and cannot fall back to an ordinary agent run.
+	// Telegram product ingress is fail-closed. It never falls back to ordinary
+	// Chat when the versioned product binding is missing, stale, or invalid.
 	if r.intake != nil && msg.Source.ChannelType == channel.Type("telegram") {
 		conversationID := msg.Source.ChatID
 		if msg.Source.ThreadID != "" {
@@ -420,16 +432,14 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 				TaskID: intake.Task.ID, TaskStartedAt: intake.Task.StartedAt,
 			}, finalizeMark, nil
 		}
-		if !errors.Is(intakeErr, service.ErrIntakeBindingMissing) {
-			if service.IsProductIntakeRefusal(intakeErr) {
-				_ = set.Audit.RecordDrop(ctx, inst.ID, msg, DropReasonInvalidEvent)
-				return Result{
-					Outcome: OutcomeDropped, DropReason: DropReasonInvalidEvent,
-					InstallationID: inst.ID, Sender: msg.Source.SenderID,
-				}, finalizeMark, nil
-			}
-			return Result{}, finalizeRelease, fmt.Errorf("route product intake: %w", intakeErr)
+		if errors.Is(intakeErr, service.ErrIntakeBindingMissing) || service.IsProductIntakeRefusal(intakeErr) {
+			_ = set.Audit.RecordDrop(ctx, inst.ID, msg, DropReasonInvalidEvent)
+			return Result{
+				Outcome: OutcomeDropped, DropReason: DropReasonInvalidEvent,
+				InstallationID: inst.ID, Sender: msg.Source.SenderID,
+			}, finalizeMark, nil
 		}
+		return Result{}, finalizeRelease, fmt.Errorf("route product intake: %w", intakeErr)
 	}
 
 	// 5-6. Resolve the current Chat route, then either append normally or

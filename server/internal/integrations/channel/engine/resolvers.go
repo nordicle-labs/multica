@@ -82,7 +82,8 @@ type Result struct {
 	IssueUsageHadMedia bool
 	// runScheduled reports whether this ingest scheduled a normal chat run.
 	// It is Router-internal state: repliers must continue to use Outcome.
-	runScheduled bool
+	runScheduled   bool
+	replyDelivered bool
 }
 
 // ResolvedInstallation is the channel-agnostic installation context the Router
@@ -382,6 +383,12 @@ type Auditor interface {
 // replies. Driven off the ACK critical path by the Router.
 type OutboundReplier interface {
 	Reply(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage, res Result)
+}
+
+// DurableOutboundReplier is required for product-intake receipts. An error
+// leaves the inbound dedup claim replayable instead of losing the receipt.
+type DurableOutboundReplier interface {
+	ReplyDurable(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage, res Result) error
 }
 
 // TypingNotifier shows a "processing" indicator when a message is ingested and

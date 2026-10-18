@@ -201,14 +201,23 @@ func (f *fakeAuditor) last() (DropReason, bool) {
 }
 
 type fakeReplier struct {
-	mu      sync.Mutex
-	results []Result
+	mu         sync.Mutex
+	results    []Result
+	durableErr error
 }
 
 func (f *fakeReplier) Reply(_ context.Context, _ ResolvedInstallation, _ channel.InboundMessage, res Result) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.results = append(f.results, res)
+}
+
+func (f *fakeReplier) ReplyDurable(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage, res Result) error {
+	if f.durableErr != nil {
+		return f.durableErr
+	}
+	f.Reply(ctx, inst, msg, res)
+	return nil
 }
 func (f *fakeReplier) calls() []Result {
 	f.mu.Lock()
@@ -579,7 +588,7 @@ func TestRouter_TelegramProductIntakeUsesStableChannelIdentityAndStopsChatFallba
 	})
 	h.router.Register(channel.Type("telegram"), ResolverSet{
 		Installation: h.inst, Identity: h.ident, Dedup: h.dedup,
-		Session: h.binder, Audit: h.audit, OriginType: "telegram_chat",
+		Session: h.binder, Audit: h.audit, Replier: h.replier, OriginType: "telegram_chat",
 	})
 	msg := p2pMessage(t)
 	msg.Source.ChannelType = channel.Type("telegram")
@@ -603,6 +612,38 @@ func TestRouter_TelegramProductIntakeUsesStableChannelIdentityAndStopsChatFallba
 	}
 	if h.dedup.marks() != 1 {
 		t.Fatalf("Telegram intake dedup marks = %d, want 1", h.dedup.marks())
+	}
+}
+
+func TestRouter_TelegramProductIntakeFailsClosedAndRetriesReceipt(t *testing.T) {
+	for _, intakeErr := range []error{service.ErrIntakeBindingMissing, service.ErrIntakeBindingStale} {
+		t.Run(intakeErr.Error(), func(t *testing.T) {
+			h := newHarness(t)
+			h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{Logger: discardLogger(), ProductIntake: &fakeProductIntake{err: intakeErr}})
+			h.router.Register(channel.Type("telegram"), ResolverSet{Installation: h.inst, Identity: h.ident, Dedup: h.dedup, Session: h.binder, Audit: h.audit, Replier: h.replier})
+			msg := p2pMessage(t)
+			msg.Source.ChannelType = channel.Type("telegram")
+			if err := h.router.Handle(context.Background(), msg); err != nil {
+				t.Fatal(err)
+			}
+			if h.binder.ensureCalls != 0 || h.dedup.marks() != 1 {
+				t.Fatalf("refusal fell through: ensure=%d marks=%d", h.binder.ensureCalls, h.dedup.marks())
+			}
+		})
+	}
+
+	h := newHarness(t)
+	h.replier.durableErr = errors.New("telegram unavailable")
+	intake := &fakeProductIntake{result: service.ProductIntakeResult{Issue: db.Issue{ID: uid(93)}, Task: db.AgentTaskQueue{ID: uid(94)}}}
+	h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{Logger: discardLogger(), ProductIntake: intake})
+	h.router.Register(channel.Type("telegram"), ResolverSet{Installation: h.inst, Identity: h.ident, Dedup: h.dedup, Session: h.binder, Audit: h.audit, Replier: h.replier})
+	msg := p2pMessage(t)
+	msg.Source.ChannelType = channel.Type("telegram")
+	if err := h.router.Handle(context.Background(), msg); err == nil {
+		t.Fatal("failed durable receipt was acknowledged")
+	}
+	if h.dedup.marks() != 0 || h.dedup.releases() != 1 {
+		t.Fatalf("receipt failure did not remain replayable: marks=%d releases=%d", h.dedup.marks(), h.dedup.releases())
 	}
 }
 

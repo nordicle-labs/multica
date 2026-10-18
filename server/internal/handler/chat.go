@@ -931,10 +931,10 @@ func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
 		if _, ok := parseUUIDOrBadRequest(w, strings.TrimSpace(*req.IntakeID), "intake_id"); !ok {
 			return
 		}
-		approvedBy := pgtype.UUID{}
+		approvalID := pgtype.UUID{}
 		if req.ApprovalID != nil && strings.TrimSpace(*req.ApprovalID) != "" {
 			var ok bool
-			approvedBy, ok = parseUUIDOrBadRequest(w, strings.TrimSpace(*req.ApprovalID), "approval_id")
+			approvalID, ok = parseUUIDOrBadRequest(w, strings.TrimSpace(*req.ApprovalID), "approval_id")
 			if !ok {
 				return
 			}
@@ -943,7 +943,7 @@ func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
 			WorkspaceID: session.WorkspaceID, ActorID: parseUUID(userID),
 			SourceType: service.IntakeSourceMulticaChat, SourceID: sessionID,
 			ConversationID: sessionID, TargetAgentID: session.AgentID,
-			MessageID: strings.TrimSpace(*req.IntakeID), Text: req.Content, ApprovedBy: approvedBy,
+			MessageID: strings.TrimSpace(*req.IntakeID), Text: req.Content, ApprovalID: approvalID,
 		})
 		if err != nil {
 			switch {

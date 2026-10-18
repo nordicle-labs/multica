@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -39,7 +41,7 @@ type ProductIntakeRequest struct {
 	TargetAgentID  pgtype.UUID
 	MessageID      string
 	Text           string
-	ApprovedBy     pgtype.UUID
+	ApprovalID     pgtype.UUID
 }
 
 type ProductIntakeResult struct {
@@ -63,16 +65,16 @@ func NewProductIntakeService(q *db.Queries, tx TxStarter, issues *IssueService, 
 }
 
 type ProductIntakeBindingRevisionRequest struct {
-	WorkspaceID, ActorID, TargetAgentID, ProjectID, CreatedBy pgtype.UUID
-	SourceType, SourceID, ConversationID                      string
-	ProductKey, RiskPolicy, ChangeReason                      string
-	ValidUntil                                                time.Time
+	WorkspaceID, ActorID, TargetAgentID, ProjectID, SquadID, CreatedBy pgtype.UUID
+	SourceType, SourceID, ConversationID                               string
+	ProductKey, RequiredCapability, RiskPolicy, ChangeReason           string
+	ValidUntil                                                         time.Time
 }
 
 func (s *ProductIntakeService) CreateBindingRevision(ctx context.Context, in ProductIntakeBindingRevisionRequest) (db.ProductIntakeBinding, error) {
-	if !in.WorkspaceID.Valid || !in.ActorID.Valid || !in.TargetAgentID.Valid || !in.ProjectID.Valid || !in.CreatedBy.Valid ||
+	if !in.WorkspaceID.Valid || !in.ActorID.Valid || !in.TargetAgentID.Valid || !in.ProjectID.Valid || !in.SquadID.Valid || !in.CreatedBy.Valid ||
 		strings.TrimSpace(in.SourceID) == "" || strings.TrimSpace(in.ConversationID) == "" ||
-		strings.TrimSpace(in.ProductKey) == "" || strings.TrimSpace(in.ChangeReason) == "" ||
+		strings.TrimSpace(in.ProductKey) == "" || strings.TrimSpace(in.RequiredCapability) == "" || strings.TrimSpace(in.ChangeReason) == "" ||
 		!in.ValidUntil.After(s.Now()) || (in.SourceType != IntakeSourceMulticaChat && in.SourceType != IntakeSourceTelegram) {
 		return db.ProductIntakeBinding{}, ErrIntakeIdentity
 	}
@@ -104,6 +106,9 @@ func (s *ProductIntakeService) CreateBindingRevision(ctx context.Context, in Pro
 	if _, err := qtx.GetProjectInWorkspace(ctx, db.GetProjectInWorkspaceParams{ID: in.ProjectID, WorkspaceID: in.WorkspaceID}); err != nil {
 		return db.ProductIntakeBinding{}, ErrIntakeIdentity
 	}
+	if err := validateIntakeRoute(ctx, qtx, in.WorkspaceID, in.SquadID, in.TargetAgentID, in.RequiredCapability); err != nil {
+		return db.ProductIntakeBinding{}, err
+	}
 	key := db.NextProductIntakeBindingRevisionParams{
 		WorkspaceID: in.WorkspaceID, SourceType: in.SourceType, SourceID: in.SourceID,
 		ConversationID: in.ConversationID, ActorID: in.ActorID, TargetAgentID: in.TargetAgentID,
@@ -121,7 +126,8 @@ func (s *ProductIntakeService) CreateBindingRevision(ctx context.Context, in Pro
 	binding, err := qtx.InsertProductIntakeBindingRevision(ctx, db.InsertProductIntakeBindingRevisionParams{
 		WorkspaceID: in.WorkspaceID, SourceType: in.SourceType, SourceID: in.SourceID,
 		ConversationID: in.ConversationID, ActorID: in.ActorID, TargetAgentID: in.TargetAgentID,
-		ProductKey: in.ProductKey, ProjectID: in.ProjectID, RiskPolicy: in.RiskPolicy,
+		ProductKey: in.ProductKey, ProjectID: in.ProjectID, SquadID: in.SquadID,
+		RequiredCapability: in.RequiredCapability, RiskPolicy: in.RiskPolicy,
 		Revision: int64(revision), ValidUntil: pgtype.Timestamptz{Time: in.ValidUntil, Valid: true},
 		CreatedBy: in.CreatedBy, ChangeReason: in.ChangeReason,
 	})
@@ -132,6 +138,38 @@ func (s *ProductIntakeService) CreateBindingRevision(ctx context.Context, in Pro
 		return db.ProductIntakeBinding{}, fmt.Errorf("commit product intake binding revision: %w", err)
 	}
 	return binding, nil
+}
+
+type ProductIntakeApprovalRequest struct {
+	WorkspaceID, BindingID, ApproverID pgtype.UUID
+	MessageID, ArtifactSHA, Decision   string
+}
+
+var gitSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// CreateApproval records a distinct immutable human decision. Process pins it
+// to the concrete task and SHA when the approved intake is dispatched.
+func (s *ProductIntakeService) CreateApproval(ctx context.Context, in ProductIntakeApprovalRequest) (db.ProductIntakeApproval, error) {
+	if !in.WorkspaceID.Valid || !in.BindingID.Valid || !in.ApproverID.Valid || strings.TrimSpace(in.MessageID) == "" ||
+		!gitSHA.MatchString(in.ArtifactSHA) || (in.Decision != "approved" && in.Decision != "denied") {
+		return db.ProductIntakeApproval{}, ErrIntakeApproval
+	}
+	binding, err := s.Queries.GetProductIntakeBinding(ctx, in.BindingID)
+	if err != nil || binding.WorkspaceID != in.WorkspaceID || binding.Status != "active" || binding.ActorID == in.ApproverID {
+		return db.ProductIntakeApproval{}, ErrIntakeApproval
+	}
+	member, err := s.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{UserID: in.ApproverID, WorkspaceID: in.WorkspaceID})
+	if err != nil || (member.Role != "owner" && member.Role != "admin") {
+		return db.ProductIntakeApproval{}, ErrIntakeApproval
+	}
+	approval, err := s.Queries.InsertProductIntakeApproval(ctx, db.InsertProductIntakeApprovalParams{
+		WorkspaceID: in.WorkspaceID, BindingID: in.BindingID, MessageID: in.MessageID,
+		ApproverID: in.ApproverID, ArtifactSha: in.ArtifactSHA, Decision: in.Decision,
+	})
+	if err != nil {
+		return db.ProductIntakeApproval{}, fmt.Errorf("persist product intake approval: %w", err)
+	}
+	return approval, nil
 }
 
 func IsTonyAgent(agent db.Agent) bool {
@@ -218,6 +256,24 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 		}
 		return ProductIntakeResult{}, fmt.Errorf("verify product intake project: %w", err)
 	}
+	if err := validateIntakeRoute(ctx, qtx, in.WorkspaceID, binding.SquadID, in.TargetAgentID, binding.RequiredCapability); err != nil {
+		return ProductIntakeResult{}, err
+	}
+
+	deliveryID := productIntakeDeliveryID(in)
+	if delivery, deliveryErr := qtx.GetProductIntakeDelivery(ctx, db.GetProductIntakeDeliveryParams{
+		WorkspaceID: in.WorkspaceID, SourceType: in.SourceType, SourceID: in.SourceID,
+		ConversationID: in.ConversationID, ActorID: in.ActorID, TargetAgentID: in.TargetAgentID, MessageID: in.MessageID,
+	}); deliveryErr == nil {
+		issue, issueErr := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: delivery.IssueID, WorkspaceID: in.WorkspaceID})
+		task, taskErr := qtx.GetProductIntakeTask(ctx, delivery.TaskID)
+		if issueErr != nil || taskErr != nil {
+			return ProductIntakeResult{}, ErrIntakeBindingStale
+		}
+		return ProductIntakeResult{Binding: binding, Issue: issue, Task: task, Resumed: true}, nil
+	} else if !errors.Is(deliveryErr, pgx.ErrNoRows) {
+		return ProductIntakeResult{}, fmt.Errorf("resolve product intake delivery: %w", deliveryErr)
+	}
 
 	kind, title, ok := ClassifyProductIntake(in.Text)
 	if !ok {
@@ -226,20 +282,16 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 	if !policyAllows(binding.RiskPolicy, kind) {
 		return ProductIntakeResult{}, ErrIntakeRiskPolicy
 	}
-	if binding.RiskPolicy == "explicit_approval_rollback" && !in.ApprovedBy.Valid {
+	var approval db.ProductIntakeApproval
+	if binding.RiskPolicy == "explicit_approval_rollback" && !in.ApprovalID.Valid {
 		return ProductIntakeResult{}, ErrIntakeApproval
 	}
-	if in.ApprovedBy.Valid {
-		if in.ApprovedBy != in.ActorID {
+	if in.ApprovalID.Valid {
+		approval, err = qtx.GetProductIntakeApproval(ctx, db.GetProductIntakeApprovalParams{
+			ID: in.ApprovalID, WorkspaceID: in.WorkspaceID, BindingID: binding.ID, MessageID: in.MessageID,
+		})
+		if err != nil || approval.Decision != "approved" || approval.ApproverID == in.ActorID {
 			return ProductIntakeResult{}, ErrIntakeApproval
-		}
-		if _, err := qtx.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
-			UserID: in.ApprovedBy, WorkspaceID: in.WorkspaceID,
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ProductIntakeResult{}, ErrIntakeApproval
-			}
-			return ProductIntakeResult{}, fmt.Errorf("verify product intake approval: %w", err)
 		}
 	}
 
@@ -249,20 +301,22 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 		Description:  pgtype.Text{String: strings.TrimSpace(in.Text), Valid: true},
 		Status:       "todo",
 		Priority:     intakePriority(binding.RiskPolicy),
-		AssigneeType: pgtype.Text{String: "agent", Valid: true},
-		AssigneeID:   in.TargetAgentID,
+		AssigneeType: pgtype.Text{String: "squad", Valid: true},
+		AssigneeID:   binding.SquadID,
 		CreatorType:  "member",
 		CreatorID:    in.ActorID,
 		ProjectID:    binding.ProjectID,
 		OriginType:   pgtype.Text{String: intakeOriginType(in.SourceType), Valid: true},
-		OriginID:     binding.ID,
+		OriginID:     deliveryID,
 	}, IssueCreateOpts{Platform: in.SourceType})
 	if err == nil {
-		task, taskErr := taskByID(ctx, qtx, created.AssignedTaskID)
+		task, taskErr := qtx.GetLatestActiveProductIntakeTask(ctx, db.GetLatestActiveProductIntakeTaskParams{
+			IssueID: created.Issue.ID, AgentID: in.TargetAgentID,
+		})
 		if taskErr != nil {
 			return ProductIntakeResult{}, taskErr
 		}
-		return ProductIntakeResult{Binding: binding, Issue: created.Issue, Task: task, Kind: kind}, nil
+		return s.persistIntakeDelivery(ctx, tx, qtx, in, binding, approval, deliveryID, created.Issue, task, kind, false)
 	}
 	if !errors.Is(err, ErrActiveDuplicate) || created.DuplicateIssue == nil {
 		return ProductIntakeResult{}, fmt.Errorf("create product intake issue: %w", err)
@@ -278,7 +332,48 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 	if taskErr != nil {
 		return ProductIntakeResult{}, fmt.Errorf("resume product intake issue: %w", taskErr)
 	}
-	return ProductIntakeResult{Binding: binding, Issue: issue, Task: task, Kind: kind, Resumed: true}, nil
+	return s.persistIntakeDelivery(ctx, tx, qtx, in, binding, approval, deliveryID, issue, task, kind, true)
+}
+
+func (s *ProductIntakeService) persistIntakeDelivery(ctx context.Context, tx pgx.Tx, q *db.Queries, in ProductIntakeRequest, binding db.ProductIntakeBinding, approval db.ProductIntakeApproval, deliveryID pgtype.UUID, issue db.Issue, task db.AgentTaskQueue, kind string, resumed bool) (ProductIntakeResult, error) {
+	params := db.InsertProductIntakeDeliveryParams{
+		ID: deliveryID, WorkspaceID: in.WorkspaceID, SourceType: in.SourceType, SourceID: in.SourceID,
+		ConversationID: in.ConversationID, ActorID: in.ActorID, TargetAgentID: in.TargetAgentID,
+		MessageID: in.MessageID, BindingID: binding.ID, IssueID: issue.ID, TaskID: task.ID,
+	}
+	if approval.ID.Valid {
+		params.ApprovalID = approval.ID
+		params.ArtifactSha = pgtype.Text{String: approval.ArtifactSha, Valid: true}
+	}
+	if _, err := q.InsertProductIntakeDelivery(ctx, params); err != nil {
+		return ProductIntakeResult{}, fmt.Errorf("persist product intake delivery: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ProductIntakeResult{}, fmt.Errorf("commit product intake delivery: %w", err)
+	}
+	return ProductIntakeResult{Binding: binding, Issue: issue, Task: task, Kind: kind, Resumed: resumed}, nil
+}
+
+func productIntakeDeliveryID(in ProductIntakeRequest) pgtype.UUID {
+	key := strings.Join([]string{util.UUIDToString(in.WorkspaceID), in.SourceType, in.SourceID, in.ConversationID, util.UUIDToString(in.ActorID), util.UUIDToString(in.TargetAgentID), in.MessageID}, "\x1f")
+	return util.MustParseUUID(uuid.NewSHA1(uuid.NameSpaceOID, []byte(key)).String())
+}
+
+func validateIntakeRoute(ctx context.Context, q *db.Queries, workspaceID, squadID, targetAgentID pgtype.UUID, capability string) error {
+	squad, err := q.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{ID: squadID, WorkspaceID: workspaceID})
+	if err != nil || squad.ArchivedAt.Valid || squad.LeaderID != targetAgentID {
+		return ErrIntakeIdentity
+	}
+	members, err := q.ListSquadMembers(ctx, squadID)
+	if err != nil {
+		return fmt.Errorf("verify product intake capability: %w", err)
+	}
+	for _, member := range members {
+		if member.MemberType == "agent" && member.MemberID == targetAgentID && member.Role == capability {
+			return nil
+		}
+	}
+	return ErrIntakeRiskPolicy
 }
 
 func taskByID(ctx context.Context, q *db.Queries, id pgtype.UUID) (db.AgentTaskQueue, error) {

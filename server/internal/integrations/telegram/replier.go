@@ -68,6 +68,7 @@ type OutboundReplierConfig struct {
 }
 
 var _ engine.OutboundReplier = (*OutboundReplier)(nil)
+var _ engine.DurableOutboundReplier = (*OutboundReplier)(nil)
 
 // NewOutboundReplier builds the replier.
 func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
@@ -91,6 +92,13 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 		client:      cfg.HTTPClient,
 		logger:      logger,
 	}
+}
+
+func (r *OutboundReplier) ReplyDurable(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) error {
+	if res.Outcome != engine.OutcomeProductIntake {
+		return errors.New("durable reply is only supported for product intake")
+	}
+	return r.post(ctx, inst, msg, productIntakeText(res))
 }
 
 // Reply routes each outcome to its user-visible message. Errors are logged,

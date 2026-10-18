@@ -10,6 +10,9 @@ WHERE workspace_id = @workspace_id
 ORDER BY revision DESC
 LIMIT 1;
 
+-- name: GetProductIntakeBinding :one
+SELECT * FROM product_intake_binding WHERE id = $1;
+
 -- name: LockProductIntakeBindingSource :exec
 SELECT pg_advisory_xact_lock(hashtextextended(
     concat_ws(E'\x1f', @workspace_id::text, @source_type::text, @source_id::text,
@@ -41,11 +44,11 @@ WHERE workspace_id = @workspace_id
 -- name: InsertProductIntakeBindingRevision :one
 INSERT INTO product_intake_binding (
     workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id,
-    product_key, project_id, risk_policy, revision, status, valid_from,
+    product_key, project_id, squad_id, required_capability, risk_policy, revision, status, valid_from,
     valid_until, created_by, change_reason
 ) VALUES (
     @workspace_id, @source_type, @source_id, @conversation_id, @actor_id, @target_agent_id,
-    @product_key, @project_id, @risk_policy, @revision, 'active', now(),
+    @product_key, @project_id, @squad_id, @required_capability, @risk_policy, @revision, 'active', now(),
     @valid_until, @created_by, @change_reason
 )
 RETURNING *;
@@ -61,3 +64,32 @@ LIMIT 1;
 
 -- name: GetProductIntakeTask :one
 SELECT * FROM agent_task_queue WHERE id = $1;
+
+-- name: GetProductIntakeApproval :one
+SELECT * FROM product_intake_approval
+WHERE id = @id AND workspace_id = @workspace_id AND binding_id = @binding_id
+  AND message_id = @message_id;
+
+-- name: InsertProductIntakeApproval :one
+INSERT INTO product_intake_approval (
+    workspace_id, binding_id, message_id, approver_id, artifact_sha, decision
+) VALUES (@workspace_id, @binding_id, @message_id, @approver_id, @artifact_sha, @decision)
+RETURNING *;
+
+-- name: GetProductIntakeDelivery :one
+SELECT * FROM product_intake_delivery
+WHERE workspace_id = @workspace_id AND source_type = @source_type
+  AND source_id = @source_id AND conversation_id = @conversation_id
+  AND actor_id = @actor_id AND target_agent_id = @target_agent_id
+  AND message_id = @message_id;
+
+-- name: InsertProductIntakeDelivery :one
+INSERT INTO product_intake_delivery (
+    id, workspace_id, source_type, source_id, conversation_id, actor_id,
+    target_agent_id, message_id, binding_id, issue_id, task_id, approval_id, artifact_sha
+) VALUES (
+    @id, @workspace_id, @source_type, @source_id, @conversation_id, @actor_id,
+    @target_agent_id, @message_id, @binding_id, @issue_id, @task_id,
+    sqlc.narg('approval_id'), sqlc.narg('artifact_sha')
+)
+RETURNING *;
