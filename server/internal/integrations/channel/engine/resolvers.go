@@ -29,6 +29,7 @@ const (
 	OutcomeFreshPending  Outcome = "fresh_pending"
 	OutcomeChatStarted   Outcome = "chat_started"
 	OutcomeIssueUsage    Outcome = "issue_usage"
+	OutcomeProductIntake Outcome = "product_intake"
 	OutcomeAgentOffline  Outcome = "agent_offline"
 	OutcomeAgentArchived Outcome = "agent_archived"
 	// OutcomeInvokeDenied — the sender may not run this agent. The web chat
@@ -69,6 +70,8 @@ type Result struct {
 	IssueIdentifier    string
 	IssueWorkspaceSlug string
 	IssueTitle         string
+	TaskID             pgtype.UUID
+	TaskStartedAt      pgtype.Timestamptz
 	// IssueDuplicate marks an /issue command that did not create a new issue
 	// because the shared duplicate guard found the active IssueID above.
 	// Repliers render this as a business conflict, never as an internal error.
@@ -417,6 +420,10 @@ type ResolverSet struct {
 type IssueCreator interface {
 	Create(ctx context.Context, p service.IssueCreateParams, opts service.IssueCreateOpts) (service.IssueCreateResult, error)
 	PublishAttachmentsChanged(ctx context.Context, issue db.Issue, actorID pgtype.UUID)
+}
+
+type ProductIntakeRouter interface {
+	Process(context.Context, service.ProductIntakeRequest) (service.ProductIntakeResult, error)
 }
 
 // TaskEnqueuer is the narrow subset of service.TaskService the Router needs to

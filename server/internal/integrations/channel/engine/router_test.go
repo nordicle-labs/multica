@@ -15,6 +15,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -508,6 +509,17 @@ type harness struct {
 	lifecycle *fakeChannelChatLifecycle
 }
 
+type fakeProductIntake struct {
+	request service.ProductIntakeRequest
+	result  service.ProductIntakeResult
+	err     error
+}
+
+func (f *fakeProductIntake) Process(_ context.Context, request service.ProductIntakeRequest) (service.ProductIntakeResult, error) {
+	f.request = request
+	return f.result, f.err
+}
+
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	h := &harness{
@@ -553,6 +565,44 @@ func TestRouter_NoResolverSet_ReturnsError(t *testing.T) {
 	msg.Source.ChannelType = channel.Type("slack")
 	if err := h.router.Handle(context.Background(), msg); !errors.Is(err, ErrNoResolverSet) {
 		t.Fatalf("expected ErrNoResolverSet, got %v", err)
+	}
+}
+
+func TestRouter_TelegramProductIntakeUsesStableChannelIdentityAndStopsChatFallback(t *testing.T) {
+	h := newHarness(t)
+	intake := &fakeProductIntake{result: service.ProductIntakeResult{
+		Issue: db.Issue{ID: uid(91), Number: 42, Title: "Telegram canary"},
+		Task:  db.AgentTaskQueue{ID: uid(92), StartedAt: pgtype.Timestamptz{Time: time.Unix(1, 0), Valid: true}},
+	}}
+	h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{
+		Logger: discardLogger(), ProductIntake: intake,
+	})
+	h.router.Register(channel.Type("telegram"), ResolverSet{
+		Installation: h.inst, Identity: h.ident, Dedup: h.dedup,
+		Session: h.binder, Audit: h.audit, OriginType: "telegram_chat",
+	})
+	msg := p2pMessage(t)
+	msg.Source.ChannelType = channel.Type("telegram")
+	msg.Source.ChatID = "chat-42"
+	msg.Source.ThreadID = "topic-7"
+	msg.MessageID = "chat-42:9"
+	msg.CommandText = "feature: Telegram canary"
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("Telegram product intake: %v", err)
+	}
+	if intake.request.SourceType != service.IntakeSourceTelegram ||
+		intake.request.SourceID != util.UUIDToString(h.inst.inst.ID) ||
+		intake.request.ConversationID != "chat-42:topic-7" ||
+		intake.request.MessageID != "chat-42:9" ||
+		intake.request.TargetAgentID != h.inst.inst.AgentID ||
+		intake.request.ActorID != h.ident.id.UserID {
+		t.Fatalf("Telegram intake identity was not preserved: %+v", intake.request)
+	}
+	if h.binder.ensureCalls != 0 || h.binder.appendedParams().Message.Text != "" {
+		t.Fatal("Telegram product intake fell through to the ordinary Chat pipeline")
+	}
+	if h.dedup.marks() != 1 {
+		t.Fatalf("Telegram intake dedup marks = %d, want 1", h.dedup.marks())
 	}
 }
 

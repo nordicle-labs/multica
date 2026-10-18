@@ -138,6 +138,11 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 					"installation_id", util.UUIDToString(inst.ID), "error", err)
 			}
 		}
+	case engine.OutcomeProductIntake:
+		if err := r.post(ctx, inst, msg, productIntakeText(res)); err != nil {
+			r.logger.WarnContext(ctx, "telegram replier: product intake reply failed",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
+		}
 	case engine.OutcomeDropped:
 		if text := droppedReplyText(res, msg); text != "" {
 			if err := r.post(ctx, inst, msg, text); err != nil {
@@ -228,6 +233,14 @@ func issueDuplicateText(res engine.Result) string {
 		return "⚠️ Not created — active issue " + id + " already exists."
 	}
 	return "⚠️ Not created — active issue " + id + " already exists: " + title
+}
+
+func productIntakeText(res engine.Result) string {
+	status := "queued"
+	if res.TaskStartedAt.Valid {
+		status = "started"
+	}
+	return fmt.Sprintf("✅ %s · run %s · %s", issueResultIdentifier(res), util.UUIDToString(res.TaskID), status)
 }
 
 func issueResultIdentifier(res engine.Result) string {

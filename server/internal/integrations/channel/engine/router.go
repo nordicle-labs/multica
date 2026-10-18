@@ -39,6 +39,7 @@ type Router struct {
 
 	issues    IssueCreator
 	tasks     TaskEnqueuer
+	intake    ProductIntakeRouter
 	reader    SessionReader
 	lifecycle ChannelChatLifecycle
 
@@ -78,6 +79,7 @@ type RouterConfig struct {
 	MediaConcurrency int
 	Logger           *slog.Logger
 	Lifecycle        ChannelChatLifecycle
+	ProductIntake    ProductIntakeRouter
 }
 
 // NewRouter builds a Router around the shared (platform-agnostic) services:
@@ -102,6 +104,7 @@ func NewRouter(issues IssueCreator, tasks TaskEnqueuer, reader SessionReader, cf
 		sets:         make(map[channel.Type]ResolverSet),
 		issues:       issues,
 		tasks:        tasks,
+		intake:       cfg.ProductIntake,
 		reader:       reader,
 		lifecycle:    cfg.Lifecycle,
 		replyTimeout: cfg.ReplyTimeout,
@@ -389,6 +392,44 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 			InstallationID: inst.ID,
 			Sender:         msg.Source.SenderID,
 		}, finalizeMark, nil
+	}
+
+	// Telegram intake keeps using the channel engine for transport identity and
+	// dedup. A missing binding means an ordinary Telegram Chat; once a binding
+	// exists, stale identity, classification, policy, and gate failures are
+	// terminal and cannot fall back to an ordinary agent run.
+	if r.intake != nil && msg.Source.ChannelType == channel.Type("telegram") {
+		conversationID := msg.Source.ChatID
+		if msg.Source.ThreadID != "" {
+			conversationID += ":" + msg.Source.ThreadID
+		}
+		intake, intakeErr := r.intake.Process(ctx, service.ProductIntakeRequest{
+			WorkspaceID: inst.WorkspaceID, ActorID: identity.UserID,
+			SourceType: service.IntakeSourceTelegram, SourceID: util.UUIDToString(inst.ID),
+			ConversationID: conversationID, TargetAgentID: inst.AgentID,
+			MessageID: msg.MessageID, Text: msg.CommandText,
+		})
+		if intakeErr == nil {
+			prefix, workspaceSlug := r.issueWorkspaceIdentity(ctx, inst.WorkspaceID)
+			return Result{
+				Outcome: OutcomeProductIntake, InstallationID: inst.ID,
+				Sender: msg.Source.SenderID, IssueID: intake.Issue.ID,
+				IssueNumber: intake.Issue.Number, IssueTitle: intake.Issue.Title,
+				IssueIdentifier:    service.IssueIdentifier(prefix, intake.Issue.Number),
+				IssueWorkspaceSlug: workspaceSlug, IssueDuplicate: intake.Resumed,
+				TaskID: intake.Task.ID, TaskStartedAt: intake.Task.StartedAt,
+			}, finalizeMark, nil
+		}
+		if !errors.Is(intakeErr, service.ErrIntakeBindingMissing) {
+			if service.IsProductIntakeRefusal(intakeErr) {
+				_ = set.Audit.RecordDrop(ctx, inst.ID, msg, DropReasonInvalidEvent)
+				return Result{
+					Outcome: OutcomeDropped, DropReason: DropReasonInvalidEvent,
+					InstallationID: inst.ID, Sender: msg.Source.SenderID,
+				}, finalizeMark, nil
+			}
+			return Result{}, finalizeRelease, fmt.Errorf("route product intake: %w", intakeErr)
+		}
 	}
 
 	// 5-6. Resolve the current Chat route, then either append normally or

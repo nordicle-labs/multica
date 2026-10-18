@@ -1299,6 +1299,28 @@ type PluginStorage struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ProductIntakeBinding struct {
+	ID             pgtype.UUID        `json:"id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	SourceType     string             `json:"source_type"`
+	SourceID       string             `json:"source_id"`
+	ConversationID string             `json:"conversation_id"`
+	ActorID        pgtype.UUID        `json:"actor_id"`
+	TargetAgentID  pgtype.UUID        `json:"target_agent_id"`
+	ProductKey     string             `json:"product_key"`
+	ProjectID      pgtype.UUID        `json:"project_id"`
+	RiskPolicy     string             `json:"risk_policy"`
+	Revision       int64              `json:"revision"`
+	Status         string             `json:"status"`
+	ValidFrom      pgtype.Timestamptz `json:"valid_from"`
+	ValidUntil     pgtype.Timestamptz `json:"valid_until"`
+	CreatedBy      pgtype.UUID        `json:"created_by"`
+	ChangeReason   string             `json:"change_reason"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	RevokedBy      pgtype.UUID        `json:"revoked_by"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type Project struct {
 	ID          pgtype.UUID        `json:"id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`
