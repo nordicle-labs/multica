@@ -63,6 +63,7 @@ func TestTonyChatProductIntakeCanaryCreatesAndResumesRealTask(t *testing.T) {
 	if err != nil || started == nil || !started.StartedAt.Valid {
 		t.Fatalf("start canary task through runtime service: task=%+v err=%v", started, err)
 	}
+	t.Logf("Tony canary issue_id=%s task_id=%s started_at=%s", first.IssueID, first.TaskID, started.StartedAt.Time.Format(time.RFC3339Nano))
 
 	resumed := send(uuid.NewString())
 	if resumed.IssueID != first.IssueID || resumed.TaskID != first.TaskID || resumed.StartedAt == "" {

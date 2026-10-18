@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -40,9 +41,10 @@ func TestTelegramProductIntakeCanaryTraversesAdapterServicesAndRuntimeClaim(t *t
 	fx.SquadMember(t, squadID, "agent", agentID, dbfx.Cols{"role": "product-engineering"})
 
 	q := db.New(testPool)
+	botID := time.Now().UnixNano()
 	inst, err := q.UpsertChannelInstallation(ctx, db.UpsertChannelInstallationParams{
 		WorkspaceID: util.MustParseUUID(fx.WorkspaceID), AgentID: util.MustParseUUID(agentID),
-		ChannelType: string(TypeTelegram), Config: []byte(`{"app_id":"999"}`), InstallerUserID: util.MustParseUUID(fx.UserID),
+		ChannelType: string(TypeTelegram), Config: []byte(fmt.Sprintf(`{"app_id":%d}`, botID)), InstallerUserID: util.MustParseUUID(fx.UserID),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +72,7 @@ func TestTelegramProductIntakeCanaryTraversesAdapterServicesAndRuntimeClaim(t *t
 
 	router := engine.NewRouter(issues, tasks, q, engine.RouterConfig{ProductIntake: intake})
 	router.Register(TypeTelegram, NewTelegramResolverSet(q, testPool, intakeCanaryReplier{}, nil, nil))
-	connector := &telegramChannel{botID: 999, botUsername: "multica_bot", handler: router.Handle}
+	connector := &telegramChannel{botID: botID, botUsername: "multica_bot", handler: router.Handle}
 	if err := connector.dispatch(ctx, Update{UpdateID: 7, Message: &Message{
 		MessageID: 8, From: &User{ID: 111, FirstName: "Ada"}, Chat: Chat{ID: 222, Type: "private"},
 		Text: "feature: adapter canary " + tag,
@@ -90,4 +92,5 @@ func TestTelegramProductIntakeCanaryTraversesAdapterServicesAndRuntimeClaim(t *t
 	if err != nil || started == nil || !started.StartedAt.Valid {
 		t.Fatalf("start task: task=%+v err=%v", started, err)
 	}
+	t.Logf("Telegram canary task_id=%s started_at=%s", taskID, started.StartedAt.Time.Format(time.RFC3339Nano))
 }
