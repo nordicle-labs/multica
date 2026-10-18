@@ -339,8 +339,11 @@ func (r *Router) dispatch(ctx context.Context, set ResolverSet, msg channel.Inbo
 
 	if claimed && finalize != finalizeNone {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(ctx), dedupFinalizeTimeout)
-		r.applyFinalize(finalizeCtx, set, inst.ID, msg.MessageID, claimToken, finalize)
+		finalizeErr := r.applyFinalize(finalizeCtx, set, inst.ID, msg.MessageID, claimToken, finalize)
 		finalizeCancel()
+		if finalizeErr != nil {
+			err = errors.Join(err, finalizeErr)
+		}
 	}
 
 	// ErrClaimLost: another worker holds the claim. Surface as duplicate.
@@ -1122,15 +1125,20 @@ func keyForSessionContext(sessionID pgtype.UUID, contextRevision int64) string {
 }
 
 // applyFinalize flips the in-flight claim row to its terminal state,
-// token-fenced. Best-effort: a transport failure cannot abort the outcome.
-func (r *Router) applyFinalize(ctx context.Context, set ResolverSet, instID pgtype.UUID, messageID string, claimToken pgtype.UUID, action dedupFinalize) {
+// token-fenced. Persistence failures surface so the adapter can retry.
+func (r *Router) applyFinalize(ctx context.Context, set ResolverSet, instID pgtype.UUID, messageID string, claimToken pgtype.UUID, action dedupFinalize) error {
 	switch action {
 	case finalizeMark:
-		_ = set.Dedup.Mark(ctx, instID, messageID, claimToken)
+		if err := set.Dedup.Mark(ctx, instID, messageID, claimToken); err != nil {
+			return fmt.Errorf("mark dedup claim: %w", err)
+		}
 	case finalizeRelease:
-		_ = set.Dedup.Release(ctx, instID, messageID, claimToken)
+		if err := set.Dedup.Release(ctx, instID, messageID, claimToken); err != nil {
+			return fmt.Errorf("release dedup claim: %w", err)
+		}
 	case finalizeNone:
 	}
+	return nil
 }
 
 func (r *Router) drop(ctx context.Context, set ResolverSet, msg channel.InboundMessage, instID pgtype.UUID, reason DropReason) Result {

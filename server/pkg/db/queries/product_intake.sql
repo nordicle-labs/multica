@@ -10,6 +10,9 @@ WHERE workspace_id = @workspace_id
 ORDER BY revision DESC
 LIMIT 1;
 
+-- name: GetProductIntakeDatabaseNow :one
+SELECT now()::timestamptz;
+
 -- name: GetProductIntakeBinding :one
 SELECT * FROM product_intake_binding WHERE id = $1;
 
@@ -64,6 +67,12 @@ LIMIT 1;
 
 -- name: GetProductIntakeTask :one
 SELECT * FROM agent_task_queue WHERE id = $1;
+
+-- name: GetLatestProductIntakeTaskForIssue :one
+SELECT * FROM agent_task_queue
+WHERE issue_id = @issue_id AND agent_id = @agent_id
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
 
 -- name: GetProductIntakeApproval :one
 SELECT * FROM product_intake_approval

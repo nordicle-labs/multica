@@ -57,11 +57,10 @@ type ProductIntakeService struct {
 	TxStarter TxStarter
 	Issues    *IssueService
 	Tasks     *TaskService
-	Now       func() time.Time
 }
 
 func NewProductIntakeService(q *db.Queries, tx TxStarter, issues *IssueService, tasks *TaskService) *ProductIntakeService {
-	return &ProductIntakeService{Queries: q, TxStarter: tx, Issues: issues, Tasks: tasks, Now: time.Now}
+	return &ProductIntakeService{Queries: q, TxStarter: tx, Issues: issues, Tasks: tasks}
 }
 
 type ProductIntakeBindingRevisionRequest struct {
@@ -75,7 +74,7 @@ func (s *ProductIntakeService) CreateBindingRevision(ctx context.Context, in Pro
 	if !in.WorkspaceID.Valid || !in.ActorID.Valid || !in.TargetAgentID.Valid || !in.ProjectID.Valid || !in.SquadID.Valid || !in.CreatedBy.Valid ||
 		strings.TrimSpace(in.SourceID) == "" || strings.TrimSpace(in.ConversationID) == "" ||
 		strings.TrimSpace(in.ProductKey) == "" || strings.TrimSpace(in.RequiredCapability) == "" || strings.TrimSpace(in.ChangeReason) == "" ||
-		!in.ValidUntil.After(s.Now()) || (in.SourceType != IntakeSourceMulticaChat && in.SourceType != IntakeSourceTelegram) {
+		(in.SourceType != IntakeSourceMulticaChat && in.SourceType != IntakeSourceTelegram) {
 		return db.ProductIntakeBinding{}, ErrIntakeIdentity
 	}
 	if _, ok := map[string]bool{"targeted_check": true, "tests_review": true, "security_integration": true, "explicit_approval_rollback": true}[in.RiskPolicy]; !ok {
@@ -87,6 +86,13 @@ func (s *ProductIntakeService) CreateBindingRevision(ctx context.Context, in Pro
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+	databaseNow, err := qtx.GetProductIntakeDatabaseNow(ctx)
+	if err != nil {
+		return db.ProductIntakeBinding{}, fmt.Errorf("read product intake database clock: %w", err)
+	}
+	if !databaseNow.Valid || !in.ValidUntil.After(databaseNow.Time) {
+		return db.ProductIntakeBinding{}, ErrIntakeIdentity
+	}
 	if err := qtx.LockProductIntakeBindingSource(ctx, db.LockProductIntakeBindingSourceParams{
 		WorkspaceID: util.UUIDToString(in.WorkspaceID), SourceType: in.SourceType,
 		SourceID: in.SourceID, ConversationID: in.ConversationID,
@@ -230,8 +236,11 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 	if err != nil {
 		return ProductIntakeResult{}, fmt.Errorf("resolve product intake binding: %w", err)
 	}
-	now := s.Now()
-	if binding.Status != "active" || now.Before(binding.ValidFrom.Time) || !now.Before(binding.ValidUntil.Time) {
+	now, err := qtx.GetProductIntakeDatabaseNow(ctx)
+	if err != nil {
+		return ProductIntakeResult{}, fmt.Errorf("read product intake database clock: %w", err)
+	}
+	if !now.Valid || binding.Status != "active" || now.Time.Before(binding.ValidFrom.Time) || !now.Time.Before(binding.ValidUntil.Time) {
 		return ProductIntakeResult{}, ErrIntakeBindingStale
 	}
 
@@ -261,17 +270,11 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 	}
 
 	deliveryID := productIntakeDeliveryID(in)
-	if delivery, deliveryErr := qtx.GetProductIntakeDelivery(ctx, db.GetProductIntakeDeliveryParams{
+	delivery, deliveryErr := qtx.GetProductIntakeDelivery(ctx, db.GetProductIntakeDeliveryParams{
 		WorkspaceID: in.WorkspaceID, SourceType: in.SourceType, SourceID: in.SourceID,
 		ConversationID: in.ConversationID, ActorID: in.ActorID, TargetAgentID: in.TargetAgentID, MessageID: in.MessageID,
-	}); deliveryErr == nil {
-		issue, issueErr := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: delivery.IssueID, WorkspaceID: in.WorkspaceID})
-		task, taskErr := qtx.GetProductIntakeTask(ctx, delivery.TaskID)
-		if issueErr != nil || taskErr != nil {
-			return ProductIntakeResult{}, ErrIntakeBindingStale
-		}
-		return ProductIntakeResult{Binding: binding, Issue: issue, Task: task, Resumed: true}, nil
-	} else if !errors.Is(deliveryErr, pgx.ErrNoRows) {
+	})
+	if deliveryErr != nil && !errors.Is(deliveryErr, pgx.ErrNoRows) {
 		return ProductIntakeResult{}, fmt.Errorf("resolve product intake delivery: %w", deliveryErr)
 	}
 
@@ -282,17 +285,43 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 	if !policyAllows(binding.RiskPolicy, kind) {
 		return ProductIntakeResult{}, ErrIntakeRiskPolicy
 	}
-	var approval db.ProductIntakeApproval
-	if binding.RiskPolicy == "explicit_approval_rollback" && !in.ApprovalID.Valid {
-		return ProductIntakeResult{}, ErrIntakeApproval
+	approvalID := in.ApprovalID
+	if deliveryErr == nil {
+		approvalID = delivery.ApprovalID
 	}
-	if in.ApprovalID.Valid {
-		approval, err = qtx.GetProductIntakeApproval(ctx, db.GetProductIntakeApprovalParams{
-			ID: in.ApprovalID, WorkspaceID: in.WorkspaceID, BindingID: binding.ID, MessageID: in.MessageID,
-		})
-		if err != nil || approval.Decision != "approved" || approval.ApproverID == in.ActorID {
+	approval, err := validateProductIntakeApproval(ctx, qtx, in, binding, approvalID)
+	if err != nil {
+		return ProductIntakeResult{}, err
+	}
+	if deliveryErr == nil {
+		if delivery.ArtifactSha.Valid && (!approval.ID.Valid || approval.ArtifactSha != delivery.ArtifactSha.String) {
 			return ProductIntakeResult{}, ErrIntakeApproval
 		}
+		issue, issueErr := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{ID: delivery.IssueID, WorkspaceID: in.WorkspaceID})
+		task, taskErr := qtx.GetProductIntakeTask(ctx, delivery.TaskID)
+		if issueErr != nil || taskErr != nil {
+			return ProductIntakeResult{}, ErrIntakeBindingStale
+		}
+		return ProductIntakeResult{Binding: binding, Issue: issue, Task: task, Kind: kind, Resumed: true}, nil
+	}
+
+	// IssueService commits issue + assigned task before this service records the
+	// immutable delivery. Recover that exact pair by deterministic origin after
+	// a crash or persistence failure; MessageID can never create a second pair.
+	if issue, issueErr := qtx.GetIssueByOrigin(ctx, db.GetIssueByOriginParams{
+		WorkspaceID: in.WorkspaceID,
+		OriginType:  pgtype.Text{String: intakeOriginType(in.SourceType), Valid: true},
+		OriginID:    deliveryID,
+	}); issueErr == nil {
+		task, taskErr := qtx.GetLatestProductIntakeTaskForIssue(ctx, db.GetLatestProductIntakeTaskForIssueParams{
+			IssueID: issue.ID, AgentID: in.TargetAgentID,
+		})
+		if taskErr != nil {
+			return ProductIntakeResult{}, fmt.Errorf("recover product intake task: %w", taskErr)
+		}
+		return s.persistIntakeDelivery(ctx, tx, qtx, in, binding, approval, deliveryID, issue, task, kind, true)
+	} else if !errors.Is(issueErr, pgx.ErrNoRows) {
+		return ProductIntakeResult{}, fmt.Errorf("recover product intake issue: %w", issueErr)
 	}
 
 	created, err := s.Issues.Create(ctx, IssueCreateParams{
@@ -333,6 +362,28 @@ func (s *ProductIntakeService) Process(ctx context.Context, in ProductIntakeRequ
 		return ProductIntakeResult{}, fmt.Errorf("resume product intake issue: %w", taskErr)
 	}
 	return s.persistIntakeDelivery(ctx, tx, qtx, in, binding, approval, deliveryID, issue, task, kind, true)
+}
+
+func validateProductIntakeApproval(ctx context.Context, q *db.Queries, in ProductIntakeRequest, binding db.ProductIntakeBinding, approvalID pgtype.UUID) (db.ProductIntakeApproval, error) {
+	if binding.RiskPolicy == "explicit_approval_rollback" && !approvalID.Valid {
+		return db.ProductIntakeApproval{}, ErrIntakeApproval
+	}
+	if !approvalID.Valid {
+		return db.ProductIntakeApproval{}, nil
+	}
+	approval, err := q.GetProductIntakeApproval(ctx, db.GetProductIntakeApprovalParams{
+		ID: approvalID, WorkspaceID: in.WorkspaceID, BindingID: binding.ID, MessageID: in.MessageID,
+	})
+	if err != nil || approval.Decision != "approved" || approval.ApproverID == in.ActorID {
+		return db.ProductIntakeApproval{}, ErrIntakeApproval
+	}
+	member, err := q.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+		UserID: approval.ApproverID, WorkspaceID: in.WorkspaceID,
+	})
+	if err != nil || (member.Role != "owner" && member.Role != "admin") {
+		return db.ProductIntakeApproval{}, ErrIntakeApproval
+	}
+	return approval, nil
 }
 
 func (s *ProductIntakeService) persistIntakeDelivery(ctx context.Context, tx pgx.Tx, q *db.Queries, in ProductIntakeRequest, binding db.ProductIntakeBinding, approval db.ProductIntakeApproval, deliveryID pgtype.UUID, issue db.Issue, task db.AgentTaskQueue, kind string, resumed bool) (ProductIntakeResult, error) {

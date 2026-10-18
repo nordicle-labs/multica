@@ -140,6 +140,7 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // they are still pending: a fresh self-hosted install, which is exactly where an
 // interrupted build would otherwise leave a permanently unusable index.
 var concurrentIndexCleanups = map[string]string{
+	"577_product_intake_approval_id_repair":                     "idx_product_intake_approval_id",
 	"575_product_intake_delivery_message":                       "idx_product_intake_delivery_message",
 	"574_product_intake_delivery_id":                            "idx_product_intake_delivery_id",
 	"573_product_intake_approval_message":                       "idx_product_intake_approval_message",
@@ -460,6 +461,10 @@ func refuseChannelChatRouteHistoryRollbackWith(ctx context.Context, query rowQue
 }
 
 var upMigrationConditions = map[string]migrationCondition{
+	// The rejected product-intake artifact could record 565 after creating only
+	// the binding table. Skip its now-unreachable approval index; 576 creates the
+	// missing objects and 577 builds the index without rewriting applied SQL.
+	"572_product_intake_approval_id": whenTableExists("product_intake_approval"),
 	// Preserve applied history; pending 469 is superseded by the bounded expand
 	// migration. SaaS backfills separately; self-host converges in 491.
 	"469_issue_status_lifecycle_categories": skipMigration("superseded by 478 expansion and 491 convergence (MUL-7365)"),
@@ -531,6 +536,19 @@ func conditionsForDirection(direction string) map[string]migrationCondition {
 func skipMigration(reason string) migrationCondition {
 	return func(context.Context, *pgxpool.Conn) (bool, string, error) {
 		return false, reason, nil
+	}
+}
+
+func whenTableExists(table string) migrationCondition {
+	return func(ctx context.Context, conn *pgxpool.Conn) (bool, string, error) {
+		var exists bool
+		if err := conn.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
+			return false, "", err
+		}
+		if !exists {
+			return false, fmt.Sprintf("table %s does not exist", table), nil
+		}
+		return true, "", nil
 	}
 }
 

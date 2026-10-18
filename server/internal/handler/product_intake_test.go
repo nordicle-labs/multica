@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -69,6 +70,26 @@ func TestTonyChatProductIntakeCanaryCreatesAndResumesRealTask(t *testing.T) {
 	if resumed.IssueID != first.IssueID || resumed.TaskID != first.TaskID || resumed.StartedAt == "" {
 		t.Fatalf("Tony resume lost canonical running task: first=%+v resumed=%+v", first, resumed)
 	}
+
+	testutil.Call(t, testHandler.CancelTaskByUser, cancelTaskByUserRequest(t, testUserID, first.TaskID)).Want(http.StatusOK)
+	restarted := service.NewProductIntakeService(testHandler.Queries, testPool, testHandler.ProductIntake.Issues, testHandler.ProductIntake.Tasks)
+	recovered, err := restarted.Process(context.Background(), service.ProductIntakeRequest{
+		WorkspaceID: util.MustParseUUID(testWorkspaceID), ActorID: util.MustParseUUID(testUserID),
+		SourceType: service.IntakeSourceMulticaChat, SourceID: sessionID, ConversationID: sessionID,
+		TargetAgentID: util.MustParseUUID(agentID), MessageID: first.MessageID, Text: "feature: deterministic Tony intake",
+	})
+	if err != nil || uuidToString(recovered.Task.ID) != first.TaskID || recovered.Task.Status != "cancelled" {
+		t.Fatalf("restart resurrected cancelled intake: result=%+v err=%v", recovered, err)
+	}
+	at := time.Now().Add(time.Hour)
+	wakeup, err := (&service.IssueWakeupService{Tasks: testHandler.TaskService}).Create(
+		context.Background(), util.MustParseUUID(first.IssueID), util.MustParseUUID(testUserID), pgtype.UUID{},
+		service.WakeupInput{AgentID: agentID, Instruction: "revalidate before continuing", Kind: "at", At: &at},
+	)
+	if err != nil || !wakeup.ID.Valid {
+		t.Fatalf("persist bounded intake wakeup: wakeup=%+v err=%v", wakeup, err)
+	}
+	dbfx.Cleanup(t, `DELETE FROM issue_wakeup WHERE id = $1`, wakeup.ID)
 	var chatMessages int
 	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM chat_message WHERE chat_session_id = $1`, sessionID).Scan(&chatMessages); err != nil {
 		t.Fatalf("count direct chat messages: %v", err)
@@ -197,6 +218,57 @@ func TestTonyReleaseRequiresDistinctImmutableSHAApproval(t *testing.T) {
 	dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, out.IssueID)
 	if _, err := testPool.Exec(context.Background(), `UPDATE product_intake_approval SET decision='denied' WHERE id=$1`, approval.ID); err == nil {
 		t.Fatal("approval decision was mutable")
+	}
+	if _, err := testPool.Exec(context.Background(), `DELETE FROM member WHERE workspace_id=$1 AND user_id=$2`, testWorkspaceID, approverID); err != nil {
+		t.Fatal(err)
+	}
+	if revoked := send(uuidToString(approval.ID)); revoked.Code != http.StatusConflict {
+		t.Fatalf("revoked approver resumed release: expected 409, got %d: %s", revoked.Code, revoked.Body.String())
+	}
+}
+
+func TestTonyProductIntakeRecoversMessageIDAfterDeliveryPersistenceGap(t *testing.T) {
+	agentID := dbfx.Agent(t, "Tony recovery", testRuntimeID, testutil.Cols{"system_key": service.TonySystemKey})
+	projectID := dbfx.Project(t, "Tony recovery")
+	sessionID := dbfx.ChatSession(t, agentID, testutil.Cols{"explicitly_created_at": testutil.Raw("now()")})
+	createProductIntakeBinding(t, service.IntakeSourceMulticaChat, sessionID, sessionID, agentID, projectID, "tests_review")
+	intakeID := uuid.NewString()
+
+	send := func(content string) SendChatMessageResponse {
+		t.Helper()
+		req := newRequest(http.MethodPost, "/api/chat/sessions/"+sessionID+"/messages", map[string]any{"content": content, "intake_id": intakeID})
+		req = withChatTestWorkspaceCtx(t, withURLParam(req, "sessionId", sessionID))
+		w := httptest.NewRecorder()
+		testHandler.SendChatMessage(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("Tony recovery send: expected 201, got %d: %s", w.Code, w.Body.String())
+		}
+		var out SendChatMessageResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	first := send("feature: original title")
+	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, first.IssueID)
+	dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, first.IssueID)
+	if _, err := testPool.Exec(context.Background(), `DELETE FROM product_intake_delivery WHERE message_id=$1`, intakeID); err != nil {
+		t.Fatal(err)
+	}
+	retried := send("feature: changed retry title")
+	if retried.IssueID != first.IssueID || retried.TaskID != first.TaskID {
+		t.Fatalf("MessageID retry created new work: first=%+v retry=%+v", first, retried)
+	}
+	var issues, tasks int
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM issue WHERE id=$1`, first.IssueID).Scan(&issues); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM agent_task_queue WHERE issue_id=$1`, first.IssueID).Scan(&tasks); err != nil {
+		t.Fatal(err)
+	}
+	if issues != 1 || tasks != 1 {
+		t.Fatalf("MessageID recovery counts: issues=%d tasks=%d", issues, tasks)
 	}
 }
 

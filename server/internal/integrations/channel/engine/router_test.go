@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,6 +45,7 @@ type fakeDedup struct {
 	token      pgtype.UUID
 	claimErr   error
 	respectCtx bool
+	markErr    error
 	releaseErr error
 	markCalls  int
 	relCalls   int
@@ -63,7 +65,7 @@ func (f *fakeDedup) Mark(_ context.Context, _ pgtype.UUID, _ string, _ pgtype.UU
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.markCalls++
-	return nil
+	return f.markErr
 }
 func (f *fakeDedup) Release(ctx context.Context, _ pgtype.UUID, _ string, _ pgtype.UUID) error {
 	f.mu.Lock()
@@ -73,7 +75,7 @@ func (f *fakeDedup) Release(ctx context.Context, _ pgtype.UUID, _ string, _ pgty
 		return ctx.Err()
 	}
 	f.relCalls++
-	return nil
+	return f.releaseErr
 }
 func (f *fakeDedup) marks() int    { f.mu.Lock(); defer f.mu.Unlock(); return f.markCalls }
 func (f *fakeDedup) releases() int { f.mu.Lock(); defer f.mu.Unlock(); return f.relCalls }
@@ -651,6 +653,34 @@ func TestRouter_TelegramProductIntakeFailsClosedAndRetriesReceipt(t *testing.T) 
 	}
 	if h.dedup.marks() != 1 || h.dedup.releases() != 1 {
 		t.Fatalf("successful redelivery was not finalized: marks=%d releases=%d", h.dedup.marks(), h.dedup.releases())
+	}
+}
+
+func TestRouter_ProductIntakePropagatesDedupFinalizeErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		durableErr error
+		markErr    error
+		releaseErr error
+		want       string
+	}{
+		{name: "mark", markErr: errors.New("mark persistence failed"), want: "mark dedup claim"},
+		{name: "release", durableErr: errors.New("telegram unavailable"), releaseErr: errors.New("release persistence failed"), want: "release dedup claim"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.dedup.markErr = tc.markErr
+			h.dedup.releaseErr = tc.releaseErr
+			h.replier.durableErr = tc.durableErr
+			intake := &fakeProductIntake{result: service.ProductIntakeResult{Issue: db.Issue{ID: uid(93)}, Task: db.AgentTaskQueue{ID: uid(94)}}}
+			h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{Logger: discardLogger(), ProductIntake: intake})
+			h.router.Register(channel.Type("telegram"), ResolverSet{Installation: h.inst, Identity: h.ident, Dedup: h.dedup, Session: h.binder, Audit: h.audit, Replier: h.replier})
+			msg := p2pMessage(t)
+			msg.Source.ChannelType = channel.Type("telegram")
+			if err := h.router.Handle(context.Background(), msg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("finalize error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
