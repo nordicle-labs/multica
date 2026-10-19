@@ -10,10 +10,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 )
+
+type tokenMint struct {
+	repositories []string
+	permissions  Permissions
+}
 
 type bootstrapGitHub struct {
 	mu                  sync.Mutex
@@ -35,6 +41,7 @@ type bootstrapGitHub struct {
 	disconnectCreate    bool
 	revokeCount         int
 	failRevokeAt        int
+	tokenMints          []tokenMint
 }
 
 func TestRepositoryIdentity(t *testing.T) {
@@ -69,9 +76,11 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	if strings.HasPrefix(path, "/app/installations/") && strings.HasSuffix(path, "/access_tokens") {
 		var body struct {
-			Repositories []string `json:"repositories"`
+			Repositories []string    `json:"repositories"`
+			Permissions  Permissions `json:"permissions"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		g.tokenMints = append(g.tokenMints, tokenMint{repositories: body.Repositories, permissions: body.Permissions})
 		w.WriteHeader(http.StatusCreated)
 		if len(body.Repositories) == 1 {
 			_, _ = w.Write([]byte(`{"token":"test-installation-token","expires_at":"2099-01-01T00:00:00Z","repositories":[{"full_name":"nordicle-labs/widget"}]}`))
@@ -238,6 +247,15 @@ func TestBootstrapCreatesCanonicalRepositoryAndSecondPassIsUnchanged(t *testing.
 	}
 	if second.State != "unchanged" || state.createCount != 1 {
 		t.Fatalf("second=%+v creates=%d", second, state.createCount)
+	}
+	wantMints := []tokenMint{
+		{permissions: Permissions{"administration": "write", "metadata": "read"}},
+		{repositories: []string{"widget"}, permissions: Permissions{"administration": "write", "contents": "write", "metadata": "read", "workflows": "write"}},
+		{permissions: Permissions{"administration": "write", "metadata": "read"}},
+		{repositories: []string{"widget"}, permissions: Permissions{"administration": "read", "contents": "read", "metadata": "read"}},
+	}
+	if !reflect.DeepEqual(state.tokenMints, wantMints) {
+		t.Fatalf("token mints = %#v, want %#v", state.tokenMints, wantMints)
 	}
 	for _, path := range []string{"README.md", "AGENTS.md", ".github/CODEOWNERS", ".github/workflows/ci.yml", ".multica/environment.json", ".multica-template.json", "Makefile"} {
 		if _, ok := state.files[path]; !ok {

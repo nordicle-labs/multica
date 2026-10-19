@@ -224,7 +224,7 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 	if err = b.revokeToken(&token, result.RepositoryURL); err != nil {
 		return result, err
 	}
-	credential, err := b.Broker.Mint(ctx, installationID, BootstrapOwner+"/"+name, Permissions{"administration": "write", "contents": "write", "metadata": "read"})
+	credential, err := b.Broker.Mint(ctx, installationID, BootstrapOwner+"/"+name, Permissions{"administration": "write", "contents": "write", "metadata": "read", "workflows": "write"})
 	if err != nil {
 		return result, err
 	}
