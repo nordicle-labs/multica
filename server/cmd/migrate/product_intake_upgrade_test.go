@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"math/rand/v2"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,5 +120,77 @@ func TestProductIntakeSchemaFreshAndRejectedArtifactUpgrade(t *testing.T) {
 				t.Fatalf("schema repair: columns=%d tables=%d indexes=%d versions=%d/%d", columns, tables, indexes, versions, len(tc.files))
 			}
 		})
+	}
+}
+
+func TestProductIntakeVerdictHistoryRollbackRefusesDuplicateHistory(t *testing.T) {
+	base := openTestPool(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	schema := createScratchSchema(t, ctx, base, "product_intake_rollback_")
+	pool := openTestPoolWithSearchPath(t, schema)
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE product_intake_approval (
+			id UUID NOT NULL DEFAULT gen_random_uuid(),
+			workspace_id UUID NOT NULL,
+			binding_id UUID NOT NULL,
+			message_id TEXT NOT NULL,
+			approver_id UUID NOT NULL,
+			artifact_sha TEXT NOT NULL,
+			decision TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE UNIQUE INDEX idx_product_intake_approval_message
+			ON product_intake_approval(workspace_id, binding_id, message_id);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	versions := []string{
+		"578_product_intake_approval_verdict_history",
+		"579_product_intake_approval_current_verdict",
+	}
+	opts := runOptions{
+		Direction:             "up",
+		Files:                 realMigrationFiles(t, versions, "up"),
+		SchemaMigrationsTable: schema + ".schema_migrations",
+		AdvisoryLockKey:       int64(rand.Uint64()&0x7fffffffffffffff) | 1,
+		Hooks:                 hooksForDirection("up"),
+	}
+	if err := runMigrations(ctx, pool, opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO product_intake_approval
+			(workspace_id, binding_id, message_id, approver_id, artifact_sha, decision)
+		VALUES
+			('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'promotion', gen_random_uuid(), '0123456789abcdef0123456789abcdef01234567', 'approved'),
+			('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'promotion', gen_random_uuid(), '0123456789abcdef0123456789abcdef01234567', 'denied')
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	opts.Direction = "down"
+	opts.Files = realMigrationFiles(t, []string{versions[1], versions[0]}, "down")
+	opts.Hooks = hooksForDirection("down")
+	err := runMigrations(ctx, pool, opts)
+	if err == nil || !strings.Contains(err.Error(), "cannot roll back product intake verdict history") {
+		t.Fatalf("rollback error = %v, want explicit verdict-history refusal", err)
+	}
+	var currentApplied, historyApplied bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, versions[1]).Scan(&currentApplied); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, versions[0]).Scan(&historyApplied); err != nil {
+		t.Fatal(err)
+	}
+	if currentApplied || !historyApplied {
+		t.Fatalf("migration state after refusal = current:%v history:%v, want false/true", currentApplied, historyApplied)
+	}
+	var currentIndexExists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('idx_product_intake_approval_current_verdict') IS NOT NULL`).Scan(&currentIndexExists); err != nil {
+		t.Fatal(err)
+	}
+	if currentIndexExists {
+		t.Fatal("current-verdict index remains after its successful rollback")
 	}
 }

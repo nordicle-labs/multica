@@ -85,6 +85,13 @@ INSERT INTO product_intake_approval (
 ) VALUES (@workspace_id, @binding_id, @message_id, @approver_id, @artifact_sha, @decision)
 RETURNING *;
 
+-- name: GetCurrentProductIntakeApproval :one
+SELECT * FROM product_intake_approval
+WHERE workspace_id = @workspace_id AND binding_id = @binding_id
+  AND message_id = @message_id AND artifact_sha = @artifact_sha
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
 -- name: GetProductIntakeDelivery :one
 SELECT * FROM product_intake_delivery
 WHERE workspace_id = @workspace_id AND source_type = @source_type

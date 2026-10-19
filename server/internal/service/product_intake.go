@@ -77,7 +77,7 @@ func (s *ProductIntakeService) CreateBindingRevision(ctx context.Context, in Pro
 		(in.SourceType != IntakeSourceMulticaChat && in.SourceType != IntakeSourceTelegram) {
 		return db.ProductIntakeBinding{}, ErrIntakeIdentity
 	}
-	if _, ok := map[string]bool{"targeted_check": true, "tests_review": true, "security_integration": true, "explicit_approval_rollback": true}[in.RiskPolicy]; !ok {
+	if !isRiskPolicy(in.RiskPolicy) {
 		return db.ProductIntakeBinding{}, ErrIntakeRiskPolicy
 	}
 	tx, err := s.TxStarter.Begin(ctx)
