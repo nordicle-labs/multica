@@ -116,8 +116,15 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 			FullName string `json:"full_name"`
 		} `json:"repositories"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, responseLimit)).Decode(&out); err != nil {
-		return Credential{}, &MintFailure{Err: errors.New("create installation token: malformed response"), Retryable: true}
+	if err := decodeBoundedJSON(resp.Body, &out); err != nil {
+		decodeErr := errors.New("create installation token: malformed response")
+		if out.Token == "" {
+			return Credential{}, &MintFailure{Err: decodeErr, Retryable: true}
+		}
+		revokeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		revokeErr := b.Revoke(revokeCtx, out.Token)
+		return Credential{}, &MintFailure{Err: errors.Join(decodeErr, revokeErr), NoCredential: revokeErr == nil, Retryable: true}
 	}
 	if out.Token == "" {
 		return Credential{}, &MintFailure{Err: errors.New("create installation token: empty token"), Retryable: true}
@@ -130,6 +137,65 @@ func (b Broker) Mint(ctx context.Context, installationID int64, repository strin
 		return Credential{}, &MintFailure{Err: errors.Join(errors.New("create installation token: repository scope mismatch"), revokeErr), NoCredential: revokeErr == nil}
 	}
 	return Credential{Repository: repository, Token: out.Token, ExpiresAt: out.ExpiresAt}, nil
+}
+
+// MintInstallation creates an installation token that is not narrowed to an
+// existing repository. Bootstrap needs this because the target does not exist.
+func (b Broker) MintInstallation(ctx context.Context, installationID int64, permissions Permissions) (string, error) {
+	if installationID <= 0 || len(permissions) == 0 {
+		return "", errors.New("github App installation and permissions are required")
+	}
+	appJWT, err := b.SignJWT()
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(map[string]any{"permissions": permissions})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(b.APIBase, "/")+fmt.Sprintf("/app/installations/%d/access_tokens", installationID), bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+appJWT)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("create installation token: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, responseLimit))
+		return "", fmt.Errorf("create installation token: github status %d", resp.StatusCode)
+	}
+	var out struct {
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := decodeBoundedJSON(resp.Body, &out); err != nil {
+		decodeErr := errors.New("create installation token: malformed response")
+		if out.Token == "" {
+			return "", decodeErr
+		}
+		revokeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return "", errors.Join(decodeErr, b.Revoke(revokeCtx, out.Token))
+	}
+	if out.Token == "" {
+		return "", errors.New("create installation token: malformed response")
+	}
+	expiresAt, parseErr := time.Parse(time.RFC3339, out.ExpiresAt)
+	now := time.Now()
+	if b.Now != nil {
+		now = b.Now()
+	}
+	if parseErr != nil || !expiresAt.After(now) {
+		revokeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return "", errors.Join(errors.New("create installation token: invalid expiration"), b.Revoke(revokeCtx, out.Token))
+	}
+	return out.Token, nil
 }
 
 func (b Broker) Revoke(ctx context.Context, token string) error {
@@ -179,8 +245,28 @@ func (b Broker) SignJWT() (string, error) {
 }
 
 func (b Broker) client() *http.Client {
+	client := http.Client{Timeout: 15 * time.Second}
 	if b.Client != nil {
-		return b.Client
+		client = *b.Client
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &client
+}
+
+func decodeBoundedJSON(r io.Reader, out any) error {
+	raw, err := io.ReadAll(io.LimitReader(r, responseLimit+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > responseLimit {
+		return errors.New("response exceeds 1 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("response contains trailing data")
+	}
+	return nil
 }
