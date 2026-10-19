@@ -140,6 +140,7 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // they are still pending: a fresh self-hosted install, which is exactly where an
 // interrupted build would otherwise leave a permanently unusable index.
 var concurrentIndexCleanups = map[string]string{
+	"579_product_intake_approval_current_verdict":               "idx_product_intake_approval_current_verdict",
 	"577_product_intake_approval_id_repair":                     "idx_product_intake_approval_id",
 	"575_product_intake_delivery_message":                       "idx_product_intake_delivery_message",
 	"574_product_intake_delivery_id":                            "idx_product_intake_delivery_id",
@@ -365,6 +366,7 @@ var concurrentIndexCleanups = map[string]string{
 // the retry, while a bare CREATE would stay wedged on "already exists"; both
 // cases need direction-specific cleanup before the rollback can retry safely.
 var concurrentDownIndexCleanups = map[string]string{
+	"578_product_intake_approval_verdict_history":           "idx_product_intake_approval_message",
 	"144_drop_agent_task_queue_chat_pending_v1":             "idx_agent_task_queue_chat_pending",
 	"171_drop_legacy_label_namespace_index":                 "issue_label_workspace_name_lower_idx",
 	"256_drop_agent_task_queue_chat_pending_v2":             "idx_agent_task_queue_chat_pending_v2",
@@ -406,6 +408,13 @@ var preRollbackHooks = func() map[string]preMigrationHook {
 	hooks := make(map[string]preMigrationHook, len(concurrentDownIndexCleanups)+len(sourceContextMigrationVersions)+1)
 	for version, index := range concurrentDownIndexCleanups {
 		hooks[version] = cleanupInvalidConcurrentIndexHook(index)
+	}
+	cleanupVerdictIndex := hooks["578_product_intake_approval_verdict_history"]
+	hooks["578_product_intake_approval_verdict_history"] = func(ctx context.Context, pool *pgxpool.Pool) error {
+		if err := cleanupVerdictIndex(ctx, pool); err != nil {
+			return err
+		}
+		return refuseProductIntakeVerdictHistoryRollback(ctx, pool)
 	}
 	// Source-context indexes are split into one-statement concurrent
 	// migrations. Register the guard on every step so a rollback from any
@@ -505,6 +514,24 @@ func hooksForDirection(direction string) map[string]preMigrationHook {
 	default:
 		return nil
 	}
+}
+
+func refuseProductIntakeVerdictHistoryRollback(ctx context.Context, pool *pgxpool.Pool) error {
+	var duplicatesExist bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM product_intake_approval
+			GROUP BY workspace_id, binding_id, message_id
+			HAVING count(*) > 1
+		)
+	`).Scan(&duplicatesExist); err != nil {
+		return fmt.Errorf("inspect product intake verdict history rollback: %w", err)
+	}
+	if duplicatesExist {
+		return errors.New("cannot roll back product intake verdict history while multiple verdicts exist for a release key; preserve the audit history or remove superseded verdicts explicitly, then retry")
+	}
+	return nil
 }
 
 func ensureSourceContextRollbackSafe(ctx context.Context, pool *pgxpool.Pool) error {
