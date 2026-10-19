@@ -189,3 +189,26 @@ func TestResolveWorkspaceIDFromRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskTokenCannotUseDifferentWorkspace(t *testing.T) {
+	const (
+		boundWorkspace  = "00000000-0000-0000-0000-000000000001"
+		targetWorkspace = "00000000-0000-0000-0000-000000000002"
+	)
+	handler := buildMiddleware(nil, func(*http.Request) (string, error) {
+		return targetWorkspace, nil
+	}, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("next handler should not be called")
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
+	req.Header.Set("X-Actor-Source", "task_token")
+	req.Header.Set("X-Workspace-ID", boundWorkspace)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", response.Code)
+	}
+	if body := response.Body.String(); body != `{"error":"task token is bound to a different workspace"}` {
+		t.Fatalf("body = %q", body)
+	}
+}

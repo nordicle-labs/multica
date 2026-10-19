@@ -51,8 +51,8 @@ func (e *bootstrapCommitError) Unwrap() error { return e.err }
 // BootstrapProject creates the canonical GitHub repository and its Multica
 // project/resource. Every local collision is resolved before the first write.
 func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
-	if isMachineCredentialActor(r) {
-		writeError(w, http.StatusForbidden, "this endpoint is only available to human actors")
+	if isCloudPATActor(r) {
+		writeError(w, http.StatusForbidden, "this endpoint is unavailable to cloud-node credentials")
 		return
 	}
 	var req projectBootstrapRequest
@@ -238,12 +238,10 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 			}
 			ref, err := decodeBootstrapRepositoryRef(resource.ResourceRef)
 			if err != nil {
-				collision = true
 				continue
 			}
 			identity, err := githubapp.RepositoryIdentity(ref.URL)
 			if err != nil {
-				collision = true
 				continue
 			}
 			if identity == targetRepository {

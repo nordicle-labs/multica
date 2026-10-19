@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/multica-ai/multica/server/internal/auth"
 )
 
 func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
@@ -90,15 +92,39 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskToken := mintAgentTaskToken(t, agentID, ensureAgentTask(t, agentID), testUserID)
-	t.Run("non-human task token", func(t *testing.T) {
+	t.Run("task token reaches workspace authorization", func(t *testing.T) {
 		resp := post(t, taskToken)
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("status = %d, want 403", resp.StatusCode)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status = %d, want 409", resp.StatusCode)
 		}
 		body, err := io.ReadAll(resp.Body)
-		if err != nil || !strings.Contains(string(body), "only available to human actors") {
-			t.Fatalf("body = %q, want human-actor denial (read error: %v)", body, err)
+		if err != nil || !strings.Contains(string(body), "exactly one nordicle-labs") {
+			t.Fatalf("body = %q, want installation preflight (read error: %v)", body, err)
+		}
+	})
+
+	t.Run("expired task token", func(t *testing.T) {
+		token := mintAgentTaskToken(t, agentID, ensureAgentTask(t, agentID), testUserID)
+		if _, err := testPool.Exec(ctx, `UPDATE task_token SET expires_at = now() - interval '1 minute' WHERE token_hash = $1`, auth.HashToken(token)); err != nil {
+			t.Fatal(err)
+		}
+		resp := post(t, token)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("revoked task token", func(t *testing.T) {
+		token := mintAgentTaskToken(t, agentID, ensureAgentTask(t, agentID), testUserID)
+		if _, err := testPool.Exec(ctx, `DELETE FROM task_token WHERE token_hash = $1`, auth.HashToken(token)); err != nil {
+			t.Fatal(err)
+		}
+		resp := post(t, token)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", resp.StatusCode)
 		}
 	})
 }

@@ -12,7 +12,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/githubapp"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -96,25 +95,16 @@ func (s bootstrapTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
 	return bootstrapCommitTx{Tx: tx, commit: s.commit}, nil
 }
 
-func TestBootstrapProjectRequiresHumanActor(t *testing.T) {
+func TestBootstrapProjectRejectsCloudPATActor(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
-	req.Header.Set("X-Actor-Source", "task_token")
+	req.Header.Set("X-Actor-Source", "cloud_pat")
 	response := httptest.NewRecorder()
 	(&Handler{}).BootstrapProject(response, req)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("status = %d", response.Code)
 	}
-}
-
-func TestBootstrapProjectRouteRequiresHumanActor(t *testing.T) {
-	router := chi.NewRouter()
-	router.With(RequireHumanActor).Post("/api/projects/bootstrap", (&Handler{}).BootstrapProject)
-	req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", strings.NewReader(`{}`))
-	req.Header.Set("X-Actor-Source", "task_token")
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, req)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", response.Code)
+	if !strings.Contains(response.Body.String(), "unavailable to cloud-node credentials") {
+		t.Fatalf("body = %q", response.Body.String())
 	}
 }
 
@@ -231,6 +221,54 @@ func TestBootstrapProjectCreatesAndReadsBackResource(t *testing.T) {
 	}
 }
 
+func TestBootstrapProjectIgnoresUnrelatedUndecodableRepositoryRef(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const (
+		name    = "ignores-undecodable-resource"
+		product = "Ignores Undecodable Resource"
+	)
+	for i, resourceRef := range []string{
+		`{"url":"https://github.com/nordicle-labs/unrelated","default_branch_hint":"main","unexpected":true}`,
+		`{"url":"not a github repository","default_branch_hint":"main"}`,
+	} {
+		projectID := dbfx.Project(t, fmt.Sprintf("Unrelated Repository Resource %d", i))
+		dbfx.Insert(t, "project_resource", testutil.Cols{
+			"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo", "resource_ref": resourceRef,
+		})
+	}
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	cleanupBootstrapProducts(t, product)
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+}
+
+func TestBootstrapProjectRejectsMatchingTitleWithUndecodableRepositoryRef(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const product = "Matching Undecodable Resource"
+	projectID := dbfx.Project(t, product)
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo",
+		"resource_ref": `{"url":"https://github.com/nordicle-labs/unrelated","default_branch_hint":"main","unexpected":true}`,
+	})
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, "matching-undecodable-resource", product)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusConflict, response.Body.String())
+	}
+}
+
 func TestBootstrapProjectReadsBackAmbiguousCommitBeforeRollback(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -329,6 +367,35 @@ func TestBootstrapProjectAllowsOwnerAndAdminButRejectsMember(t *testing.T) {
 		})
 	}
 	cleanupBootstrapProducts(t, "Bootstrap Role Owner", "Bootstrap Role Admin")
+}
+
+func TestBootstrapProjectAllowsTaskTokenOwnerAndAdmin(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	adminID := dbfx.User(t, "Bootstrap Task Admin", "bootstrap-task-admin@multica.test")
+	dbfx.Member(t, testWorkspaceID, adminID, "admin")
+
+	for _, tc := range []struct{ role, userID string }{
+		{"owner", testUserID},
+		{"admin", adminID},
+	} {
+		t.Run(tc.role, func(t *testing.T) {
+			product := "Bootstrap Task " + strings.ToUpper(tc.role[:1]) + tc.role[1:]
+			cleanupBootstrapProducts(t, product)
+			remote := &bootstrapTestRemote{}
+			h := *testHandler
+			h.ProjectBootstrap = remote
+			req := testutil.WithHeaders(
+				testutil.JSONRequest(http.MethodPost, "/api/projects/bootstrap", map[string]string{"name": "task-" + tc.role, "visibility": "private", "product": product}),
+				"X-Actor-Source", "task_token",
+				"X-User-ID", tc.userID,
+				"X-Workspace-ID", testWorkspaceID,
+			)
+			testutil.Call(t, h.BootstrapProject, req).Want(http.StatusCreated)
+		})
+	}
 }
 
 func TestBootstrapProjectFailsClosedOnLocalCollisionsAndAdoption(t *testing.T) {
