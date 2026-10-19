@@ -55,9 +55,13 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		})
 	}
 
-	post := func(t *testing.T, token string) *http.Response {
+	post := func(t *testing.T, token string, divergentSelector bool) *http.Response {
 		t.Helper()
-		req, err := http.NewRequest(http.MethodPost, testServer.URL+"/api/projects/bootstrap", bytes.NewBufferString(`{"name":"router-auth","visibility":"private","product":"Router Auth"}`))
+		path := "/api/projects/bootstrap"
+		if divergentSelector {
+			path += "?workspace_id=00000000-0000-0000-0000-000000000099"
+		}
+		req, err := http.NewRequest(http.MethodPost, testServer.URL+path, bytes.NewBufferString(`{"name":"router-auth","visibility":"private","product":"Router Auth"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,6 +70,9 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		req.Header.Set("X-Workspace-ID", testWorkspaceID)
 		req.Header.Set("X-User-ID", "00000000-0000-0000-0000-000000000099")
 		req.Header.Set("X-Actor-Source", "task_token")
+		if divergentSelector {
+			req.Header.Set("X-Workspace-Slug", "not-the-token-workspace")
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -75,7 +82,7 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 
 	for role, actor := range actors {
 		t.Run(role+" human", func(t *testing.T) {
-			resp := post(t, actor.token)
+			resp := post(t, actor.token, false)
 			defer resp.Body.Close()
 			if resp.StatusCode != actor.want {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, actor.want)
@@ -92,8 +99,8 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskToken := mintAgentTaskToken(t, agentID, ensureAgentTask(t, agentID), testUserID)
-	t.Run("task token reaches workspace authorization", func(t *testing.T) {
-		resp := post(t, taskToken)
+	t.Run("task token ignores divergent workspace selectors", func(t *testing.T) {
+		resp := post(t, taskToken, true)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409", resp.StatusCode)
@@ -109,7 +116,7 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		if _, err := testPool.Exec(ctx, `UPDATE task_token SET expires_at = now() - interval '1 minute' WHERE token_hash = $1`, auth.HashToken(token)); err != nil {
 			t.Fatal(err)
 		}
-		resp := post(t, token)
+		resp := post(t, token, false)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -121,7 +128,7 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		if _, err := testPool.Exec(ctx, `DELETE FROM task_token WHERE token_hash = $1`, auth.HashToken(token)); err != nil {
 			t.Fatal(err)
 		}
-		resp := post(t, token)
+		resp := post(t, token, false)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", resp.StatusCode)
