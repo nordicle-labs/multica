@@ -152,7 +152,9 @@ func TestResolveWorkspaceIDFromRequest(t *testing.T) {
 			// X-Workspace-ID along with X-Actor-Source=task_token. Any
 			// other workspace identifier the agent puts on the wire — a
 			// slug pointing at a sibling workspace, a different
-			// workspace_id — must be ignored. Otherwise an agent could
+			// workspace_id — is rejected by Auth before reaching this
+			// resolver. The server-stamped binding remains authoritative
+			// here. Otherwise an agent could
 			// route owner-token traffic at any workspace its host is
 			// also a member of.
 			name: "task_token actor: client-supplied slug/id cannot override token-bound workspace",

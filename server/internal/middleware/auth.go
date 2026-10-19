@@ -31,6 +31,24 @@ func rejectTemporarilyDisabledUser(w http.ResponseWriter, r *http.Request, userI
 	return true
 }
 
+func taskTokenWorkspaceSelectorMismatch(r *http.Request, queries *db.Queries, bound string) bool {
+	for _, id := range []string{r.Header.Get("X-Workspace-ID"), r.URL.Query().Get("workspace_id")} {
+		if id != "" && id != bound {
+			return true
+		}
+	}
+	for _, slug := range []string{r.Header.Get("X-Workspace-Slug"), r.URL.Query().Get("workspace_slug")} {
+		if slug == "" {
+			continue
+		}
+		workspace, err := queries.GetWorkspaceBySlug(r.Context(), slug)
+		if err != nil || uuidToString(workspace.ID) != bound {
+			return true
+		}
+	}
+	return false
+}
+
 // Auth middleware validates JWT tokens or Personal Access Tokens.
 // Token sources (in priority order):
 //  1. Authorization: Bearer <token> header (PAT or JWT)
@@ -123,10 +141,15 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				if rejectTemporarilyDisabledUser(w, r, userID, "", "task_token") {
 					return
 				}
+				workspaceID := uuidToString(tt.WorkspaceID)
+				if taskTokenWorkspaceSelectorMismatch(r, queries, workspaceID) {
+					writeError(w, http.StatusForbidden, "task token is bound to a different workspace")
+					return
+				}
 				r.Header.Set("X-User-ID", userID)
 				r.Header.Set("X-Agent-ID", uuidToString(tt.AgentID))
 				r.Header.Set("X-Task-ID", uuidToString(tt.TaskID))
-				r.Header.Set("X-Workspace-ID", uuidToString(tt.WorkspaceID))
+				r.Header.Set("X-Workspace-ID", workspaceID)
 				// X-Actor-Source flags the auth path so resolveActor and
 				// any owner-only handler can deny without re-querying the
 				// token table. The value "task_token" is the only signal

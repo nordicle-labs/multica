@@ -64,6 +64,33 @@ func authMiddleware(next http.Handler) http.Handler {
 	return Auth(nil, nil, nil, nil)(next)
 }
 
+func TestTaskTokenWorkspaceIDSelectorMismatch(t *testing.T) {
+	const bound = "00000000-0000-0000-0000-000000000001"
+	for _, tc := range []struct {
+		name       string
+		headerID   string
+		queryID    string
+		wantReject bool
+	}{
+		{name: "no selector"},
+		{name: "bound header", headerID: bound},
+		{name: "bound query", queryID: bound},
+		{name: "divergent header", headerID: "00000000-0000-0000-0000-000000000002", wantReject: true},
+		{name: "divergent query", queryID: "00000000-0000-0000-0000-000000000002", wantReject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
+			req.Header.Set("X-Workspace-ID", tc.headerID)
+			query := req.URL.Query()
+			query.Set("workspace_id", tc.queryID)
+			req.URL.RawQuery = query.Encode()
+			if got := taskTokenWorkspaceSelectorMismatch(req, nil, bound); got != tc.wantReject {
+				t.Fatalf("mismatch = %v, want %v", got, tc.wantReject)
+			}
+		})
+	}
+}
+
 func TestAuth_MissingHeader(t *testing.T) {
 	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler should not be called")
