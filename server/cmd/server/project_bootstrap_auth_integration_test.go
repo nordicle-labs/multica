@@ -97,6 +97,7 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 	post := func(t *testing.T, token, divergentSelector string) *http.Response {
 		t.Helper()
 		path := "/api/projects/bootstrap"
+		rawQuery := ""
 		switch divergentSelector {
 		case "query id":
 			path += "?workspace_id=00000000-0000-0000-0000-000000000099"
@@ -106,6 +107,10 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 			path += "?workspace_id=" + testWorkspaceID + "&workspace_id=00000000-0000-0000-0000-000000000099"
 		case "repeated query slug":
 			path += "?workspace_slug=" + workspaceSlug + "&workspace_slug=not-the-token-workspace"
+		case "malformed repeated query id":
+			rawQuery = "workspace_id=" + testWorkspaceID + "&workspace_id=%ZZ"
+		case "malformed repeated query slug":
+			rawQuery = "workspace_slug=" + workspaceSlug + "&workspace_slug=%ZZ"
 		}
 		req, err := http.NewRequest(http.MethodPost, testServer.URL+path, bytes.NewBufferString(`{"name":"router-auth","visibility":"private","product":"Router Auth"}`))
 		if err != nil {
@@ -116,6 +121,9 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		req.Header.Set("X-Workspace-ID", testWorkspaceID)
 		req.Header.Set("X-User-ID", "00000000-0000-0000-0000-000000000099")
 		req.Header.Set("X-Actor-Source", "task_token")
+		if rawQuery != "" {
+			req.URL.RawQuery = rawQuery
+		}
 		switch divergentSelector {
 		case "header id":
 			req.Header.Set("X-Workspace-ID", "00000000-0000-0000-0000-000000000099")
@@ -126,6 +134,11 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		case "repeated header slug":
 			req.Header.Add("X-Workspace-Slug", workspaceSlug)
 			req.Header.Add("X-Workspace-Slug", "not-the-token-workspace")
+		}
+		if rawQuery != "" {
+			response := httptest.NewRecorder()
+			testServer.Config.Handler.ServeHTTP(response, req)
+			return response.Result()
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -170,6 +183,7 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 		for _, selector := range []string{
 			"header id", "query id", "header slug", "query slug",
 			"repeated header id", "repeated query id", "repeated header slug", "repeated query slug",
+			"malformed repeated query id", "malformed repeated query slug",
 		} {
 			selector := selector
 			t.Run(role+" task token rejects divergent "+selector, func(t *testing.T) {

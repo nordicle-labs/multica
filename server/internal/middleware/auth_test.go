@@ -101,6 +101,20 @@ func TestTaskTokenWorkspaceIDSelectorMismatch(t *testing.T) {
 	}
 }
 
+func TestTaskTokenWorkspaceMalformedQuerySelectors(t *testing.T) {
+	const bound = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	for _, rawQuery := range []string{
+		"workspace_id=" + bound + "&workspace_id=%ZZ",
+		"workspace_slug=bound-workspace&workspace_slug=%ZZ",
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
+		req.URL.RawQuery = rawQuery
+		if !taskTokenWorkspaceSelectorMismatch(req, nil, bound) {
+			t.Fatalf("malformed query %q was accepted", rawQuery)
+		}
+	}
+}
+
 func TestTaskTokenWorkspaceSlugSelectorMismatch(t *testing.T) {
 	pool := openPool(t)
 	defer pool.Close()
