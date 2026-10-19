@@ -32,18 +32,31 @@ func rejectTemporarilyDisabledUser(w http.ResponseWriter, r *http.Request, userI
 }
 
 func taskTokenWorkspaceSelectorMismatch(r *http.Request, queries *db.Queries, bound string) bool {
-	for _, id := range []string{r.Header.Get("X-Workspace-ID"), r.URL.Query().Get("workspace_id")} {
-		if id != "" && id != bound {
-			return true
+	boundID, err := util.ParseUUID(bound)
+	if err != nil {
+		return true
+	}
+	query := r.URL.Query()
+	for _, values := range [][]string{r.Header.Values("X-Workspace-ID"), query["workspace_id"]} {
+		for _, id := range values {
+			if id == "" {
+				continue
+			}
+			parsed, err := util.ParseUUID(id)
+			if err != nil || parsed.Bytes != boundID.Bytes {
+				return true
+			}
 		}
 	}
-	for _, slug := range []string{r.Header.Get("X-Workspace-Slug"), r.URL.Query().Get("workspace_slug")} {
-		if slug == "" {
-			continue
-		}
-		workspace, err := queries.GetWorkspaceBySlug(r.Context(), slug)
-		if err != nil || uuidToString(workspace.ID) != bound {
-			return true
+	for _, values := range [][]string{r.Header.Values("X-Workspace-Slug"), query["workspace_slug"]} {
+		for _, slug := range values {
+			if slug == "" {
+				continue
+			}
+			workspace, err := queries.GetWorkspaceBySlug(r.Context(), slug)
+			if err != nil || workspace.ID.Bytes != boundID.Bytes {
+				return true
+			}
 		}
 	}
 	return false

@@ -54,6 +54,10 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `DELETE FROM github_installation WHERE workspace_id = $1`, testWorkspaceID); err != nil {
 		t.Fatal(err)
 	}
+	var workspaceSlug string
+	if err := testPool.QueryRow(ctx, `SELECT slug FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&workspaceSlug); err != nil {
+		t.Fatal(err)
+	}
 
 	type actor struct {
 		token    string
@@ -98,6 +102,10 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 			path += "?workspace_id=00000000-0000-0000-0000-000000000099"
 		case "query slug":
 			path += "?workspace_slug=not-the-token-workspace"
+		case "repeated query id":
+			path += "?workspace_id=" + testWorkspaceID + "&workspace_id=00000000-0000-0000-0000-000000000099"
+		case "repeated query slug":
+			path += "?workspace_slug=" + workspaceSlug + "&workspace_slug=not-the-token-workspace"
 		}
 		req, err := http.NewRequest(http.MethodPost, testServer.URL+path, bytes.NewBufferString(`{"name":"router-auth","visibility":"private","product":"Router Auth"}`))
 		if err != nil {
@@ -113,6 +121,11 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 			req.Header.Set("X-Workspace-ID", "00000000-0000-0000-0000-000000000099")
 		case "header slug":
 			req.Header.Set("X-Workspace-Slug", "not-the-token-workspace")
+		case "repeated header id":
+			req.Header.Add("X-Workspace-ID", "00000000-0000-0000-0000-000000000099")
+		case "repeated header slug":
+			req.Header.Add("X-Workspace-Slug", workspaceSlug)
+			req.Header.Add("X-Workspace-Slug", "not-the-token-workspace")
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -154,7 +167,10 @@ func TestProjectBootstrapUsesRealRouterAuthAndRoleGuards(t *testing.T) {
 				t.Fatalf("body = %q, want installation preflight (read error: %v)", body, err)
 			}
 		})
-		for _, selector := range []string{"header id", "query id", "header slug", "query slug"} {
+		for _, selector := range []string{
+			"header id", "query id", "header slug", "query slug",
+			"repeated header id", "repeated query id", "repeated header slug", "repeated query slug",
+		} {
 			selector := selector
 			t.Run(role+" task token rejects divergent "+selector, func(t *testing.T) {
 				taskToken := mintAgentTaskToken(t, agentID, taskID, actors[role].userID)
