@@ -221,6 +221,26 @@ VALUES ($1, 'head-a', 0, 'backend', 'completed', 'success', false)
 		"runtime_id":     runtimeID,
 		"owner_id":       testUserID,
 	})
+	projectID := dbfx.Insert(t, "project", testutil.Cols{
+		"workspace_id": wsID,
+		"title":        "Workspace delete intake project",
+		"status":       "planned",
+		"priority":     "none",
+	})
+	squadID := dbfx.Insert(t, "squad", testutil.Cols{
+		"workspace_id": wsID,
+		"name":         "Workspace delete intake squad",
+		"leader_id":    agentID,
+		"creator_id":   testUserID,
+	})
+	dbfx.Insert(t, "product_intake_binding", testutil.Cols{
+		"workspace_id": wsID, "source_type": "multica_chat", "source_id": "delete-source",
+		"conversation_id": "delete-conversation", "actor_id": testUserID, "target_agent_id": agentID,
+		"product_key": "delete-product", "project_id": projectID, "squad_id": squadID,
+		"required_capability": "engineering", "risk_policy": "targeted_check",
+		"revision": 1, "status": "active", "valid_until": testutil.Raw("now() + interval '1 hour'"),
+		"created_by": testUserID, "change_reason": "workspace deletion coverage",
+	})
 
 	issueID := dbfx.Insert(t, "issue", testutil.Cols{
 		"workspace_id": wsID,
@@ -324,6 +344,11 @@ VALUES ($1, $2, gen_random_uuid(), gen_random_uuid(), 's3://workspace-delete/sou
 	dbfx.QueryRow(t, `SELECT EXISTS (SELECT 1 FROM workspace WHERE id = $1)`, wsID).Scan(&exists)
 	if exists {
 		t.Fatal("workspace still exists after owner DELETE")
+	}
+	var intakeBindingCount int
+	dbfx.QueryRow(t, `SELECT COUNT(*) FROM product_intake_binding WHERE workspace_id = $1`, wsID).Scan(&intakeBindingCount)
+	if intakeBindingCount != 0 {
+		t.Fatalf("product intake bindings were not cleaned up for deleted workspace: %d", intakeBindingCount)
 	}
 	if len(notifier.runtimeIDs) != 1 || notifier.runtimeIDs[0] != runtimeID {
 		t.Fatalf("runtime-gone notifications = %v, want [%s]", notifier.runtimeIDs, runtimeID)

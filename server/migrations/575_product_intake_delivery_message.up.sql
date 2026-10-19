@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx_product_intake_delivery_message ON product_intake_delivery(workspace_id, source_type, source_id, conversation_id, actor_id, target_agent_id, message_id);

@@ -39,6 +39,7 @@ type Router struct {
 
 	issues    IssueCreator
 	tasks     TaskEnqueuer
+	intake    ProductIntakeRouter
 	reader    SessionReader
 	lifecycle ChannelChatLifecycle
 
@@ -78,6 +79,7 @@ type RouterConfig struct {
 	MediaConcurrency int
 	Logger           *slog.Logger
 	Lifecycle        ChannelChatLifecycle
+	ProductIntake    ProductIntakeRouter
 }
 
 // NewRouter builds a Router around the shared (platform-agnostic) services:
@@ -102,6 +104,7 @@ func NewRouter(issues IssueCreator, tasks TaskEnqueuer, reader SessionReader, cf
 		sets:         make(map[channel.Type]ResolverSet),
 		issues:       issues,
 		tasks:        tasks,
+		intake:       cfg.ProductIntake,
 		reader:       reader,
 		lifecycle:    cfg.Lifecycle,
 		replyTimeout: cfg.ReplyTimeout,
@@ -277,7 +280,9 @@ func (r *Router) Handle(ctx context.Context, msg channel.InboundMessage) error {
 			set.Typing.OnIngested(tctx, inst, msg, res.ChatSessionID)
 		}()
 	}
-	r.scheduleReply(set, inst, msg, res)
+	if !res.replyDelivered {
+		r.scheduleReply(set, inst, msg, res)
+	}
 	return nil
 }
 
@@ -319,11 +324,26 @@ func (r *Router) dispatch(ctx context.Context, set ResolverSet, msg channel.Inbo
 	}
 
 	res, finalize, err := r.processClaimed(ctx, set, msg, inst, claimToken, bareFresh, startChat)
+	if err == nil && res.Outcome == OutcomeProductIntake && finalize == finalizeMark {
+		replier, ok := set.Replier.(DurableOutboundReplier)
+		if !ok {
+			finalize = finalizeRelease
+			err = errors.New("product intake requires durable outbound replier")
+		} else if replyErr := replier.ReplyDurable(ctx, inst, msg, res); replyErr != nil {
+			finalize = finalizeRelease
+			err = fmt.Errorf("deliver product intake receipt: %w", replyErr)
+		} else {
+			res.replyDelivered = true
+		}
+	}
 
 	if claimed && finalize != finalizeNone {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(ctx), dedupFinalizeTimeout)
-		r.applyFinalize(finalizeCtx, set, inst.ID, msg.MessageID, claimToken, finalize)
+		finalizeErr := r.applyFinalize(finalizeCtx, set, inst.ID, msg.MessageID, claimToken, finalize)
 		finalizeCancel()
+		if finalizeErr != nil {
+			err = errors.Join(err, finalizeErr)
+		}
 	}
 
 	// ErrClaimLost: another worker holds the claim. Surface as duplicate.
@@ -389,6 +409,40 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 			InstallationID: inst.ID,
 			Sender:         msg.Source.SenderID,
 		}, finalizeMark, nil
+	}
+
+	// Telegram product ingress is fail-closed. It never falls back to ordinary
+	// Chat when the versioned product binding is missing, stale, or invalid.
+	if r.intake != nil && msg.Source.ChannelType == channel.Type("telegram") {
+		conversationID := msg.Source.ChatID
+		if msg.Source.ThreadID != "" {
+			conversationID += ":" + msg.Source.ThreadID
+		}
+		intake, intakeErr := r.intake.Process(ctx, service.ProductIntakeRequest{
+			WorkspaceID: inst.WorkspaceID, ActorID: identity.UserID,
+			SourceType: service.IntakeSourceTelegram, SourceID: util.UUIDToString(inst.ID),
+			ConversationID: conversationID, TargetAgentID: inst.AgentID,
+			MessageID: msg.MessageID, Text: msg.CommandText,
+		})
+		if intakeErr == nil {
+			prefix, workspaceSlug := r.issueWorkspaceIdentity(ctx, inst.WorkspaceID)
+			return Result{
+				Outcome: OutcomeProductIntake, InstallationID: inst.ID,
+				Sender: msg.Source.SenderID, IssueID: intake.Issue.ID,
+				IssueNumber: intake.Issue.Number, IssueTitle: intake.Issue.Title,
+				IssueIdentifier:    service.IssueIdentifier(prefix, intake.Issue.Number),
+				IssueWorkspaceSlug: workspaceSlug, IssueDuplicate: intake.Resumed,
+				TaskID: intake.Task.ID, TaskStartedAt: intake.Task.StartedAt,
+			}, finalizeMark, nil
+		}
+		if errors.Is(intakeErr, service.ErrIntakeBindingMissing) || service.IsProductIntakeRefusal(intakeErr) {
+			_ = set.Audit.RecordDrop(ctx, inst.ID, msg, DropReasonInvalidEvent)
+			return Result{
+				Outcome: OutcomeDropped, DropReason: DropReasonInvalidEvent,
+				InstallationID: inst.ID, Sender: msg.Source.SenderID,
+			}, finalizeMark, nil
+		}
+		return Result{}, finalizeRelease, fmt.Errorf("route product intake: %w", intakeErr)
 	}
 
 	// 5-6. Resolve the current Chat route, then either append normally or
@@ -1071,15 +1125,20 @@ func keyForSessionContext(sessionID pgtype.UUID, contextRevision int64) string {
 }
 
 // applyFinalize flips the in-flight claim row to its terminal state,
-// token-fenced. Best-effort: a transport failure cannot abort the outcome.
-func (r *Router) applyFinalize(ctx context.Context, set ResolverSet, instID pgtype.UUID, messageID string, claimToken pgtype.UUID, action dedupFinalize) {
+// token-fenced. Persistence failures surface so the adapter can retry.
+func (r *Router) applyFinalize(ctx context.Context, set ResolverSet, instID pgtype.UUID, messageID string, claimToken pgtype.UUID, action dedupFinalize) error {
 	switch action {
 	case finalizeMark:
-		_ = set.Dedup.Mark(ctx, instID, messageID, claimToken)
+		if err := set.Dedup.Mark(ctx, instID, messageID, claimToken); err != nil {
+			return fmt.Errorf("mark dedup claim: %w", err)
+		}
 	case finalizeRelease:
-		_ = set.Dedup.Release(ctx, instID, messageID, claimToken)
+		if err := set.Dedup.Release(ctx, instID, messageID, claimToken); err != nil {
+			return fmt.Errorf("release dedup claim: %w", err)
+		}
 	case finalizeNone:
 	}
+	return nil
 }
 
 func (r *Router) drop(ctx context.Context, set ResolverSet, msg channel.InboundMessage, instID pgtype.UUID, reason DropReason) Result {

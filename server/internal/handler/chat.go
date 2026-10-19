@@ -804,6 +804,12 @@ func (h *Handler) DeleteChatSession(w http.ResponseWriter, r *http.Request) {
 type SendChatMessageRequest struct {
 	Content       string   `json:"content"`
 	AttachmentIDs []string `json:"attachment_ids"`
+	// IntakeID is a client-generated stable UUID. It is required only when the
+	// session explicitly targets the built-in Tony role.
+	IntakeID *string `json:"intake_id,omitempty"`
+	// ApprovalID is a structured human approval reference for release-class
+	// bindings. Free-form message text never grants this gate.
+	ApprovalID *string `json:"approval_id,omitempty"`
 }
 
 type SendChatMessageResponse struct {
@@ -827,6 +833,9 @@ type SendChatMessageResponse struct {
 	// real created_at. Returning it here means the pill renders 0s from
 	// the start with a stable anchor.
 	CreatedAt string `json:"created_at"`
+	IssueID   string `json:"issue_id,omitempty"`
+	Intake    bool   `json:"intake,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
 }
 
 func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
@@ -908,6 +917,58 @@ func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
 	if !h.canInvokeAgent(r.Context(), agent, actorType, actorID, h.invokeOriginatorFromRequest(r, actorType, actorID), workspaceID) {
 		h.writeDispatchBlocked(w, http.StatusForbidden, ReasonInvocationNotAllowed)
+		return
+	}
+
+	// Tony is a product intake role, identified by its stable system key rather
+	// than its mutable display name. Its authenticated Chat path resolves the
+	// versioned PostgreSQL binding before creating/resuming an issue or dispatching.
+	if service.IsTonyAgent(agent) {
+		if req.IntakeID == nil || strings.TrimSpace(*req.IntakeID) == "" {
+			writeError(w, http.StatusBadRequest, "intake_id is required for Tony")
+			return
+		}
+		if _, ok := parseUUIDOrBadRequest(w, strings.TrimSpace(*req.IntakeID), "intake_id"); !ok {
+			return
+		}
+		approvalID := pgtype.UUID{}
+		if req.ApprovalID != nil && strings.TrimSpace(*req.ApprovalID) != "" {
+			var ok bool
+			approvalID, ok = parseUUIDOrBadRequest(w, strings.TrimSpace(*req.ApprovalID), "approval_id")
+			if !ok {
+				return
+			}
+		}
+		intake, err := h.ProductIntake.Process(r.Context(), service.ProductIntakeRequest{
+			WorkspaceID: session.WorkspaceID, ActorID: parseUUID(userID),
+			SourceType: service.IntakeSourceMulticaChat, SourceID: sessionID,
+			ConversationID: sessionID, TargetAgentID: session.AgentID,
+			MessageID: strings.TrimSpace(*req.IntakeID), Text: req.Content, ApprovalID: approvalID,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, service.ErrIntakeUnclassified):
+				writeError(w, http.StatusBadRequest, err.Error())
+			case errors.Is(err, service.ErrIntakeIdentity):
+				writeError(w, http.StatusForbidden, "Tony intake identity is not valid")
+			case errors.Is(err, service.ErrIntakeBindingMissing), errors.Is(err, service.ErrIntakeBindingStale),
+				errors.Is(err, service.ErrIntakeRiskPolicy), errors.Is(err, service.ErrIntakeApproval):
+				writeError(w, http.StatusConflict, err.Error())
+			default:
+				writeError(w, http.StatusInternalServerError, "failed to route Tony intake")
+			}
+			return
+		}
+		startedAt := ""
+		if intake.Task.StartedAt.Valid {
+			startedAt = timestampToString(intake.Task.StartedAt)
+		}
+		createdAt := timestampToString(intake.Task.CreatedAt)
+		writeJSON(w, http.StatusCreated, SendChatMessageResponse{
+			MessageID: strings.TrimSpace(*req.IntakeID), TaskID: uuidToString(intake.Task.ID),
+			Queued: !intake.Task.StartedAt.Valid, CreatedAt: createdAt,
+			IssueID: uuidToString(intake.Issue.ID), Intake: true, StartedAt: startedAt,
+		})
 		return
 	}
 

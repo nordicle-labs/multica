@@ -68,6 +68,7 @@ type OutboundReplierConfig struct {
 }
 
 var _ engine.OutboundReplier = (*OutboundReplier)(nil)
+var _ engine.DurableOutboundReplier = (*OutboundReplier)(nil)
 
 // NewOutboundReplier builds the replier.
 func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
@@ -91,6 +92,13 @@ func NewOutboundReplier(cfg OutboundReplierConfig) *OutboundReplier {
 		client:      cfg.HTTPClient,
 		logger:      logger,
 	}
+}
+
+func (r *OutboundReplier) ReplyDurable(ctx context.Context, inst engine.ResolvedInstallation, msg channel.InboundMessage, res engine.Result) error {
+	if res.Outcome != engine.OutcomeProductIntake {
+		return errors.New("durable reply is only supported for product intake")
+	}
+	return r.post(ctx, inst, msg, productIntakeText(res))
 }
 
 // Reply routes each outcome to its user-visible message. Errors are logged,
@@ -137,6 +145,11 @@ func (r *OutboundReplier) Reply(ctx context.Context, inst engine.ResolvedInstall
 				r.logger.WarnContext(ctx, "telegram replier: issue outcome reply failed",
 					"installation_id", util.UUIDToString(inst.ID), "error", err)
 			}
+		}
+	case engine.OutcomeProductIntake:
+		if err := r.post(ctx, inst, msg, productIntakeText(res)); err != nil {
+			r.logger.WarnContext(ctx, "telegram replier: product intake reply failed",
+				"installation_id", util.UUIDToString(inst.ID), "error", err)
 		}
 	case engine.OutcomeDropped:
 		if text := droppedReplyText(res, msg); text != "" {
@@ -228,6 +241,14 @@ func issueDuplicateText(res engine.Result) string {
 		return "⚠️ Not created — active issue " + id + " already exists."
 	}
 	return "⚠️ Not created — active issue " + id + " already exists: " + title
+}
+
+func productIntakeText(res engine.Result) string {
+	status := "queued"
+	if res.TaskStartedAt.Valid {
+		status = "started"
+	}
+	return fmt.Sprintf("✅ %s · run %s · %s", issueResultIdentifier(res), util.UUIDToString(res.TaskID), status)
 }
 
 func issueResultIdentifier(res engine.Result) string {

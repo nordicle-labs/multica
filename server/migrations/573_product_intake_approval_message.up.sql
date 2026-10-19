@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx_product_intake_approval_message ON product_intake_approval(workspace_id, binding_id, message_id);

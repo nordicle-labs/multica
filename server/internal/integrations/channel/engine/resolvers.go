@@ -29,6 +29,7 @@ const (
 	OutcomeFreshPending  Outcome = "fresh_pending"
 	OutcomeChatStarted   Outcome = "chat_started"
 	OutcomeIssueUsage    Outcome = "issue_usage"
+	OutcomeProductIntake Outcome = "product_intake"
 	OutcomeAgentOffline  Outcome = "agent_offline"
 	OutcomeAgentArchived Outcome = "agent_archived"
 	// OutcomeInvokeDenied — the sender may not run this agent. The web chat
@@ -69,6 +70,8 @@ type Result struct {
 	IssueIdentifier    string
 	IssueWorkspaceSlug string
 	IssueTitle         string
+	TaskID             pgtype.UUID
+	TaskStartedAt      pgtype.Timestamptz
 	// IssueDuplicate marks an /issue command that did not create a new issue
 	// because the shared duplicate guard found the active IssueID above.
 	// Repliers render this as a business conflict, never as an internal error.
@@ -79,7 +82,8 @@ type Result struct {
 	IssueUsageHadMedia bool
 	// runScheduled reports whether this ingest scheduled a normal chat run.
 	// It is Router-internal state: repliers must continue to use Outcome.
-	runScheduled bool
+	runScheduled   bool
+	replyDelivered bool
 }
 
 // ResolvedInstallation is the channel-agnostic installation context the Router
@@ -381,6 +385,12 @@ type OutboundReplier interface {
 	Reply(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage, res Result)
 }
 
+// DurableOutboundReplier is required for product-intake receipts. An error
+// leaves the inbound dedup claim replayable instead of losing the receipt.
+type DurableOutboundReplier interface {
+	ReplyDurable(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage, res Result) error
+}
+
 // TypingNotifier shows a "processing" indicator when a message is ingested and
 // clears it once the message reaches a terminal outcome. Optional; nil disables
 // it.
@@ -417,6 +427,10 @@ type ResolverSet struct {
 type IssueCreator interface {
 	Create(ctx context.Context, p service.IssueCreateParams, opts service.IssueCreateOpts) (service.IssueCreateResult, error)
 	PublishAttachmentsChanged(ctx context.Context, issue db.Issue, actorID pgtype.UUID)
+}
+
+type ProductIntakeRouter interface {
+	Process(context.Context, service.ProductIntakeRequest) (service.ProductIntakeResult, error)
 }
 
 // TaskEnqueuer is the narrow subset of service.TaskService the Router needs to

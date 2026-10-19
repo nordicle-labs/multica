@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -43,6 +45,7 @@ type fakeDedup struct {
 	token      pgtype.UUID
 	claimErr   error
 	respectCtx bool
+	markErr    error
 	releaseErr error
 	markCalls  int
 	relCalls   int
@@ -62,7 +65,7 @@ func (f *fakeDedup) Mark(_ context.Context, _ pgtype.UUID, _ string, _ pgtype.UU
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.markCalls++
-	return nil
+	return f.markErr
 }
 func (f *fakeDedup) Release(ctx context.Context, _ pgtype.UUID, _ string, _ pgtype.UUID) error {
 	f.mu.Lock()
@@ -72,7 +75,7 @@ func (f *fakeDedup) Release(ctx context.Context, _ pgtype.UUID, _ string, _ pgty
 		return ctx.Err()
 	}
 	f.relCalls++
-	return nil
+	return f.releaseErr
 }
 func (f *fakeDedup) marks() int    { f.mu.Lock(); defer f.mu.Unlock(); return f.markCalls }
 func (f *fakeDedup) releases() int { f.mu.Lock(); defer f.mu.Unlock(); return f.relCalls }
@@ -200,14 +203,23 @@ func (f *fakeAuditor) last() (DropReason, bool) {
 }
 
 type fakeReplier struct {
-	mu      sync.Mutex
-	results []Result
+	mu         sync.Mutex
+	results    []Result
+	durableErr error
 }
 
 func (f *fakeReplier) Reply(_ context.Context, _ ResolvedInstallation, _ channel.InboundMessage, res Result) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.results = append(f.results, res)
+}
+
+func (f *fakeReplier) ReplyDurable(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage, res Result) error {
+	if f.durableErr != nil {
+		return f.durableErr
+	}
+	f.Reply(ctx, inst, msg, res)
+	return nil
 }
 func (f *fakeReplier) calls() []Result {
 	f.mu.Lock()
@@ -508,6 +520,17 @@ type harness struct {
 	lifecycle *fakeChannelChatLifecycle
 }
 
+type fakeProductIntake struct {
+	request service.ProductIntakeRequest
+	result  service.ProductIntakeResult
+	err     error
+}
+
+func (f *fakeProductIntake) Process(_ context.Context, request service.ProductIntakeRequest) (service.ProductIntakeResult, error) {
+	f.request = request
+	return f.result, f.err
+}
+
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	h := &harness{
@@ -553,6 +576,111 @@ func TestRouter_NoResolverSet_ReturnsError(t *testing.T) {
 	msg.Source.ChannelType = channel.Type("slack")
 	if err := h.router.Handle(context.Background(), msg); !errors.Is(err, ErrNoResolverSet) {
 		t.Fatalf("expected ErrNoResolverSet, got %v", err)
+	}
+}
+
+func TestRouter_TelegramProductIntakeUsesStableChannelIdentityAndStopsChatFallback(t *testing.T) {
+	h := newHarness(t)
+	intake := &fakeProductIntake{result: service.ProductIntakeResult{
+		Issue: db.Issue{ID: uid(91), Number: 42, Title: "Telegram canary"},
+		Task:  db.AgentTaskQueue{ID: uid(92), StartedAt: pgtype.Timestamptz{Time: time.Unix(1, 0), Valid: true}},
+	}}
+	h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{
+		Logger: discardLogger(), ProductIntake: intake,
+	})
+	h.router.Register(channel.Type("telegram"), ResolverSet{
+		Installation: h.inst, Identity: h.ident, Dedup: h.dedup,
+		Session: h.binder, Audit: h.audit, Replier: h.replier, OriginType: "telegram_chat",
+	})
+	msg := p2pMessage(t)
+	msg.Source.ChannelType = channel.Type("telegram")
+	msg.Source.ChatID = "chat-42"
+	msg.Source.ThreadID = "topic-7"
+	msg.MessageID = "chat-42:9"
+	msg.CommandText = "feature: Telegram canary"
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("Telegram product intake: %v", err)
+	}
+	if intake.request.SourceType != service.IntakeSourceTelegram ||
+		intake.request.SourceID != util.UUIDToString(h.inst.inst.ID) ||
+		intake.request.ConversationID != "chat-42:topic-7" ||
+		intake.request.MessageID != "chat-42:9" ||
+		intake.request.TargetAgentID != h.inst.inst.AgentID ||
+		intake.request.ActorID != h.ident.id.UserID {
+		t.Fatalf("Telegram intake identity was not preserved: %+v", intake.request)
+	}
+	if h.binder.ensureCalls != 0 || h.binder.appendedParams().Message.Text != "" {
+		t.Fatal("Telegram product intake fell through to the ordinary Chat pipeline")
+	}
+	if h.dedup.marks() != 1 {
+		t.Fatalf("Telegram intake dedup marks = %d, want 1", h.dedup.marks())
+	}
+}
+
+func TestRouter_TelegramProductIntakeFailsClosedAndRetriesReceipt(t *testing.T) {
+	for _, intakeErr := range []error{service.ErrIntakeBindingMissing, service.ErrIntakeBindingStale} {
+		t.Run(intakeErr.Error(), func(t *testing.T) {
+			h := newHarness(t)
+			h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{Logger: discardLogger(), ProductIntake: &fakeProductIntake{err: intakeErr}})
+			h.router.Register(channel.Type("telegram"), ResolverSet{Installation: h.inst, Identity: h.ident, Dedup: h.dedup, Session: h.binder, Audit: h.audit, Replier: h.replier})
+			msg := p2pMessage(t)
+			msg.Source.ChannelType = channel.Type("telegram")
+			if err := h.router.Handle(context.Background(), msg); err != nil {
+				t.Fatal(err)
+			}
+			if h.binder.ensureCalls != 0 || h.dedup.marks() != 1 {
+				t.Fatalf("refusal fell through: ensure=%d marks=%d", h.binder.ensureCalls, h.dedup.marks())
+			}
+		})
+	}
+
+	h := newHarness(t)
+	h.replier.durableErr = errors.New("telegram unavailable")
+	intake := &fakeProductIntake{result: service.ProductIntakeResult{Issue: db.Issue{ID: uid(93)}, Task: db.AgentTaskQueue{ID: uid(94)}}}
+	h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{Logger: discardLogger(), ProductIntake: intake})
+	h.router.Register(channel.Type("telegram"), ResolverSet{Installation: h.inst, Identity: h.ident, Dedup: h.dedup, Session: h.binder, Audit: h.audit, Replier: h.replier})
+	msg := p2pMessage(t)
+	msg.Source.ChannelType = channel.Type("telegram")
+	if err := h.router.Handle(context.Background(), msg); err == nil {
+		t.Fatal("failed durable receipt was acknowledged")
+	}
+	if h.dedup.marks() != 0 || h.dedup.releases() != 1 {
+		t.Fatalf("receipt failure did not remain replayable: marks=%d releases=%d", h.dedup.marks(), h.dedup.releases())
+	}
+	h.replier.durableErr = nil
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("redeliver product intake receipt: %v", err)
+	}
+	if h.dedup.marks() != 1 || h.dedup.releases() != 1 {
+		t.Fatalf("successful redelivery was not finalized: marks=%d releases=%d", h.dedup.marks(), h.dedup.releases())
+	}
+}
+
+func TestRouter_ProductIntakePropagatesDedupFinalizeErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		durableErr error
+		markErr    error
+		releaseErr error
+		want       string
+	}{
+		{name: "mark", markErr: errors.New("mark persistence failed"), want: "mark dedup claim"},
+		{name: "release", durableErr: errors.New("telegram unavailable"), releaseErr: errors.New("release persistence failed"), want: "release dedup claim"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.dedup.markErr = tc.markErr
+			h.dedup.releaseErr = tc.releaseErr
+			h.replier.durableErr = tc.durableErr
+			intake := &fakeProductIntake{result: service.ProductIntakeResult{Issue: db.Issue{ID: uid(93)}, Task: db.AgentTaskQueue{ID: uid(94)}}}
+			h.router = NewRouter(h.issues, h.tasks, h.reader, RouterConfig{Logger: discardLogger(), ProductIntake: intake})
+			h.router.Register(channel.Type("telegram"), ResolverSet{Installation: h.inst, Identity: h.ident, Dedup: h.dedup, Session: h.binder, Audit: h.audit, Replier: h.replier})
+			msg := p2pMessage(t)
+			msg.Source.ChannelType = channel.Type("telegram")
+			if err := h.router.Handle(context.Background(), msg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("finalize error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

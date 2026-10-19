@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_product_intake_approval_message;

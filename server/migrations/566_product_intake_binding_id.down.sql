@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_product_intake_binding_id;

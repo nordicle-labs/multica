@@ -818,6 +818,8 @@ func classifyOrigin(issue db.Issue, opts IssueCreateOpts) (source, taskID, autop
 		return analytics.SourceManual, originID, ""
 	case "autopilot":
 		return analytics.SourceAutopilot, "", originID
+	case "multica_chat", "telegram_chat":
+		return analytics.SourceChat, "", ""
 	default:
 		slog.Warn("analytics: unknown issue origin type",
 			"origin_type", issue.OriginType.String,

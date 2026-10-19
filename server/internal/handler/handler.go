@@ -215,6 +215,7 @@ type Handler struct {
 	TaskService            *service.TaskService
 	PluginService          *service.PluginService
 	IssueService           *service.IssueService
+	ProductIntake          *service.ProductIntakeService
 	AutopilotService       *service.AutopilotService
 	// Entitlements supplies workspace-scoped commercial gates. A nil provider
 	// preserves self-hosted behavior without extra reads.
@@ -483,6 +484,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	// backs auto-titling. A deployment with no MULTICA_LLM_* configuration gets
 	// a disabled client, which turns the feature off rather than failing.
 	taskSvc.QuickActions = llmClient
+	issueSvc := service.NewIssueService(queries, txStarter, bus, analyticsClient, taskSvc)
 	h := &Handler{
 		Queries:                      queries,
 		ReadSelector:                 dbreader.NewPrimaryOnly(queries),
@@ -496,7 +498,8 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		Bus:                          bus,
 		TaskService:                  taskSvc,
 		PluginService:                service.NewPluginService(queries, txStarter),
-		IssueService:                 service.NewIssueService(queries, txStarter, bus, analyticsClient, taskSvc),
+		IssueService:                 issueSvc,
+		ProductIntake:                service.NewProductIntakeService(queries, txStarter, issueSvc, taskSvc),
 		AutopilotService:             service.NewAutopilotService(queries, txStarter, bus, taskSvc),
 		EmailService:                 emailService,
 		UpdateStore:                  NewInMemoryUpdateStore(),

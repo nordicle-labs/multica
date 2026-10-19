@@ -532,7 +532,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// is the single shared inbound handler injected into every Channel.
 	channelRegistry := channel.NewRegistry()
 	channelRouter := engine.NewRouter(h.IssueService, h.TaskService, queries, engine.RouterConfig{
-		Logger: slog.Default(), Lifecycle: h,
+		Logger: slog.Default(), Lifecycle: h, ProductIntake: h.ProductIntake,
 	})
 	// Debounce the per-session run trigger so a burst of messages collapses
 	// into one agent run instead of one per message (MUL-2968).
@@ -2399,6 +2399,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 			// Workspace-wide 30-day run counts per agent for the Agents-list RUNS column.
 			r.Get("/api/agent-run-counts", h.GetWorkspaceAgentRunCounts)
+			r.Post("/api/product-intake/approvals", h.CreateProductIntakeApproval)
 
 			r.Route("/api/chat/sessions", func(r chi.Router) {
 				r.Post("/", h.CreateChatSession)
