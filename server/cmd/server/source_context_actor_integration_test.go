@@ -59,10 +59,11 @@ func TestSourceContextRoutesRejectAuthoritativeTaskToken(t *testing.T) {
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
-		// Auth must discard both spoofed values and stamp the token's
-		// authoritative actor source and workspace before route guards run.
+		// Keep the workspace selector aligned with the token binding so these
+		// assertions isolate route-level human guards. Divergent selectors are
+		// rejected earlier by Auth and are covered by the auth integration tests.
 		req.Header.Set("X-Actor-Source", "member")
-		req.Header.Set("X-Workspace-ID", "00000000-0000-0000-0000-000000000099")
+		req.Header.Set("X-Workspace-ID", testWorkspaceID)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("perform request: %v", err)

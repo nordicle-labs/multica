@@ -118,3 +118,7 @@ func isMachineCredentialActor(r *http.Request) bool {
 		return false
 	}
 }
+
+func isCloudPATActor(r *http.Request) bool {
+	return r.Header.Get("X-Actor-Source") == "cloud_pat"
+}

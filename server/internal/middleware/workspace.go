@@ -52,8 +52,8 @@ var errWorkspaceNotFound = errors.New("workspace not found")
 // themselves.
 //
 // Priority:
-//  1. task-token binding (X-Actor-Source == "task_token") — authoritative,
-//     server-set, cannot be re-negotiated by the client (MUL-2600)
+//  1. task-token binding (X-Actor-Source == "task_token") — authoritative and
+//     server-set after Auth rejects divergent client selectors (MUL-2600)
 //  2. middleware-injected context (fast path for middleware-protected routes)
 //  3. X-Workspace-Slug header → GetWorkspaceBySlug → UUID (post-refactor frontend)
 //  4. ?workspace_slug query → GetWorkspaceBySlug → UUID
@@ -68,10 +68,7 @@ var errWorkspaceNotFound = errors.New("workspace not found")
 func ResolveWorkspaceIDFromRequest(r *http.Request, queries *db.Queries) string {
 	// A mat_ task token is bound to exactly one workspace by the token
 	// row. Auth middleware writes that workspace into X-Workspace-ID
-	// after stripping any client-supplied X-Actor-Source. Any other
-	// workspace identifier on the request (slug header/query, ID
-	// query, URL param) is the agent trying to widen its blast
-	// radius — ignore it.
+	// after rejecting divergent client-supplied workspace selectors.
 	if r.Header.Get("X-Actor-Source") == "task_token" {
 		return r.Header.Get("X-Workspace-ID")
 	}
@@ -103,9 +100,8 @@ type workspaceResolver func(r *http.Request) (string, error)
 // resolveWorkspaceUUID builds a resolver that accepts slug-first identification.
 //
 // Priority:
-//  1. task-token binding (X-Actor-Source == "task_token") — authoritative,
-//     server-set; the agent cannot widen its workspace scope by passing a
-//     different slug/id (MUL-2600)
+//  1. task-token binding (X-Actor-Source == "task_token") — authoritative and
+//     server-set after Auth rejects a different slug/id (MUL-2600)
 //  2. X-Workspace-Slug header / ?workspace_slug query → GetWorkspaceBySlug → UUID
 //  3. X-Workspace-ID header / ?workspace_id query → UUID directly (CLI/daemon compat)
 //

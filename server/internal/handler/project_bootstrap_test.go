@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -12,7 +14,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/githubapp"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -29,6 +30,25 @@ type bootstrapTestRemote struct {
 	bootstrapErr   error
 	deleteErr      error
 	bootstrapState string
+}
+
+func TestNewProjectBootstrapperBranchProtectionConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  githubapp.BranchProtectionMode
+	}{
+		{want: githubapp.BranchProtectionRequired},
+		{value: "disabled", want: githubapp.BranchProtectionDisabled},
+		{value: "invalid", want: githubapp.BranchProtectionRequired},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("GITHUB_BOOTSTRAP_BRANCH_PROTECTION_MODE", tc.value)
+			got := NewProjectBootstrapper().(githubapp.Bootstrapper)
+			if got.BranchProtectionMode != tc.want {
+				t.Fatalf("mode = %q, want %q", got.BranchProtectionMode, tc.want)
+			}
+		})
+	}
 }
 
 func (r *bootstrapTestRemote) Check(_ context.Context, _ int64, name, _, _ string) (bool, githubapp.BootstrapResult, error) {
@@ -96,25 +116,82 @@ func (s bootstrapTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
 	return bootstrapCommitTx{Tx: tx, commit: s.commit}, nil
 }
 
-func TestBootstrapProjectRequiresHumanActor(t *testing.T) {
+func TestBootstrapProjectRejectsCloudPATActor(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
-	req.Header.Set("X-Actor-Source", "task_token")
+	req.Header.Set("X-Actor-Source", "cloud_pat")
 	response := httptest.NewRecorder()
 	(&Handler{}).BootstrapProject(response, req)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("status = %d", response.Code)
 	}
+	if !strings.Contains(response.Body.String(), "unavailable to cloud-node credentials") {
+		t.Fatalf("body = %q", response.Body.String())
+	}
 }
 
-func TestBootstrapProjectRouteRequiresHumanActor(t *testing.T) {
-	router := chi.NewRouter()
-	router.With(RequireHumanActor).Post("/api/projects/bootstrap", (&Handler{}).BootstrapProject)
-	req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", strings.NewReader(`{}`))
-	req.Header.Set("X-Actor-Source", "task_token")
+func TestWriteBootstrapFailureReturnsSafeStructuredDiagnostic(t *testing.T) {
+	const secret = "synthetic-secret-marker"
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
 	response := httptest.NewRecorder()
-	router.ServeHTTP(response, req)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", response.Code)
+	writeBootstrapFailure(response, &githubapp.BootstrapFailure{
+		Code: "github_bootstrap_write_template_failed", Category: "github_api", Stage: "write_template", GitHubStatus: http.StatusForbidden, Err: errors.New("provider error containing " + secret),
+	})
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d", response.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 5 || body["error"] != "GitHub repository bootstrap failed" || body["code"] != "github_bootstrap_write_template_failed" || body["category"] != "github_api" || body["stage"] != "write_template" || body["github_status"] != float64(http.StatusForbidden) {
+		t.Fatalf("body = %#v", body)
+	}
+	if strings.Contains(response.Body.String(), secret) || strings.Contains(logs.String(), secret) {
+		t.Fatalf("secret leaked: response=%q logs=%q", response.Body.String(), logs.String())
+	}
+	for _, field := range []string{"code=github_bootstrap_write_template_failed", "category=github_api", "stage=write_template", "github_status=403"} {
+		if !strings.Contains(logs.String(), field) {
+			t.Fatalf("safe field %q missing from logs: %q", field, logs.String())
+		}
+	}
+}
+
+func TestBootstrapProjectCheckFailureReturnsSafeStructuredDiagnostic(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	const secret = "synthetic-check-secret-marker"
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	seedBootstrapInstallation(t)
+	remote := &bootstrapTestRemote{checkErr: errors.New("provider error containing " + secret)}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, "check-failure", "Bootstrap Check Failure")
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 4 || body["error"] != "GitHub repository bootstrap failed" || body["code"] != "github_bootstrap_failed" || body["category"] != "github_api" || body["stage"] != "unknown" {
+		t.Fatalf("body = %#v", body)
+	}
+	if strings.Contains(response.Body.String(), secret) || strings.Contains(logs.String(), secret) {
+		t.Fatalf("secret leaked: response=%q logs=%q", response.Body.String(), logs.String())
+	}
+	for _, field := range []string{"code=github_bootstrap_failed", "category=github_api", "stage=unknown", "github_status=0"} {
+		if !strings.Contains(logs.String(), field) {
+			t.Fatalf("safe field %q missing from logs: %q", field, logs.String())
+		}
 	}
 }
 
@@ -231,6 +308,54 @@ func TestBootstrapProjectCreatesAndReadsBackResource(t *testing.T) {
 	}
 }
 
+func TestBootstrapProjectIgnoresUnrelatedUndecodableRepositoryRef(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const (
+		name    = "ignores-undecodable-resource"
+		product = "Ignores Undecodable Resource"
+	)
+	for i, resourceRef := range []string{
+		`{"url":"https://github.com/nordicle-labs/unrelated","default_branch_hint":"main","unexpected":true}`,
+		`{"url":"not a github repository","default_branch_hint":"main"}`,
+	} {
+		projectID := dbfx.Project(t, fmt.Sprintf("Unrelated Repository Resource %d", i))
+		dbfx.Insert(t, "project_resource", testutil.Cols{
+			"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo", "resource_ref": resourceRef,
+		})
+	}
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	cleanupBootstrapProducts(t, product)
+	response := callBootstrap(t, &h, testUserID, name, product)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+}
+
+func TestBootstrapProjectRejectsMatchingTitleWithUndecodableRepositoryRef(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	const product = "Matching Undecodable Resource"
+	projectID := dbfx.Project(t, product)
+	dbfx.Insert(t, "project_resource", testutil.Cols{
+		"project_id": projectID, "workspace_id": testWorkspaceID, "resource_type": "github_repo",
+		"resource_ref": `{"url":"https://github.com/nordicle-labs/unrelated","default_branch_hint":"main","unexpected":true}`,
+	})
+	remote := &bootstrapTestRemote{}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, "matching-undecodable-resource", product)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusConflict, response.Body.String())
+	}
+}
+
 func TestBootstrapProjectReadsBackAmbiguousCommitBeforeRollback(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -329,6 +454,35 @@ func TestBootstrapProjectAllowsOwnerAndAdminButRejectsMember(t *testing.T) {
 		})
 	}
 	cleanupBootstrapProducts(t, "Bootstrap Role Owner", "Bootstrap Role Admin")
+}
+
+func TestBootstrapProjectAllowsTaskTokenOwnerAndAdmin(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	seedBootstrapInstallation(t)
+	adminID := dbfx.User(t, "Bootstrap Task Admin", "bootstrap-task-admin@multica.test")
+	dbfx.Member(t, testWorkspaceID, adminID, "admin")
+
+	for _, tc := range []struct{ role, userID string }{
+		{"owner", testUserID},
+		{"admin", adminID},
+	} {
+		t.Run(tc.role, func(t *testing.T) {
+			product := "Bootstrap Task " + strings.ToUpper(tc.role[:1]) + tc.role[1:]
+			cleanupBootstrapProducts(t, product)
+			remote := &bootstrapTestRemote{}
+			h := *testHandler
+			h.ProjectBootstrap = remote
+			req := testutil.WithHeaders(
+				testutil.JSONRequest(http.MethodPost, "/api/projects/bootstrap", map[string]string{"name": "task-" + tc.role, "visibility": "private", "product": product}),
+				"X-Actor-Source", "task_token",
+				"X-User-ID", tc.userID,
+				"X-Workspace-ID", testWorkspaceID,
+			)
+			testutil.Call(t, h.BootstrapProject, req).Want(http.StatusCreated)
+		})
+	}
 }
 
 func TestBootstrapProjectFailsClosedOnLocalCollisionsAndAdoption(t *testing.T) {

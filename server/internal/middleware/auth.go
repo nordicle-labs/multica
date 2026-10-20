@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -29,6 +30,48 @@ func rejectTemporarilyDisabledUser(w http.ResponseWriter, r *http.Request, userI
 	)
 	writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)
 	return true
+}
+
+func taskTokenWorkspaceSelectorMismatch(r *http.Request, queries *db.Queries, bound string) bool {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return true
+	}
+	boundID, err := util.ParseUUID(bound)
+	if err != nil {
+		return true
+	}
+	for _, values := range [][]string{r.Header.Values("X-Workspace-ID"), query["workspace_id"]} {
+		for _, id := range values {
+			if id == "" {
+				continue
+			}
+			parsed, err := util.ParseUUID(id)
+			if err != nil || parsed.Bytes != boundID.Bytes {
+				return true
+			}
+		}
+	}
+	const maxWorkspaceSlugSelectors = 16
+	slugs := make(map[string]struct{})
+	for _, values := range [][]string{r.Header.Values("X-Workspace-Slug"), query["workspace_slug"]} {
+		for _, slug := range values {
+			if slug == "" {
+				continue
+			}
+			slugs[slug] = struct{}{}
+			if len(slugs) > maxWorkspaceSlugSelectors {
+				return true
+			}
+		}
+	}
+	for slug := range slugs {
+		workspace, err := queries.GetWorkspaceBySlug(r.Context(), slug)
+		if err != nil || workspace.ID.Bytes != boundID.Bytes {
+			return true
+		}
+	}
+	return false
 }
 
 // Auth middleware validates JWT tokens or Personal Access Tokens.
@@ -123,10 +166,15 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				if rejectTemporarilyDisabledUser(w, r, userID, "", "task_token") {
 					return
 				}
+				workspaceID := uuidToString(tt.WorkspaceID)
+				if taskTokenWorkspaceSelectorMismatch(r, queries, workspaceID) {
+					writeError(w, http.StatusForbidden, "task token is bound to a different workspace")
+					return
+				}
 				r.Header.Set("X-User-ID", userID)
 				r.Header.Set("X-Agent-ID", uuidToString(tt.AgentID))
 				r.Header.Set("X-Task-ID", uuidToString(tt.TaskID))
-				r.Header.Set("X-Workspace-ID", uuidToString(tt.WorkspaceID))
+				r.Header.Set("X-Workspace-ID", workspaceID)
 				// X-Actor-Source flags the auth path so resolveActor and
 				// any owner-only handler can deny without re-querying the
 				// token table. The value "task_token" is the only signal

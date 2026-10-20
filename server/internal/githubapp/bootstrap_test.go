@@ -10,10 +10,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 )
+
+type tokenMint struct {
+	repositories []string
+	permissions  Permissions
+}
 
 type bootstrapGitHub struct {
 	mu                  sync.Mutex
@@ -22,6 +28,7 @@ type bootstrapGitHub struct {
 	visibility          string
 	files               map[string]string
 	protected           bool
+	protectionCalls     int
 	createCount         int
 	deleteCount         int
 	failCreate          bool
@@ -35,6 +42,7 @@ type bootstrapGitHub struct {
 	disconnectCreate    bool
 	revokeCount         int
 	failRevokeAt        int
+	tokenMints          []tokenMint
 }
 
 func TestRepositoryIdentity(t *testing.T) {
@@ -69,9 +77,11 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	if strings.HasPrefix(path, "/app/installations/") && strings.HasSuffix(path, "/access_tokens") {
 		var body struct {
-			Repositories []string `json:"repositories"`
+			Repositories []string    `json:"repositories"`
+			Permissions  Permissions `json:"permissions"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		g.tokenMints = append(g.tokenMints, tokenMint{repositories: body.Repositories, permissions: body.Permissions})
 		w.WriteHeader(http.StatusCreated)
 		if len(body.Repositories) == 1 {
 			_, _ = w.Write([]byte(`{"token":"test-installation-token","expires_at":"2099-01-01T00:00:00Z","repositories":[{"full_name":"nordicle-labs/widget"}]}`))
@@ -168,6 +178,7 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasSuffix(path, "/branches/main/protection") {
+		g.protectionCalls++
 		if r.Method == http.MethodPut {
 			if g.failProtection {
 				http.Error(w, "injected", http.StatusInternalServerError)
@@ -229,7 +240,7 @@ func TestBootstrapCreatesCanonicalRepositoryAndSecondPassIsUnchanged(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.State != "created" || first.HeadSHA != "head-sha" || first.TreeSHA != "tree-sha" {
+	if first.State != "created" || !first.BranchProtected || first.HeadSHA != "head-sha" || first.TreeSHA != "tree-sha" {
 		t.Fatalf("first = %+v", first)
 	}
 	second, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
@@ -239,6 +250,15 @@ func TestBootstrapCreatesCanonicalRepositoryAndSecondPassIsUnchanged(t *testing.
 	if second.State != "unchanged" || state.createCount != 1 {
 		t.Fatalf("second=%+v creates=%d", second, state.createCount)
 	}
+	wantMints := []tokenMint{
+		{permissions: Permissions{"administration": "write", "metadata": "read"}},
+		{repositories: []string{"widget"}, permissions: Permissions{"administration": "write", "contents": "write", "metadata": "read", "workflows": "write"}},
+		{permissions: Permissions{"administration": "write", "metadata": "read"}},
+		{repositories: []string{"widget"}, permissions: Permissions{"administration": "read", "contents": "read", "metadata": "read"}},
+	}
+	if !reflect.DeepEqual(state.tokenMints, wantMints) {
+		t.Fatalf("token mints = %#v, want %#v", state.tokenMints, wantMints)
+	}
 	for _, path := range []string{"README.md", "AGENTS.md", ".github/CODEOWNERS", ".github/workflows/ci.yml", ".multica/environment.json", ".multica-template.json", "Makefile"} {
 		if _, ok := state.files[path]; !ok {
 			t.Errorf("missing template file %s", path)
@@ -247,6 +267,39 @@ func TestBootstrapCreatesCanonicalRepositoryAndSecondPassIsUnchanged(t *testing.
 	manifest, _ := base64.StdEncoding.DecodeString(state.files[".multica-template.json"])
 	if !strings.Contains(string(manifest), first.TemplateFingerprint) {
 		t.Fatal("manifest does not carry template fingerprint")
+	}
+}
+
+func TestBootstrapWithoutBranchProtectionIsExplicitAndIdempotent(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}}
+	bootstrapper := testBootstrapper(t, state)
+	bootstrapper.BranchProtectionMode = BranchProtectionDisabled
+
+	first, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State != "created" || first.BranchProtected || second.State != "unchanged" || second.BranchProtected {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+	if state.createCount != 1 || state.protectionCalls != 0 {
+		t.Fatalf("creates=%d protection calls=%d", state.createCount, state.protectionCalls)
+	}
+}
+
+func TestBranchProtectionModeDefaultsAndInvalidValuesFailClosed(t *testing.T) {
+	for _, raw := range []string{"", "required", "typo"} {
+		mode, _ := ParseBranchProtectionMode(raw)
+		if mode != BranchProtectionRequired {
+			t.Errorf("ParseBranchProtectionMode(%q) = %q", raw, mode)
+		}
+	}
+	if _, err := ParseBranchProtectionMode("typo"); err == nil {
+		t.Fatal("invalid mode was accepted")
 	}
 }
 
@@ -376,6 +429,22 @@ func TestBootstrapReportsIncompleteRemoteRollback(t *testing.T) {
 	}
 	if !state.repository || state.deleteCount != 0 {
 		t.Fatalf("repository=%v deletes=%d", state.repository, state.deleteCount)
+	}
+}
+
+func TestBootstrapFailureDiagnosesStageAndGitHubStatusWithoutResponseBody(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}, failCreate: true}
+	bootstrapper := testBootstrapper(t, state)
+	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget")
+	failure, ok := DiagnoseBootstrapFailure(err)
+	if !ok {
+		t.Fatalf("failure is not diagnosable: %v", err)
+	}
+	if failure.Code != "github_bootstrap_create_repository_failed" || failure.Category != "github_api" || failure.Stage != "create_repository" || failure.GitHubStatus != http.StatusInternalServerError {
+		t.Fatalf("failure = %+v", failure)
+	}
+	if strings.Contains(err.Error(), "injected") {
+		t.Fatalf("GitHub response body leaked: %v", err)
 	}
 }
 

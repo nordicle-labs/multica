@@ -10,6 +10,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -62,6 +63,90 @@ func validClaims() jwt.MapClaims {
 // authMiddleware returns the Auth middleware with nil queries (JWT-only tests).
 func authMiddleware(next http.Handler) http.Handler {
 	return Auth(nil, nil, nil, nil)(next)
+}
+
+func TestTaskTokenWorkspaceIDSelectorMismatch(t *testing.T) {
+	const bound = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	for _, tc := range []struct {
+		name       string
+		headerIDs  []string
+		queryIDs   []string
+		wantReject bool
+	}{
+		{name: "no selector"},
+		{name: "bound header", headerIDs: []string{bound}},
+		{name: "bound query", queryIDs: []string{bound}},
+		{name: "equivalent UUID representations", headerIDs: []string{bound, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"}},
+		{name: "divergent header", headerIDs: []string{"00000000-0000-0000-0000-000000000002"}, wantReject: true},
+		{name: "divergent query", queryIDs: []string{"00000000-0000-0000-0000-000000000002"}, wantReject: true},
+		{name: "invalid UUID", queryIDs: []string{"not-a-uuid"}, wantReject: true},
+		{name: "second header diverges", headerIDs: []string{bound, "00000000-0000-0000-0000-000000000002"}, wantReject: true},
+		{name: "second query diverges", queryIDs: []string{bound, "00000000-0000-0000-0000-000000000002"}, wantReject: true},
+		{name: "empty values are ignored", headerIDs: []string{"", bound}, queryIDs: []string{"", bound}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
+			for _, id := range tc.headerIDs {
+				req.Header.Add("X-Workspace-ID", id)
+			}
+			query := req.URL.Query()
+			for _, id := range tc.queryIDs {
+				query.Add("workspace_id", id)
+			}
+			req.URL.RawQuery = query.Encode()
+			if got := taskTokenWorkspaceSelectorMismatch(req, nil, bound); got != tc.wantReject {
+				t.Fatalf("mismatch = %v, want %v", got, tc.wantReject)
+			}
+		})
+	}
+}
+
+func TestTaskTokenWorkspaceMalformedQuerySelectors(t *testing.T) {
+	const bound = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	for _, rawQuery := range []string{
+		"workspace_id=" + bound + "&workspace_id=%ZZ",
+		"workspace_slug=bound-workspace&workspace_slug=%ZZ",
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
+		req.URL.RawQuery = rawQuery
+		if !taskTokenWorkspaceSelectorMismatch(req, nil, bound) {
+			t.Fatalf("malformed query %q was accepted", rawQuery)
+		}
+	}
+}
+
+func TestTaskTokenWorkspaceSlugSelectorMismatch(t *testing.T) {
+	pool := openPool(t)
+	defer pool.Close()
+	bound, cleanup := setupResolverFixture(t, pool)
+	defer cleanup()
+	queries := db.New(pool)
+
+	for _, tc := range []struct {
+		name        string
+		headerSlugs []string
+		querySlugs  []string
+		wantReject  bool
+	}{
+		{name: "matching repeated values", headerSlugs: []string{"", testResolverSlug}, querySlugs: []string{testResolverSlug}},
+		{name: "second header diverges", headerSlugs: []string{testResolverSlug, "does-not-exist"}, wantReject: true},
+		{name: "second query diverges", querySlugs: []string{testResolverSlug, "does-not-exist"}, wantReject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/projects/bootstrap", nil)
+			for _, slug := range tc.headerSlugs {
+				req.Header.Add("X-Workspace-Slug", slug)
+			}
+			query := req.URL.Query()
+			for _, slug := range tc.querySlugs {
+				query.Add("workspace_slug", slug)
+			}
+			req.URL.RawQuery = query.Encode()
+			if got := taskTokenWorkspaceSelectorMismatch(req, queries, bound); got != tc.wantReject {
+				t.Fatalf("mismatch = %v, want %v", got, tc.wantReject)
+			}
+		})
+	}
 }
 
 func TestAuth_MissingHeader(t *testing.T) {

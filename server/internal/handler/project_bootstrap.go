@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -24,7 +26,14 @@ type ProjectBootstrapper interface {
 }
 
 func NewProjectBootstrapper() ProjectBootstrapper {
-	return githubapp.Bootstrapper{Broker: githubAppBroker()}
+	const envName = "GITHUB_BOOTSTRAP_BRANCH_PROTECTION_MODE"
+	mode, err := githubapp.ParseBranchProtectionMode(os.Getenv(envName))
+	if err != nil {
+		slog.Error("invalid GitHub bootstrap branch protection mode; requiring protection", "name", envName, "mode", mode)
+	} else {
+		slog.Info("GitHub bootstrap branch protection mode configured", "mode", mode)
+	}
+	return githubapp.Bootstrapper{Broker: githubAppBroker(), BranchProtectionMode: mode}
 }
 
 type projectBootstrapRequest struct {
@@ -51,8 +60,8 @@ func (e *bootstrapCommitError) Unwrap() error { return e.err }
 // BootstrapProject creates the canonical GitHub repository and its Multica
 // project/resource. Every local collision is resolved before the first write.
 func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
-	if isMachineCredentialActor(r) {
-		writeError(w, http.StatusForbidden, "this endpoint is only available to human actors")
+	if isCloudPATActor(r) {
+		writeError(w, http.StatusForbidden, "this endpoint is unavailable to cloud-node credentials")
 		return
 	}
 	var req projectBootstrapRequest
@@ -125,7 +134,7 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 
 	remoteExists, remote, err := h.ProjectBootstrap.Check(r.Context(), installation.InstallationID, name, req.Visibility, req.Product)
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		writeBootstrapFailure(w, err)
 		return
 	}
 	if localState == "exact" {
@@ -143,7 +152,7 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 
 	remote, err = h.ProjectBootstrap.Bootstrap(r.Context(), installation.InstallationID, name, req.Visibility, req.Product)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeBootstrapFailure(w, err)
 		return
 	}
 	if remote.State != "created" {
@@ -174,6 +183,29 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, projectBootstrapResponse{BootstrapResult: remote, Project: projectToResponse(project)})
+}
+
+func writeBootstrapFailure(w http.ResponseWriter, err error) {
+	failure, ok := githubapp.DiagnoseBootstrapFailure(err)
+	if !ok {
+		failure = &githubapp.BootstrapFailure{Code: "github_bootstrap_failed", Category: "github_api", Stage: "unknown", Err: err}
+	}
+	slog.Error("project bootstrap failed",
+		"code", failure.Code,
+		"category", failure.Category,
+		"stage", failure.Stage,
+		"github_status", failure.GitHubStatus,
+	)
+	body := map[string]any{
+		"error":    "GitHub repository bootstrap failed",
+		"code":     failure.Code,
+		"category": failure.Category,
+		"stage":    failure.Stage,
+	}
+	if failure.GitHubStatus != 0 {
+		body["github_status"] = failure.GitHubStatus
+	}
+	writeJSON(w, http.StatusBadGateway, body)
 }
 
 func bootstrapInstallation(installations []db.GithubInstallation) (db.GithubInstallation, error) {
@@ -238,12 +270,10 @@ func (h *Handler) bootstrapLocalState(ctx context.Context, workspaceID pgtype.UU
 			}
 			ref, err := decodeBootstrapRepositoryRef(resource.ResourceRef)
 			if err != nil {
-				collision = true
 				continue
 			}
 			identity, err := githubapp.RepositoryIdentity(ref.URL)
 			if err != nil {
-				collision = true
 				continue
 			}
 			if identity == targetRepository {

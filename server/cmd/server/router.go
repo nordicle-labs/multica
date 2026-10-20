@@ -2131,7 +2131,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Get("/search", h.SearchProjects)
 				r.Get("/", h.ListProjects)
 				r.Post("/", h.CreateProject)
-				r.With(handler.RequireHumanActor).Post("/bootstrap", h.BootstrapProject)
+				r.Post("/bootstrap", h.BootstrapProject)
 				r.Route("/{id}", func(r chi.Router) {
 					r.Get("/", h.GetProject)
 					r.Put("/", h.UpdateProject)
