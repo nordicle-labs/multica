@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
 // stubLookPath swaps the package-level lookPath indirection used by
@@ -472,6 +475,58 @@ func TestRegisterRuntimes_OverrideNotExecutableFallsBackToPath(t *testing.T) {
 
 	if got := d.profileLaunchSpecs["prof-1"].path; got != "/usr/bin/company-codex" {
 		t.Errorf("profileLaunchSpecs[prof-1].path = %q, want the PATH fallback /usr/bin/company-codex", got)
+	}
+}
+
+func TestRegisterRuntimes_CanonicalProfilesTolerateOneTimedOutProbe(t *testing.T) {
+	const profileCount = 37
+	profiles := make([]RuntimeProfile, 0, profileCount)
+	resolved := make(map[string]string, profileCount)
+	for i := 0; i < profileCount; i++ {
+		name := "canonical-" + strconv.Itoa(i)
+		profiles = append(profiles, RuntimeProfile{
+			ID:             "prof-" + strconv.Itoa(i),
+			WorkspaceID:    "ws-1",
+			DisplayName:    name,
+			ProtocolFamily: "codex",
+			CommandName:    name,
+			Enabled:        true,
+		})
+		resolved[name] = "/opt/bin/" + name
+	}
+	stubLookPath(t, resolved)
+
+	origDetect := detectAgentVersion
+	t.Cleanup(func() { detectAgentVersion = origDetect })
+	const probeTimeout = 100 * time.Millisecond
+	detectAgentVersion = func(ctx context.Context, cmd agent.Command) (string, error) {
+		if cmd.Path != "/opt/bin/canonical-36" {
+			return "9.9.9", nil
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		defer cancel()
+		<-probeCtx.Done()
+		return "", probeCtx.Err()
+	}
+
+	fx := newProfileRegisterFixture(t, profiles, http.StatusOK)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	startedAt := time.Now()
+	if _, _, _, err := fx.daemon.registerRuntimesForWorkspaceLocked(ctx, "ws-1"); err != nil {
+		t.Fatalf("register canonical profiles: %v", err)
+	}
+	elapsed := time.Since(startedAt)
+	if elapsed < probeTimeout || elapsed >= time.Second {
+		t.Fatalf("registration elapsed %s, want timed-out probe honored within total budget", elapsed)
+	}
+	if len(fx.sentRuntimes) != profileCount {
+		t.Fatalf("registered %d profiles, want %d", len(fx.sentRuntimes), profileCount)
+	}
+	for _, runtime := range fx.sentRuntimes {
+		if runtime["profile_id"] == "prof-36" && runtime["version"] != "" {
+			t.Fatalf("timed-out profile version = %v, want empty best-effort version", runtime["version"])
+		}
 	}
 }
 

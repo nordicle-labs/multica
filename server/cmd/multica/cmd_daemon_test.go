@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 const (
 	startingDaemonChildProfileEnv  = "MULTICA_TEST_STARTING_DAEMON_PROFILE"
 	startingDaemonDescendantPIDEnv = "MULTICA_TEST_STARTING_DAEMON_DESCENDANT_PID"
+	startingDaemonReadyDelayEnv    = "MULTICA_TEST_STARTING_DAEMON_READY_DELAY"
 )
 
 func TestStartingDaemonChildProcess(t *testing.T) {
@@ -46,8 +48,14 @@ func TestStartingDaemonChildProcess(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
+	startedAt := time.Now()
+	readyDelay, _ := time.ParseDuration(os.Getenv(startingDaemonReadyDelayEnv))
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"status":"starting","pid":%d}`, os.Getpid())
+		status := "starting"
+		if readyDelay > 0 && time.Since(startedAt) >= readyDelay {
+			status = "running"
+		}
+		_, _ = fmt.Fprintf(w, `{"status":%q,"pid":%d}`, status, os.Getpid())
 	})}
 	go func() { _ = srv.Serve(ln) }()
 	time.Sleep(60 * time.Second)
@@ -444,7 +452,7 @@ list workspaces: GET /api/workspaces returned 401: {"error":"invalid token"}
 // for an authenticated `daemon start` whose child dies during preflight
 // (unreachable server, token rejected with 401, ...): the parent must notice
 // the exit and report failure immediately instead of polling the health port
-// for the full 45s readiness window and ending with a vague "check logs"
+// for the full readiness window and ending with a vague "check logs"
 // warning and exit code 0.
 //
 // The spawned child is stubbed to `false` via daemonExecutable so it dies
@@ -481,7 +489,7 @@ func TestDaemonStartBackgroundReportsEarlyChildExit(t *testing.T) {
 		t.Fatalf("runDaemonStart() = %v, want startup failure error", err)
 	}
 	if elapsed > 15*time.Second {
-		t.Fatalf("runDaemonStart took %s, want early-exit detection well before the 45s readiness window", elapsed)
+		t.Fatalf("runDaemonStart took %s, want early-exit detection well before the readiness window", elapsed)
 	}
 }
 
@@ -545,6 +553,79 @@ func TestDaemonStartBackgroundStopsChildThatNeverBecomesReady(t *testing.T) {
 	_ = ln.Close()
 	if _, err := os.Stat(daemonPIDPathForProfile(profile)); !os.IsNotExist(err) {
 		t.Fatalf("timed-out startup left PID file: %v", err)
+	}
+}
+
+func TestDaemonStartBackgroundAllowsBoundedSlowPreflight(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	const profile = "slow-preflight-test"
+	if err := cli.SaveCLIConfigForProfile(cli.CLIConfig{Token: "mul_fake"}, profile); err != nil {
+		t.Fatalf("SaveCLIConfigForProfile: %v", err)
+	}
+	t.Setenv(startingDaemonChildProfileEnv, profile)
+	t.Setenv(startingDaemonReadyDelayEnv, "1200ms")
+
+	script := filepath.Join(t.TempDir(), "slow-starting-daemon")
+	contents := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=^TestStartingDaemonChildProcess$\n", os.Args[0])
+	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
+		t.Fatalf("write child wrapper: %v", err)
+	}
+	origExecutable := daemonExecutable
+	daemonExecutable = func() (string, error) { return script, nil }
+	t.Cleanup(func() { daemonExecutable = origExecutable })
+
+	cmd := &cobra.Command{Use: "start"}
+	cmd.Flags().Bool("foreground", false, "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("server-url", "", "")
+	if err := cmd.Flags().Set("profile", profile); err != nil {
+		t.Fatalf("set profile flag: %v", err)
+	}
+
+	origTimeout := daemonStartupTimeout
+	daemonStartupTimeout = 2 * time.Second
+	t.Cleanup(func() { daemonStartupTimeout = origTimeout })
+
+	startedAt := time.Now()
+	if err := runDaemonBackground(cmd); err != nil {
+		t.Fatalf("runDaemonBackground() = %v, want slow bounded preflight to become ready", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed < 1200*time.Millisecond || elapsed >= daemonStartupTimeout {
+		t.Fatalf("startup elapsed %s, want probe delay honored within %s budget", elapsed, daemonStartupTimeout)
+	}
+
+	pidBytes, err := os.ReadFile(daemonPIDPathForProfile(profile))
+	if err != nil {
+		t.Fatalf("read daemon pid: %v", err)
+	}
+	pid, err := strconv.Atoi(string(pidBytes))
+	if err != nil {
+		t.Fatalf("parse daemon pid: %v", err)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("find daemon: %v", err)
+	}
+	if err := killDaemonProcess(process); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("stop test daemon: %v", err)
+	}
+}
+
+func TestDaemonStartupTimeoutCoversCanonicalProbeBudget(t *testing.T) {
+	const (
+		tokenRenewalTimeout = 15 * time.Second
+		versionProbeTimeout = 10 * time.Second
+		canonicalProfiles   = 37
+		probeConcurrency    = 8
+	)
+	profileWaves := (canonicalProfiles + probeConcurrency - 1) / probeConcurrency
+	minimum := tokenRenewalTimeout + time.Duration(1+profileWaves)*versionProbeTimeout
+	if daemonStartupTimeout < minimum {
+		t.Fatalf("daemon startup timeout %s is shorter than bounded canonical preflight %s", daemonStartupTimeout, minimum)
 	}
 }
 
