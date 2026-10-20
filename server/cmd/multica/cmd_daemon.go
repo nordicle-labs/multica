@@ -556,13 +556,14 @@ func runDaemonBackground(cmd *cobra.Command) error {
 	return runDaemonBackgroundWithTimeout(cmd, daemonStartupTimeout)
 }
 
-// daemonStartupTimeout covers the bounded work before the child reports
-// "running": a 15s token-renewal request, one 10s built-in version-probe wave,
-// and five 10s waves for the 37 canonical custom profiles at concurrency 8.
-// The remaining 15s covers the workspace/profile/register round trips. It stays
-// finite so a genuinely blocked preflight still fails closed and is killed.
+// daemonStartupTimeout covers a canonical cold start with 37 custom profiles.
+// The version probes' 10s contexts are not their wall-clock ceiling: process
+// cleanup can add WaitDelay, and profile fetch/register requests run around the
+// probe waves. Use a three-minute bound so those bounded phases can finish
+// without treating a live child as failed. The timeout stays finite,
+// so a genuinely blocked preflight still fails closed and is killed.
 // A var lets lifecycle tests scale the same contract down to milliseconds.
-var daemonStartupTimeout = 90 * time.Second
+var daemonStartupTimeout = 3 * time.Minute
 
 func runDaemonBackgroundWithTimeout(cmd *cobra.Command, startupTimeout time.Duration) error {
 	profile := resolveProfile(cmd)

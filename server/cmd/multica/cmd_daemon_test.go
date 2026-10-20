@@ -615,17 +615,10 @@ func TestDaemonStartBackgroundAllowsBoundedSlowPreflight(t *testing.T) {
 	}
 }
 
-func TestDaemonStartupTimeoutCoversCanonicalProbeBudget(t *testing.T) {
-	const (
-		tokenRenewalTimeout = 15 * time.Second
-		versionProbeTimeout = 10 * time.Second
-		canonicalProfiles   = 37
-		probeConcurrency    = 8
-	)
-	profileWaves := (canonicalProfiles + probeConcurrency - 1) / probeConcurrency
-	minimum := tokenRenewalTimeout + time.Duration(1+profileWaves)*versionProbeTimeout
+func TestDaemonStartupTimeoutCoversCanonicalColdStart(t *testing.T) {
+	const minimum = 3 * time.Minute
 	if daemonStartupTimeout < minimum {
-		t.Fatalf("daemon startup timeout %s is shorter than bounded canonical preflight %s", daemonStartupTimeout, minimum)
+		t.Fatalf("daemon startup timeout %s is shorter than canonical cold-start budget %s", daemonStartupTimeout, minimum)
 	}
 }
 
