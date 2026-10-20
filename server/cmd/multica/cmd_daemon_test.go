@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"text/template"
 	"time"
@@ -21,12 +22,24 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon"
 )
 
-const startingDaemonChildProfileEnv = "MULTICA_TEST_STARTING_DAEMON_PROFILE"
+const (
+	startingDaemonChildProfileEnv  = "MULTICA_TEST_STARTING_DAEMON_PROFILE"
+	startingDaemonDescendantPIDEnv = "MULTICA_TEST_STARTING_DAEMON_DESCENDANT_PID"
+)
 
 func TestStartingDaemonChildProcess(t *testing.T) {
 	profile := os.Getenv(startingDaemonChildProfileEnv)
 	if profile == "" {
 		return
+	}
+	if pidPath := os.Getenv(startingDaemonDescendantPIDEnv); pidPath != "" {
+		descendant := exec.Command("sleep", "60")
+		if err := descendant.Start(); err != nil {
+			t.Fatalf("start descendant: %v", err)
+		}
+		if err := os.WriteFile(pidPath, []byte(strconv.Itoa(descendant.Process.Pid)), 0o644); err != nil {
+			t.Fatalf("write descendant pid: %v", err)
+		}
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
 	if err != nil {
@@ -483,6 +496,8 @@ func TestDaemonStartBackgroundStopsChildThatNeverBecomesReady(t *testing.T) {
 		t.Fatalf("SaveCLIConfigForProfile: %v", err)
 	}
 	t.Setenv(startingDaemonChildProfileEnv, profile)
+	descendantPIDPath := filepath.Join(t.TempDir(), "descendant.pid")
+	t.Setenv(startingDaemonDescendantPIDEnv, descendantPIDPath)
 
 	script := filepath.Join(t.TempDir(), "starting-daemon")
 	contents := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=^TestStartingDaemonChildProcess$\n", os.Args[0])
@@ -506,11 +521,31 @@ func TestDaemonStartBackgroundStopsChildThatNeverBecomesReady(t *testing.T) {
 		t.Fatalf("runDaemonStart() = %v, want readiness timeout error", err)
 	}
 
+	descendantPIDBytes, err := os.ReadFile(descendantPIDPath)
+	if err != nil {
+		t.Fatalf("read descendant pid: %v", err)
+	}
+	descendantPID, err := strconv.Atoi(string(descendantPIDBytes))
+	if err != nil {
+		t.Fatalf("parse descendant pid: %v", err)
+	}
+	descendant, err := os.FindProcess(descendantPID)
+	if err != nil {
+		t.Fatalf("find descendant: %v", err)
+	}
+	t.Cleanup(func() { _ = descendant.Kill() })
+	if err := descendant.Signal(syscall.Signal(0)); err == nil {
+		t.Fatalf("timed-out startup left descendant pid %d alive", descendantPID)
+	}
+
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
 	if err != nil {
 		t.Fatalf("timed-out child still owns health port: %v", err)
 	}
 	_ = ln.Close()
+	if _, err := os.Stat(daemonPIDPathForProfile(profile)); !os.IsNotExist(err) {
+		t.Fatalf("timed-out startup left PID file: %v", err)
+	}
 }
 
 // TestDaemonRestartUnauthenticatedFailsBeforeStopping pins the ordering that

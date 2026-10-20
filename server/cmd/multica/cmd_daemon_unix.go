@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,6 +19,14 @@ import (
 // session and process group.
 func daemonSysProcAttr(_ bool) *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setsid: true}
+}
+
+func killDaemonProcess(process *os.Process) error {
+	err := syscall.Kill(-process.Pid, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return process.Kill()
+	}
+	return err
 }
 
 // isAccessDeniedSpawnErr is always false on Unix. The Windows version

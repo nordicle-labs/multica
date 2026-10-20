@@ -700,7 +700,7 @@ func runDaemonBackgroundWithTimeout(cmd *cobra.Command, startupTimeout time.Dura
 		}
 	}
 	if !started {
-		killErr := child.Process.Kill()
+		killErr := killDaemonProcess(child.Process)
 		select {
 		case <-waitCh:
 		case <-time.After(5 * time.Second):
