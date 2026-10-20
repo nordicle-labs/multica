@@ -189,7 +189,7 @@ func writeBootstrapFailure(w http.ResponseWriter, err error) {
 		"github_status", failure.GitHubStatus,
 	)
 	body := map[string]any{
-		"error":    err.Error(),
+		"error":    "GitHub repository bootstrap failed",
 		"code":     failure.Code,
 		"category": failure.Category,
 		"stage":    failure.Stage,

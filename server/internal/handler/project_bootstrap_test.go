@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -109,9 +111,15 @@ func TestBootstrapProjectRejectsCloudPATActor(t *testing.T) {
 }
 
 func TestWriteBootstrapFailureReturnsSafeStructuredDiagnostic(t *testing.T) {
+	const secret = "synthetic-secret-marker"
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
 	response := httptest.NewRecorder()
 	writeBootstrapFailure(response, &githubapp.BootstrapFailure{
-		Code: "github_bootstrap_write_template_failed", Category: "github_api", Stage: "write_template", GitHubStatus: http.StatusForbidden, Err: errors.New("write template file .github/workflows/ci.yml: github status 403"),
+		Code: "github_bootstrap_write_template_failed", Category: "github_api", Stage: "write_template", GitHubStatus: http.StatusForbidden, Err: errors.New("provider error containing " + secret),
 	})
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d", response.Code)
@@ -120,8 +128,16 @@ func TestWriteBootstrapFailureReturnsSafeStructuredDiagnostic(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if body["code"] != "github_bootstrap_write_template_failed" || body["category"] != "github_api" || body["stage"] != "write_template" || body["github_status"] != float64(http.StatusForbidden) {
+	if len(body) != 5 || body["error"] != "GitHub repository bootstrap failed" || body["code"] != "github_bootstrap_write_template_failed" || body["category"] != "github_api" || body["stage"] != "write_template" || body["github_status"] != float64(http.StatusForbidden) {
 		t.Fatalf("body = %#v", body)
+	}
+	if strings.Contains(response.Body.String(), secret) || strings.Contains(logs.String(), secret) {
+		t.Fatalf("secret leaked: response=%q logs=%q", response.Body.String(), logs.String())
+	}
+	for _, field := range []string{"code=github_bootstrap_write_template_failed", "category=github_api", "stage=write_template", "github_status=403"} {
+		if !strings.Contains(logs.String(), field) {
+			t.Fatalf("safe field %q missing from logs: %q", field, logs.String())
+		}
 	}
 }
 
