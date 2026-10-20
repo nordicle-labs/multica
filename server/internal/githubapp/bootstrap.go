@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +32,7 @@ var (
 	//go:embed all:template
 	templateFS    embed.FS
 	validRepoName = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$`)
+	githubStatus  = regexp.MustCompile(`github status ([0-9]{3})`)
 )
 
 var RequiredChecks = []string{"build", "lint", "test", "smoke"}
@@ -47,6 +49,36 @@ type BootstrapResult struct {
 }
 
 type Bootstrapper struct{ Broker Broker }
+
+type BootstrapFailure struct {
+	Code         string
+	Category     string
+	Stage        string
+	GitHubStatus int
+	Err          error
+}
+
+func (e *BootstrapFailure) Error() string { return e.Err.Error() }
+func (e *BootstrapFailure) Unwrap() error { return e.Err }
+
+func DiagnoseBootstrapFailure(err error) (*BootstrapFailure, bool) {
+	var failure *BootstrapFailure
+	return failure, errors.As(err, &failure)
+}
+
+func bootstrapFailure(stage string, err error) error {
+	status := 0
+	if match := githubStatus.FindStringSubmatch(err.Error()); len(match) == 2 {
+		status, _ = strconv.Atoi(match[1])
+	}
+	return &BootstrapFailure{
+		Code:         "github_bootstrap_" + stage + "_failed",
+		Category:     "github_api",
+		Stage:        stage,
+		GitHubStatus: status,
+		Err:          err,
+	}
+}
 
 // Check performs the complete remote preflight without mutation. A present
 // repository is returned only after template and protection readback succeeds.
@@ -172,25 +204,33 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 	// scoped token. Revoke this installation-wide token after attesting the ID.
 	token, err := b.Broker.MintInstallation(ctx, installationID, Permissions{"administration": "write", "metadata": "read"})
 	if err != nil {
-		return result, err
+		return result, bootstrapFailure("mint_installation_token", err)
 	}
-	defer func() { err = errors.Join(err, b.revokeToken(&token, result.RepositoryURL)) }()
+	defer func() {
+		if revokeErr := b.revokeToken(&token, result.RepositoryURL); revokeErr != nil {
+			err = errors.Join(err, bootstrapFailure("revoke_installation_token", revokeErr))
+		}
+	}()
 
 	exists, err := b.repositoryExists(ctx, token, name)
 	if err != nil {
-		return result, err
+		return result, bootstrapFailure("repository_preflight", err)
 	}
 	if exists {
 		if err := b.revokeToken(&token, result.RepositoryURL); err != nil {
-			return result, err
+			return result, bootstrapFailure("revoke_installation_token", err)
 		}
 		credential, mintErr := b.Broker.Mint(ctx, installationID, BootstrapOwner+"/"+name, Permissions{"administration": "read", "contents": "read", "metadata": "read"})
 		if mintErr != nil {
-			return result, mintErr
+			return result, bootstrapFailure("mint_repository_token", mintErr)
 		}
-		defer func() { err = errors.Join(err, b.revokeToken(&credential.Token, result.RepositoryURL)) }()
+		defer func() {
+			if revokeErr := b.revokeToken(&credential.Token, result.RepositoryURL); revokeErr != nil {
+				err = errors.Join(err, bootstrapFailure("revoke_repository_token", revokeErr))
+			}
+		}()
 		if err := b.verify(ctx, credential.Token, name, visibility, product, fingerprint, &result); err != nil {
-			return result, fmt.Errorf("existing repository is divergent: %w", err)
+			return result, bootstrapFailure("verify_repository", fmt.Errorf("existing repository is divergent: %w", err))
 		}
 		result.State = "unchanged"
 		return result, nil
@@ -204,7 +244,7 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if rollbackErr := b.Delete(rollbackCtx, installationID, name, result.RepositoryID); rollbackErr != nil {
-			err = fmt.Errorf("%w; rollback incomplete; reconcile repository %s/%s", err, BootstrapOwner, name)
+			err = errors.Join(err, bootstrapFailure("rollback_repository", fmt.Errorf("rollback incomplete; reconcile repository %s/%s: %w", BootstrapOwner, name, rollbackErr)))
 		}
 	}()
 	var creationAmbiguous bool
@@ -215,28 +255,32 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 			defer cancel()
 			err = b.reconcileAmbiguousCreate(readbackCtx, token, name, err)
 		}
-		return result, err
+		return result, bootstrapFailure("create_repository", err)
 	}
 	created = true
 	if err = b.attestRepository(ctx, token, name, result.RepositoryID); err != nil {
-		return result, err
+		return result, bootstrapFailure("attest_repository", err)
 	}
 	if err = b.revokeToken(&token, result.RepositoryURL); err != nil {
-		return result, err
+		return result, bootstrapFailure("revoke_installation_token", err)
 	}
 	credential, err := b.Broker.Mint(ctx, installationID, BootstrapOwner+"/"+name, Permissions{"administration": "write", "contents": "write", "metadata": "read", "workflows": "write"})
 	if err != nil {
-		return result, err
+		return result, bootstrapFailure("mint_repository_token", err)
 	}
-	defer func() { err = errors.Join(err, b.revokeToken(&credential.Token, result.RepositoryURL)) }()
+	defer func() {
+		if revokeErr := b.revokeToken(&credential.Token, result.RepositoryURL); revokeErr != nil {
+			err = errors.Join(err, bootstrapFailure("revoke_repository_token", revokeErr))
+		}
+	}()
 	if err = b.writeTemplate(ctx, credential.Token, name, product, fingerprint); err != nil {
-		return result, err
+		return result, bootstrapFailure("write_template", err)
 	}
 	if err = b.protect(ctx, credential.Token, name); err != nil {
-		return result, err
+		return result, bootstrapFailure("protect_branch", err)
 	}
 	if err = b.verify(ctx, credential.Token, name, visibility, product, fingerprint, &result); err != nil {
-		return result, err
+		return result, bootstrapFailure("verify_repository", err)
 	}
 	result.State = "created"
 	return result, nil

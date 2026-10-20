@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -143,7 +144,7 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 
 	remote, err = h.ProjectBootstrap.Bootstrap(r.Context(), installation.InstallationID, name, req.Visibility, req.Product)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeBootstrapFailure(w, err)
 		return
 	}
 	if remote.State != "created" {
@@ -174,6 +175,29 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, projectBootstrapResponse{BootstrapResult: remote, Project: projectToResponse(project)})
+}
+
+func writeBootstrapFailure(w http.ResponseWriter, err error) {
+	failure, ok := githubapp.DiagnoseBootstrapFailure(err)
+	if !ok {
+		failure = &githubapp.BootstrapFailure{Code: "github_bootstrap_failed", Category: "github_api", Stage: "unknown", Err: err}
+	}
+	slog.Error("project bootstrap failed",
+		"code", failure.Code,
+		"category", failure.Category,
+		"stage", failure.Stage,
+		"github_status", failure.GitHubStatus,
+	)
+	body := map[string]any{
+		"error":    err.Error(),
+		"code":     failure.Code,
+		"category": failure.Category,
+		"stage":    failure.Stage,
+	}
+	if failure.GitHubStatus != 0 {
+		body["github_status"] = failure.GitHubStatus
+	}
+	writeJSON(w, http.StatusBadGateway, body)
 }
 
 func bootstrapInstallation(installations []db.GithubInstallation) (db.GithubInstallation, error) {

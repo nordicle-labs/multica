@@ -397,6 +397,22 @@ func TestBootstrapReportsIncompleteRemoteRollback(t *testing.T) {
 	}
 }
 
+func TestBootstrapFailureDiagnosesStageAndGitHubStatusWithoutResponseBody(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}, failCreate: true}
+	bootstrapper := testBootstrapper(t, state)
+	_, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget")
+	failure, ok := DiagnoseBootstrapFailure(err)
+	if !ok {
+		t.Fatalf("failure is not diagnosable: %v", err)
+	}
+	if failure.Code != "github_bootstrap_create_repository_failed" || failure.Category != "github_api" || failure.Stage != "create_repository" || failure.GitHubStatus != http.StatusInternalServerError {
+		t.Fatalf("failure = %+v", failure)
+	}
+	if strings.Contains(err.Error(), "injected") {
+		t.Fatalf("GitHub response body leaked: %v", err)
+	}
+}
+
 func TestDeleteRefusesRepositoryIdentityMismatch(t *testing.T) {
 	state := &bootstrapGitHub{repository: true, visibility: "private", files: map[string]string{}}
 	bootstrapper := testBootstrapper(t, state)

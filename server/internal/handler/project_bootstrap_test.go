@@ -108,6 +108,23 @@ func TestBootstrapProjectRejectsCloudPATActor(t *testing.T) {
 	}
 }
 
+func TestWriteBootstrapFailureReturnsSafeStructuredDiagnostic(t *testing.T) {
+	response := httptest.NewRecorder()
+	writeBootstrapFailure(response, &githubapp.BootstrapFailure{
+		Code: "github_bootstrap_write_template_failed", Category: "github_api", Stage: "write_template", GitHubStatus: http.StatusForbidden, Err: errors.New("write template file .github/workflows/ci.yml: github status 403"),
+	})
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d", response.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["code"] != "github_bootstrap_write_template_failed" || body["category"] != "github_api" || body["stage"] != "write_template" || body["github_status"] != float64(http.StatusForbidden) {
+		t.Fatalf("body = %#v", body)
+	}
+}
+
 func TestBootstrapLockKeysSerializeProductAndRepositoryCollisions(t *testing.T) {
 	first := bootstrapLockKeys("workspace", "Product", "repo-one")
 	second := bootstrapLockKeys("workspace", "Product", "repo-two")
