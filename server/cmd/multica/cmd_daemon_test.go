@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"text/template"
 	"time"
@@ -20,6 +21,37 @@ import (
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon"
 )
+
+const (
+	startingDaemonChildProfileEnv  = "MULTICA_TEST_STARTING_DAEMON_PROFILE"
+	startingDaemonDescendantPIDEnv = "MULTICA_TEST_STARTING_DAEMON_DESCENDANT_PID"
+)
+
+func TestStartingDaemonChildProcess(t *testing.T) {
+	profile := os.Getenv(startingDaemonChildProfileEnv)
+	if profile == "" {
+		return
+	}
+	if pidPath := os.Getenv(startingDaemonDescendantPIDEnv); pidPath != "" {
+		descendant := exec.Command("sleep", "60")
+		if err := descendant.Start(); err != nil {
+			t.Fatalf("start descendant: %v", err)
+		}
+		if err := os.WriteFile(pidPath, []byte(strconv.Itoa(descendant.Process.Pid)), 0o644); err != nil {
+			t.Fatalf("write descendant pid: %v", err)
+		}
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"status":"starting","pid":%d}`, os.Getpid())
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	time.Sleep(60 * time.Second)
+}
 
 // TestDaemonAlive locks in the liveness predicate the lifecycle commands rely
 // on: both a ready ("running") and a still-booting ("starting") daemon count as
@@ -450,6 +482,69 @@ func TestDaemonStartBackgroundReportsEarlyChildExit(t *testing.T) {
 	}
 	if elapsed > 15*time.Second {
 		t.Fatalf("runDaemonStart took %s, want early-exit detection well before the 45s readiness window", elapsed)
+	}
+}
+
+func TestDaemonStartBackgroundStopsChildThatNeverBecomesReady(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	const profile = "startup-timeout-test"
+	if err := cli.SaveCLIConfigForProfile(cli.CLIConfig{Token: "mul_fake"}, profile); err != nil {
+		t.Fatalf("SaveCLIConfigForProfile: %v", err)
+	}
+	t.Setenv(startingDaemonChildProfileEnv, profile)
+	descendantPIDPath := filepath.Join(t.TempDir(), "descendant.pid")
+	t.Setenv(startingDaemonDescendantPIDEnv, descendantPIDPath)
+
+	script := filepath.Join(t.TempDir(), "starting-daemon")
+	contents := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=^TestStartingDaemonChildProcess$\n", os.Args[0])
+	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
+		t.Fatalf("write child wrapper: %v", err)
+	}
+	origExecutable := daemonExecutable
+	daemonExecutable = func() (string, error) { return script, nil }
+	t.Cleanup(func() { daemonExecutable = origExecutable })
+
+	cmd := &cobra.Command{Use: "start"}
+	cmd.Flags().Bool("foreground", false, "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("server-url", "", "")
+	if err := cmd.Flags().Set("profile", profile); err != nil {
+		t.Fatalf("set profile flag: %v", err)
+	}
+
+	err := runDaemonBackgroundWithTimeout(cmd, 900*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), `did not become ready after 900ms (last status "starting")`) {
+		t.Fatalf("runDaemonStart() = %v, want readiness timeout error", err)
+	}
+
+	descendantPIDBytes, err := os.ReadFile(descendantPIDPath)
+	if err != nil {
+		t.Fatalf("read descendant pid: %v", err)
+	}
+	descendantPID, err := strconv.Atoi(string(descendantPIDBytes))
+	if err != nil {
+		t.Fatalf("parse descendant pid: %v", err)
+	}
+	descendant, err := os.FindProcess(descendantPID)
+	if err != nil {
+		t.Fatalf("find descendant: %v", err)
+	}
+	t.Cleanup(func() { _ = descendant.Kill() })
+	if err := descendant.Signal(syscall.Signal(0)); err == nil {
+		t.Fatalf("timed-out startup left descendant pid %d alive", descendantPID)
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
+	if err != nil {
+		t.Fatalf("timed-out child still owns health port: %v", err)
+	}
+	_ = ln.Close()
+	if _, err := os.Stat(daemonPIDPathForProfile(profile)); !os.IsNotExist(err) {
+		t.Fatalf("timed-out startup left PID file: %v", err)
 	}
 }
 

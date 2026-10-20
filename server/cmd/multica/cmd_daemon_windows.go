@@ -58,6 +58,10 @@ func daemonSysProcAttr(withBreakaway bool) *syscall.SysProcAttr {
 	}
 }
 
+func killDaemonProcess(process *os.Process) error {
+	return process.Kill()
+}
+
 // isAccessDeniedSpawnErr reports whether the error returned from
 // (*exec.Cmd).Start() is the Windows ERROR_ACCESS_DENIED, which is what
 // CreateProcess returns when CREATE_BREAKAWAY_FROM_JOB is requested but
