@@ -141,6 +141,41 @@ func TestWriteBootstrapFailureReturnsSafeStructuredDiagnostic(t *testing.T) {
 	}
 }
 
+func TestBootstrapProjectCheckFailureReturnsSafeStructuredDiagnostic(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	const secret = "synthetic-check-secret-marker"
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	seedBootstrapInstallation(t)
+	remote := &bootstrapTestRemote{checkErr: errors.New("provider error containing " + secret)}
+	h := *testHandler
+	h.ProjectBootstrap = remote
+	response := callBootstrap(t, &h, testUserID, "check-failure", "Bootstrap Check Failure")
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 4 || body["error"] != "GitHub repository bootstrap failed" || body["code"] != "github_bootstrap_failed" || body["category"] != "github_api" || body["stage"] != "unknown" {
+		t.Fatalf("body = %#v", body)
+	}
+	if strings.Contains(response.Body.String(), secret) || strings.Contains(logs.String(), secret) {
+		t.Fatalf("secret leaked: response=%q logs=%q", response.Body.String(), logs.String())
+	}
+	for _, field := range []string{"code=github_bootstrap_failed", "category=github_api", "stage=unknown", "github_status=0"} {
+		if !strings.Contains(logs.String(), field) {
+			t.Fatalf("safe field %q missing from logs: %q", field, logs.String())
+		}
+	}
+}
+
 func TestBootstrapLockKeysSerializeProductAndRepositoryCollisions(t *testing.T) {
 	first := bootstrapLockKeys("workspace", "Product", "repo-one")
 	second := bootstrapLockKeys("workspace", "Product", "repo-two")

@@ -126,7 +126,7 @@ func (h *Handler) BootstrapProject(w http.ResponseWriter, r *http.Request) {
 
 	remoteExists, remote, err := h.ProjectBootstrap.Check(r.Context(), installation.InstallationID, name, req.Visibility, req.Product)
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		writeBootstrapFailure(w, err)
 		return
 	}
 	if localState == "exact" {
