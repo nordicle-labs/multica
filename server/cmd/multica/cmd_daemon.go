@@ -553,6 +553,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 }
 
 func runDaemonBackground(cmd *cobra.Command) error {
+	return runDaemonBackgroundWithTimeout(cmd, 45*time.Second)
+}
+
+func runDaemonBackgroundWithTimeout(cmd *cobra.Command, startupTimeout time.Duration) error {
 	profile := resolveProfile(cmd)
 	healthPort := healthPortForProfile(profile)
 
@@ -672,7 +676,6 @@ func runDaemonBackground(cmd *cobra.Command) error {
 	// sync, which exec's every configured agent for version detection and can
 	// take ~20s on a cold cache). Wait long enough to cover that so a healthy
 	// cold start is not misreported as a failure.
-	const startupTimeout = 45 * time.Second
 	deadline := time.Now().Add(startupTimeout)
 	started := false
 	lastStatus := ""
@@ -697,12 +700,20 @@ func runDaemonBackground(cmd *cobra.Command) error {
 		}
 	}
 	if !started {
-		if lastStatus == "starting" {
-			fmt.Fprintf(os.Stderr, "Daemon is still starting after %s (agent detection / workspace sync is taking longer than expected). Check logs:\n  %s\n", startupTimeout, logPath)
-		} else {
-			fmt.Fprintf(os.Stderr, "Daemon may not have started successfully. Check logs:\n  %s\n  %s (crash output)\n", logPath, errLogPath)
+		killErr := child.Process.Kill()
+		select {
+		case <-waitCh:
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("daemon did not become ready after %s (last status %q) and did not exit after being killed; check logs: %s", startupTimeout, lastStatus, logPath)
 		}
-		return nil
+		_ = os.Remove(pidPath)
+		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			return fmt.Errorf("daemon did not become ready after %s (last status %q) and could not be stopped: %w; check logs: %s", startupTimeout, lastStatus, killErr, logPath)
+		}
+		if lastStatus == "starting" {
+			return fmt.Errorf("daemon did not become ready after %s (last status %q); stopped the startup process so it cannot retain the health port; check logs: %s", startupTimeout, lastStatus, logPath)
+		}
+		return fmt.Errorf("daemon did not become ready after %s (last status %q); stopped the startup process; check logs: %s and %s (crash output)", startupTimeout, lastStatus, logPath, errLogPath)
 	}
 
 	if profile != "" {

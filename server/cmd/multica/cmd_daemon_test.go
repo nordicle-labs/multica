@@ -21,6 +21,25 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon"
 )
 
+const startingDaemonChildProfileEnv = "MULTICA_TEST_STARTING_DAEMON_PROFILE"
+
+func TestStartingDaemonChildProcess(t *testing.T) {
+	profile := os.Getenv(startingDaemonChildProfileEnv)
+	if profile == "" {
+		return
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"status":"starting","pid":%d}`, os.Getpid())
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	time.Sleep(60 * time.Second)
+}
+
 // TestDaemonAlive locks in the liveness predicate the lifecycle commands rely
 // on: both a ready ("running") and a still-booting ("starting") daemon count as
 // alive, so `daemon start` won't double-spawn over a starting daemon and
@@ -451,6 +470,47 @@ func TestDaemonStartBackgroundReportsEarlyChildExit(t *testing.T) {
 	if elapsed > 15*time.Second {
 		t.Fatalf("runDaemonStart took %s, want early-exit detection well before the 45s readiness window", elapsed)
 	}
+}
+
+func TestDaemonStartBackgroundStopsChildThatNeverBecomesReady(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	const profile = "startup-timeout-test"
+	if err := cli.SaveCLIConfigForProfile(cli.CLIConfig{Token: "mul_fake"}, profile); err != nil {
+		t.Fatalf("SaveCLIConfigForProfile: %v", err)
+	}
+	t.Setenv(startingDaemonChildProfileEnv, profile)
+
+	script := filepath.Join(t.TempDir(), "starting-daemon")
+	contents := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=^TestStartingDaemonChildProcess$\n", os.Args[0])
+	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
+		t.Fatalf("write child wrapper: %v", err)
+	}
+	origExecutable := daemonExecutable
+	daemonExecutable = func() (string, error) { return script, nil }
+	t.Cleanup(func() { daemonExecutable = origExecutable })
+
+	cmd := &cobra.Command{Use: "start"}
+	cmd.Flags().Bool("foreground", false, "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("server-url", "", "")
+	if err := cmd.Flags().Set("profile", profile); err != nil {
+		t.Fatalf("set profile flag: %v", err)
+	}
+
+	err := runDaemonBackgroundWithTimeout(cmd, 900*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), `did not become ready after 900ms (last status "starting")`) {
+		t.Fatalf("runDaemonStart() = %v, want readiness timeout error", err)
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
+	if err != nil {
+		t.Fatalf("timed-out child still owns health port: %v", err)
+	}
+	_ = ln.Close()
 }
 
 // TestDaemonRestartUnauthenticatedFailsBeforeStopping pins the ordering that
