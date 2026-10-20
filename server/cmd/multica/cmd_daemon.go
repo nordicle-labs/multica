@@ -522,7 +522,7 @@ var daemonExecutable = selfexec.Resolve
 // requireDaemonAuth fails fast when the user never ran `multica login`. The
 // daemon child performs the same check (resolveAuth) and dies immediately,
 // but the background parent can't see that exit — it would poll the health
-// port for the full 45s readiness window and then print a vague "check logs"
+// port for the full readiness window and then print a vague "check logs"
 // warning. Checking before spawning turns that silent stall into an
 // immediate, actionable error. Mirrors daemon.resolveAuth: the daemon only
 // authenticates via the stored config token, never MULTICA_TOKEN.
@@ -553,8 +553,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 }
 
 func runDaemonBackground(cmd *cobra.Command) error {
-	return runDaemonBackgroundWithTimeout(cmd, 45*time.Second)
+	return runDaemonBackgroundWithTimeout(cmd, daemonStartupTimeout)
 }
+
+// daemonStartupTimeout covers the bounded work before the child reports
+// "running": a 15s token-renewal request, one 10s built-in version-probe wave,
+// and five 10s waves for the 37 canonical custom profiles at concurrency 8.
+// The remaining 15s covers the workspace/profile/register round trips. It stays
+// finite so a genuinely blocked preflight still fails closed and is killed.
+// A var lets lifecycle tests scale the same contract down to milliseconds.
+var daemonStartupTimeout = 90 * time.Second
 
 func runDaemonBackgroundWithTimeout(cmd *cobra.Command, startupTimeout time.Duration) error {
 	profile := resolveProfile(cmd)
@@ -673,9 +681,9 @@ func runDaemonBackgroundWithTimeout(cmd *cobra.Command, startupTimeout time.Dura
 	// Poll the health endpoint until the daemon reports ready ("running") or we
 	// time out. The daemon binds the health port almost immediately but reports
 	// status:"starting" until preflight finishes (PAT renew + initial workspace
-	// sync, which exec's every configured agent for version detection and can
-	// take ~20s on a cold cache). Wait long enough to cover that so a healthy
-	// cold start is not misreported as a failure.
+	// sync, which exec's every configured agent and custom profile for bounded
+	// version detection). Wait long enough to cover that so a healthy cold start
+	// is not misreported as a failure.
 	deadline := time.Now().Add(startupTimeout)
 	started := false
 	lastStatus := ""
