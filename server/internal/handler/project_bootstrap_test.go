@@ -32,6 +32,25 @@ type bootstrapTestRemote struct {
 	bootstrapState string
 }
 
+func TestNewProjectBootstrapperBranchProtectionConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  githubapp.BranchProtectionMode
+	}{
+		{want: githubapp.BranchProtectionRequired},
+		{value: "disabled", want: githubapp.BranchProtectionDisabled},
+		{value: "invalid", want: githubapp.BranchProtectionRequired},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("GITHUB_BOOTSTRAP_BRANCH_PROTECTION_MODE", tc.value)
+			got := NewProjectBootstrapper().(githubapp.Bootstrapper)
+			if got.BranchProtectionMode != tc.want {
+				t.Fatalf("mode = %q, want %q", got.BranchProtectionMode, tc.want)
+			}
+		})
+	}
+}
+
 func (r *bootstrapTestRemote) Check(_ context.Context, _ int64, name, _, _ string) (bool, githubapp.BootstrapResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

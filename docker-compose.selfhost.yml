@@ -127,6 +127,7 @@ services:
       # its newlines survive into the container.
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_BOOTSTRAP_BRANCH_PROTECTION_MODE: ${GITHUB_BOOTSTRAP_BRANCH_PROTECTION_MODE:-required}
       # Public URL the API is reachable at from the open internet, no
       # trailing slash. Used to mint absolute webhook URLs for autopilot
       # webhook triggers. Leave unset behind a same-origin reverse proxy

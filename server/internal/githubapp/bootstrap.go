@@ -26,6 +26,9 @@ const (
 	TemplateVersion  = "v1"
 	DefaultBranch    = "main"
 	maxResponseBytes = 1 << 20
+
+	BranchProtectionRequired BranchProtectionMode = "required"
+	BranchProtectionDisabled BranchProtectionMode = "disabled"
 )
 
 var (
@@ -41,6 +44,7 @@ type BootstrapResult struct {
 	State               string `json:"state"`
 	RepositoryURL       string `json:"repository_url"`
 	Branch              string `json:"branch"`
+	BranchProtected     bool   `json:"branch_protected"`
 	HeadSHA             string `json:"head_sha"`
 	TreeSHA             string `json:"tree_sha"`
 	TemplateVersion     string `json:"template_version"`
@@ -48,7 +52,27 @@ type BootstrapResult struct {
 	RepositoryID        int64  `json:"-"`
 }
 
-type Bootstrapper struct{ Broker Broker }
+type BranchProtectionMode string
+
+func ParseBranchProtectionMode(raw string) (BranchProtectionMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", string(BranchProtectionRequired):
+		return BranchProtectionRequired, nil
+	case string(BranchProtectionDisabled):
+		return BranchProtectionDisabled, nil
+	default:
+		return BranchProtectionRequired, errors.New("branch protection mode must be required or disabled")
+	}
+}
+
+type Bootstrapper struct {
+	Broker               Broker
+	BranchProtectionMode BranchProtectionMode
+}
+
+func (b Bootstrapper) branchProtectionRequired() bool {
+	return b.BranchProtectionMode != BranchProtectionDisabled
+}
 
 type BootstrapFailure struct {
 	Code         string
@@ -81,7 +105,7 @@ func bootstrapFailure(stage string, err error) error {
 }
 
 // Check performs the complete remote preflight without mutation. A present
-// repository is returned only after template and protection readback succeeds.
+// repository is returned only after template and configured protection readback succeeds.
 func (b Bootstrapper) Check(ctx context.Context, installationID int64, name, visibility, product string) (exists bool, result BootstrapResult, err error) {
 	name, err = NormalizeRepositoryName(name)
 	if err != nil {
@@ -114,7 +138,7 @@ func (b Bootstrapper) Check(ctx context.Context, installationID int64, name, vis
 		return true, result, err
 	}
 	defer func() { err = errors.Join(err, b.revokeToken(&credential.Token, result.RepositoryURL)) }()
-	if err := b.verify(ctx, credential.Token, name, visibility, product, fingerprint, &result); err != nil {
+	if err := b.verify(ctx, credential.Token, name, visibility, product, fingerprint, b.branchProtectionRequired(), &result); err != nil {
 		return true, result, fmt.Errorf("existing repository is divergent: %w", err)
 	}
 	return true, result, nil
@@ -229,7 +253,7 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 				err = errors.Join(err, bootstrapFailure("revoke_repository_token", revokeErr))
 			}
 		}()
-		if err := b.verify(ctx, credential.Token, name, visibility, product, fingerprint, &result); err != nil {
+		if err := b.verify(ctx, credential.Token, name, visibility, product, fingerprint, b.branchProtectionRequired(), &result); err != nil {
 			return result, bootstrapFailure("verify_repository", fmt.Errorf("existing repository is divergent: %w", err))
 		}
 		result.State = "unchanged"
@@ -276,10 +300,12 @@ func (b Bootstrapper) Bootstrap(ctx context.Context, installationID int64, name,
 	if err = b.writeTemplate(ctx, credential.Token, name, product, fingerprint); err != nil {
 		return result, bootstrapFailure("write_template", err)
 	}
-	if err = b.protect(ctx, credential.Token, name); err != nil {
-		return result, bootstrapFailure("protect_branch", err)
+	if b.branchProtectionRequired() {
+		if err = b.protect(ctx, credential.Token, name); err != nil {
+			return result, bootstrapFailure("protect_branch", err)
+		}
 	}
-	if err = b.verify(ctx, credential.Token, name, visibility, product, fingerprint, &result); err != nil {
+	if err = b.verify(ctx, credential.Token, name, visibility, product, fingerprint, b.branchProtectionRequired(), &result); err != nil {
 		return result, bootstrapFailure("verify_repository", err)
 	}
 	result.State = "created"
@@ -410,7 +436,7 @@ func (b Bootstrapper) protect(ctx context.Context, token, name string) error {
 	return nil
 }
 
-func (b Bootstrapper) verify(ctx context.Context, token, name, visibility, product, fingerprint string, result *BootstrapResult) error {
+func (b Bootstrapper) verify(ctx context.Context, token, name, visibility, product, fingerprint string, requireProtection bool, result *BootstrapResult) error {
 	status, raw, err := b.request(ctx, token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name, nil)
 	if err != nil || status != http.StatusOK {
 		return fmt.Errorf("repository readback failed")
@@ -445,38 +471,41 @@ func (b Bootstrapper) verify(ctx context.Context, token, name, visibility, produ
 			return fmt.Errorf("template file %s mismatch", path)
 		}
 	}
-	status, raw, err = b.request(ctx, token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name+"/branches/"+DefaultBranch+"/protection", nil)
-	if err != nil || status != http.StatusOK {
-		return errors.New("branch protection readback failed")
-	}
-	var protection struct {
-		RequiredStatusChecks *struct {
-			Contexts []string `json:"contexts"`
-			Strict   *bool    `json:"strict"`
-		} `json:"required_status_checks"`
-		EnforceAdmins *struct {
-			Enabled *bool `json:"enabled"`
-		} `json:"enforce_admins"`
-		RequiredPullRequestReviews *struct {
-			RequiredApprovingReviewCount *int `json:"required_approving_review_count"`
-		} `json:"required_pull_request_reviews"`
-		Restrictions     json.RawMessage `json:"restrictions"`
-		AllowForcePushes *struct {
-			Enabled *bool `json:"enabled"`
-		} `json:"allow_force_pushes"`
-		AllowDeletions *struct {
-			Enabled *bool `json:"enabled"`
-		} `json:"allow_deletions"`
-	}
-	if json.Unmarshal(raw, &protection) != nil ||
-		protection.RequiredStatusChecks == nil || protection.RequiredStatusChecks.Strict == nil || !*protection.RequiredStatusChecks.Strict ||
-		strings.Join(protection.RequiredStatusChecks.Contexts, ",") != strings.Join(RequiredChecks, ",") ||
-		protection.EnforceAdmins == nil || protection.EnforceAdmins.Enabled == nil || !*protection.EnforceAdmins.Enabled ||
-		protection.RequiredPullRequestReviews == nil || protection.RequiredPullRequestReviews.RequiredApprovingReviewCount == nil || *protection.RequiredPullRequestReviews.RequiredApprovingReviewCount != 1 ||
-		string(protection.Restrictions) != "null" ||
-		protection.AllowForcePushes == nil || protection.AllowForcePushes.Enabled == nil || *protection.AllowForcePushes.Enabled ||
-		protection.AllowDeletions == nil || protection.AllowDeletions.Enabled == nil || *protection.AllowDeletions.Enabled {
-		return errors.New("branch protection mismatch")
+	if requireProtection {
+		status, raw, err = b.request(ctx, token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name+"/branches/"+DefaultBranch+"/protection", nil)
+		if err != nil || status != http.StatusOK {
+			return errors.New("branch protection readback failed")
+		}
+		var protection struct {
+			RequiredStatusChecks *struct {
+				Contexts []string `json:"contexts"`
+				Strict   *bool    `json:"strict"`
+			} `json:"required_status_checks"`
+			EnforceAdmins *struct {
+				Enabled *bool `json:"enabled"`
+			} `json:"enforce_admins"`
+			RequiredPullRequestReviews *struct {
+				RequiredApprovingReviewCount *int `json:"required_approving_review_count"`
+			} `json:"required_pull_request_reviews"`
+			Restrictions     json.RawMessage `json:"restrictions"`
+			AllowForcePushes *struct {
+				Enabled *bool `json:"enabled"`
+			} `json:"allow_force_pushes"`
+			AllowDeletions *struct {
+				Enabled *bool `json:"enabled"`
+			} `json:"allow_deletions"`
+		}
+		if json.Unmarshal(raw, &protection) != nil ||
+			protection.RequiredStatusChecks == nil || protection.RequiredStatusChecks.Strict == nil || !*protection.RequiredStatusChecks.Strict ||
+			strings.Join(protection.RequiredStatusChecks.Contexts, ",") != strings.Join(RequiredChecks, ",") ||
+			protection.EnforceAdmins == nil || protection.EnforceAdmins.Enabled == nil || !*protection.EnforceAdmins.Enabled ||
+			protection.RequiredPullRequestReviews == nil || protection.RequiredPullRequestReviews.RequiredApprovingReviewCount == nil || *protection.RequiredPullRequestReviews.RequiredApprovingReviewCount != 1 ||
+			string(protection.Restrictions) != "null" ||
+			protection.AllowForcePushes == nil || protection.AllowForcePushes.Enabled == nil || *protection.AllowForcePushes.Enabled ||
+			protection.AllowDeletions == nil || protection.AllowDeletions.Enabled == nil || *protection.AllowDeletions.Enabled {
+			return errors.New("branch protection mismatch")
+		}
+		result.BranchProtected = true
 	}
 	status, raw, err = b.request(ctx, token, http.MethodGet, "/repos/"+BootstrapOwner+"/"+name+"/git/ref/heads/"+DefaultBranch, nil)
 	if err != nil || status != http.StatusOK {

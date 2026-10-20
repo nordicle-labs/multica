@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,14 @@ type ProjectBootstrapper interface {
 }
 
 func NewProjectBootstrapper() ProjectBootstrapper {
-	return githubapp.Bootstrapper{Broker: githubAppBroker()}
+	const envName = "GITHUB_BOOTSTRAP_BRANCH_PROTECTION_MODE"
+	mode, err := githubapp.ParseBranchProtectionMode(os.Getenv(envName))
+	if err != nil {
+		slog.Error("invalid GitHub bootstrap branch protection mode; requiring protection", "name", envName, "mode", mode)
+	} else {
+		slog.Info("GitHub bootstrap branch protection mode configured", "mode", mode)
+	}
+	return githubapp.Bootstrapper{Broker: githubAppBroker(), BranchProtectionMode: mode}
 }
 
 type projectBootstrapRequest struct {

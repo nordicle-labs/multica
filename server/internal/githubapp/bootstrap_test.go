@@ -28,6 +28,7 @@ type bootstrapGitHub struct {
 	visibility          string
 	files               map[string]string
 	protected           bool
+	protectionCalls     int
 	createCount         int
 	deleteCount         int
 	failCreate          bool
@@ -177,6 +178,7 @@ func (g *bootstrapGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasSuffix(path, "/branches/main/protection") {
+		g.protectionCalls++
 		if r.Method == http.MethodPut {
 			if g.failProtection {
 				http.Error(w, "injected", http.StatusInternalServerError)
@@ -238,7 +240,7 @@ func TestBootstrapCreatesCanonicalRepositoryAndSecondPassIsUnchanged(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.State != "created" || first.HeadSHA != "head-sha" || first.TreeSHA != "tree-sha" {
+	if first.State != "created" || !first.BranchProtected || first.HeadSHA != "head-sha" || first.TreeSHA != "tree-sha" {
 		t.Fatalf("first = %+v", first)
 	}
 	second, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
@@ -265,6 +267,39 @@ func TestBootstrapCreatesCanonicalRepositoryAndSecondPassIsUnchanged(t *testing.
 	manifest, _ := base64.StdEncoding.DecodeString(state.files[".multica-template.json"])
 	if !strings.Contains(string(manifest), first.TemplateFingerprint) {
 		t.Fatal("manifest does not carry template fingerprint")
+	}
+}
+
+func TestBootstrapWithoutBranchProtectionIsExplicitAndIdempotent(t *testing.T) {
+	state := &bootstrapGitHub{files: map[string]string{}}
+	bootstrapper := testBootstrapper(t, state)
+	bootstrapper.BranchProtectionMode = BranchProtectionDisabled
+
+	first, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := bootstrapper.Bootstrap(context.Background(), 42, "widget", "private", "Widget Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State != "created" || first.BranchProtected || second.State != "unchanged" || second.BranchProtected {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+	if state.createCount != 1 || state.protectionCalls != 0 {
+		t.Fatalf("creates=%d protection calls=%d", state.createCount, state.protectionCalls)
+	}
+}
+
+func TestBranchProtectionModeDefaultsAndInvalidValuesFailClosed(t *testing.T) {
+	for _, raw := range []string{"", "required", "typo"} {
+		mode, _ := ParseBranchProtectionMode(raw)
+		if mode != BranchProtectionRequired {
+			t.Errorf("ParseBranchProtectionMode(%q) = %q", raw, mode)
+		}
+	}
+	if _, err := ParseBranchProtectionMode("typo"); err == nil {
+		t.Fatal("invalid mode was accepted")
 	}
 }
 
