@@ -551,6 +551,44 @@ func TestSyncWorkspaces_CustomProfilesDoNotLeakAcrossWorkspaces(t *testing.T) {
 	}
 }
 
+func TestSyncWorkspaces_ProbesCustomProfilesConcurrently(t *testing.T) {
+	fx := newBatchFixture(t)
+	stubLookPath(t, map[string]string{
+		"profile-one": "/opt/bin/profile-one",
+		"profile-two": "/opt/bin/profile-two",
+	})
+	d := fx.daemon
+	d.cfg.Agents = map[string]AgentEntry{}
+	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
+	fx.profiles["ws-1"] = []RuntimeProfile{
+		{ID: "prof-1", WorkspaceID: "ws-1", DisplayName: "One", ProtocolFamily: "hermes", CommandName: "profile-one", Enabled: true},
+		{ID: "prof-2", WorkspaceID: "ws-1", DisplayName: "Two", ProtocolFamily: "hermes", CommandName: "profile-two", Enabled: true},
+	}
+
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	detectAgentVersion = func(_ context.Context, runtimeCmd agent.Command) (string, error) {
+		started <- runtimeCmd.Path
+		<-release
+		return "9.9.9", nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.syncWorkspacesFromAPI(context.Background(), false) }()
+
+	<-started
+	select {
+	case <-started:
+		close(release)
+	case <-time.After(time.Second):
+		close(release)
+		<-done
+		t.Fatal("second custom profile version probe did not start while the first was blocked")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("syncWorkspacesFromAPI: %v", err)
+	}
+}
+
 // TestSyncWorkspaces_ReprobesOnNextSync pins the refresh semantics the sharing
 // must not break: the payload is scoped to one sync, so a workspace that shows
 // up later re-detects versions and picks up an in-place CLI upgrade.

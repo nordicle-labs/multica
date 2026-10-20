@@ -3092,6 +3092,15 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		// later transition (zero → first profile added).
 		return profileSetSignature(nil)
 	}
+	type profileRuntime struct {
+		profile     RuntimeProfile
+		runtimeType string
+		path        string
+		command     agent.Command
+		version     string
+		versionErr  error
+	}
+	profiles := make([]profileRuntime, 0, len(resp.RuntimeProfiles))
 	for _, profile := range resp.RuntimeProfiles {
 		runtimeType := agent.ProfileRuntimeType(profile.RuntimeType, profile.ProtocolFamily)
 		if profile.CommandName == "" || profile.ProtocolFamily == "" {
@@ -3166,31 +3175,47 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 				resolved = r
 			}
 		}
-		// Best-effort version detection; an empty version is acceptable. The
-		// probe carries the profile's fixed_args so a wrapper reports the
-		// version of the CLI it execs rather than its own: `ccms start q36
-		// --version` is Claude Code's version, `ccms --version` is the
-		// wrapper's, and only the former means anything to the min-version
-		// gate (GH #7046).
-		version, verErr := detectAgentVersion(ctx, agent.NewCommand(resolved,
-			agent.FilterLaunchPrefix(runtimeType, profile.FixedArgs, d.logger)))
-		if verErr != nil {
+		profiles = append(profiles, profileRuntime{
+			profile:     profile,
+			runtimeType: runtimeType,
+			path:        resolved,
+			command: agent.NewCommand(resolved,
+				agent.FilterLaunchPrefix(runtimeType, profile.FixedArgs, d.logger)),
+		})
+	}
+
+	// Custom profiles are independent external processes, just like built-in
+	// version probes. Bound their fan-out with the same existing limit so many
+	// profiles do not turn startup latency into the sum of every wrapper's
+	// `--version` call.
+	var g errgroup.Group
+	g.SetLimit(runtimeVersionProbeConcurrency)
+	for i := range profiles {
+		g.Go(func() error {
+			profiles[i].version, profiles[i].versionErr = detectAgentVersion(ctx, profiles[i].command)
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	for _, candidate := range profiles {
+		profile := candidate.profile
+		if candidate.versionErr != nil {
 			d.logger.Debug("custom runtime profile: version probe failed (registering with empty version)",
-				"workspace_id", workspaceID, "profile_id", profile.ID, "path", resolved, "error", verErr)
-			version = ""
+				"workspace_id", workspaceID, "profile_id", profile.ID, "path", candidate.path, "error", candidate.versionErr)
 		}
 		displayName := profile.DisplayName
 		if d.cfg.DeviceName != "" {
 			displayName = fmt.Sprintf("%s (%s)", displayName, d.cfg.DeviceName)
 		}
-		d.recordProfileLaunch(profile.ID, resolved, version, profile.FixedArgs)
+		d.recordProfileLaunch(profile.ID, candidate.path, candidate.version, profile.FixedArgs)
 		d.logger.Info("registering custom runtime profile",
 			"workspace_id", workspaceID, "profile_id", profile.ID,
-			"protocol_family", profile.ProtocolFamily, "command_path", resolved)
+			"protocol_family", profile.ProtocolFamily, "command_path", candidate.path)
 		*runtimes = append(*runtimes, map[string]string{
 			"name":       displayName,
-			"type":       runtimeType,
-			"version":    version,
+			"type":       candidate.runtimeType,
+			"version":    candidate.version,
 			"status":     "online",
 			"profile_id": profile.ID,
 		})
