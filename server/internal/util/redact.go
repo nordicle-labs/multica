@@ -111,7 +111,7 @@ func sensitiveJSONKey(key string) bool {
 	case "accesskey", "accesstoken", "apikey", "apisecret", "auth",
 		"authorization", "authtoken", "clientsecret", "cookie", "credential",
 		"credentials", "customenv", "databaseurl", "dbpassword", "dburl", "env",
-		"environment", "headers", "mcpconfig", "password", "privatekey",
+		"environment", "headers", "mcpconfig", "password", "privatekey", "redisurl",
 		"refreshtoken", "secret", "secretkey", "token":
 		return true
 	default:

@@ -44,6 +44,7 @@ func TestRedactSensitiveJSONCommonSecretAliases(t *testing.T) {
 		"secret_key":   fakeSecret,
 		"database_url": fakeSecret,
 		"db_password":  fakeSecret,
+		"redis_url":    fakeSecret,
 	}
 
 	out, err := json.Marshal(RedactSensitiveJSON(input))
