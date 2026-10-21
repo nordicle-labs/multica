@@ -37,14 +37,23 @@ func TestRedactSensitiveJSONNestedAndCaseInsensitive(t *testing.T) {
 func TestRedactSensitiveJSONCommonSecretAliases(t *testing.T) {
 	const fakeSecret = "HERM1086_FAKE_ALIAS_SECRET"
 	input := map[string]any{
-		"safe":         "kept",
-		"auth":         fakeSecret,
-		"auth_token":   fakeSecret,
-		"api_secret":   fakeSecret,
-		"secret_key":   fakeSecret,
-		"database_url": fakeSecret,
-		"db_password":  fakeSecret,
-		"redis_url":    fakeSecret,
+		"safe":                  "kept",
+		"api_key":               fakeSecret,
+		"api_secret":            fakeSecret,
+		"secret_key":            fakeSecret,
+		"secret":                fakeSecret,
+		"access_token":          fakeSecret,
+		"auth_token":            fakeSecret,
+		"private_key":           fakeSecret,
+		"database_url":          fakeSecret,
+		"db_password":           fakeSecret,
+		"db_url":                fakeSecret,
+		"redis_url":             fakeSecret,
+		"password":              fakeSecret,
+		"token":                 fakeSecret,
+		"aws_secret_access_key": fakeSecret,
+		"secret_access_key":     fakeSecret,
+		"auth":                  fakeSecret,
 	}
 
 	out, err := json.Marshal(RedactSensitiveJSON(input))
