@@ -349,6 +349,9 @@ deleted_activity AS (
 deleted_inbox AS (
     DELETE FROM inbox_item WHERE workspace_id = $1
 ),
+deleted_decision_impact_candidates AS (
+    DELETE FROM decision_impact_candidate WHERE workspace_id = $1
+),
 deleted_issue_dependencies AS (
     DELETE FROM issue_dependency
     WHERE issue_id IN (SELECT id FROM ws_issues)

@@ -1,0 +1,34 @@
+{
+  "decision": {
+    "identifier": "HERM-931",
+    "project_id": "brain",
+    "actor_type": "member",
+    "actor_role": "owner",
+    "text": "DECISION CLEMENT: new methodology replaces HERM-885"
+  },
+  "issues": [
+    {"identifier": "HERM-888", "project_id": "brain", "status": "done"},
+    {"identifier": "HERM-885", "project_id": "brain", "status": "in_progress", "comments": ["HERM-927 injected by error after HERM-931"]},
+    {"identifier": "HERM-931", "project_id": "brain", "status": "done"},
+    {"identifier": "HERM-934", "project_id": "brain", "status": "in_progress", "text": "Implementation of HERM-931"}
+  ],
+  "runs": [
+    {
+      "id": "0199ee0c-7518-7000-8000-000000000927",
+      "issue_identifier": "HERM-885",
+      "status": "running",
+      "trigger_text": "HERM-927 injected by mistake",
+      "proof": {
+        "decision_identifier": "HERM-931",
+        "issue_identifier": "HERM-885",
+        "run_id": "0199ee0c-7518-7000-8000-000000000927",
+        "obsolete": true
+      }
+    },
+    {
+      "id": "0199ee0c-7518-7000-8000-000000000934",
+      "issue_identifier": "HERM-934",
+      "status": "running"
+    }
+  ]
+}
