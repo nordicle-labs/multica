@@ -1775,13 +1775,10 @@ func broadcastAgentResponse(resp AgentResponse) AgentResponse {
 	out := resp
 	redactMcpConfig(&out)
 	redactComposioToolkitAllowlist(&out)
-	// Belt-and-suspenders: agentToResponse already masks gateway.token on
-	// every read, so by the time a response reaches this broadcast helper
-	// the field is already "***". Re-mask anyway so a future refactor that
-	// bypasses agentToResponse (e.g. constructing AgentResponse from raw
-	// db.Agent in a new handler) cannot silently leak the token to every
-	// WebSocket subscriber on the workspace, agent processes included.
-	maskGatewayToken(out.RuntimeConfig)
+	// Belt-and-suspenders: agentToResponse already sanitizes runtime_config.
+	// Reapply the shared boundary so future direct AgentResponse construction
+	// cannot leak any secret-bearing container to workspace subscribers.
+	out.RuntimeConfig = util.RedactSensitiveJSON(out.RuntimeConfig)
 	return out
 }
 

@@ -45,3 +45,24 @@ func TestAgentResponseOmitsSecretBearingConfiguration(t *testing.T) {
 		t.Fatalf("custom env metadata = (%v, %d), want (true, 1)", resp.HasCustomEnv, resp.CustomEnvKeyCount)
 	}
 }
+
+func TestBroadcastAgentResponseRedactsSensitiveRuntimeConfig(t *testing.T) {
+	const fakeSecret = "HERM1086_FAKE_BROADCAST_SECRET"
+	resp := AgentResponse{
+		RuntimeConfig: map[string]any{
+			"safe":     "kept",
+			"embedded": `{"headers":{"Authorization":"` + fakeSecret + `"}}`,
+		},
+	}
+
+	out, err := json.Marshal(broadcastAgentResponse(resp))
+	if err != nil {
+		t.Fatalf("marshal broadcast response: %v", err)
+	}
+	if bytes.Contains(out, []byte(fakeSecret)) {
+		t.Fatalf("broadcast leaked synthetic secret: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`"safe":"kept"`)) {
+		t.Fatalf("broadcast removed safe runtime config: %s", out)
+	}
+}

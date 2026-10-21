@@ -164,12 +164,52 @@ describe("McpConfigTab", () => {
     mockRemoveServer.mockResolvedValue([]);
   });
 
-  it("renders redacted managed MCP without exposing add or edit controls", () => {
-    renderTab({ mcp_config: null, mcp_config_redacted: true });
+  it("renders redacted managed MCP without write controls for read-only viewers", () => {
+    render(
+      <TestShell>
+        <McpConfigTab
+          agent={{ ...baseAgent, mcp_config: null, mcp_config_redacted: true }}
+          runtime={null}
+          currentUserId="user-2"
+          canEdit={false}
+          onSave={vi.fn()}
+        />
+      </TestShell>,
+    );
 
     expect(screen.getByText(/hidden from your view/i)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /add mcp/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /replace configuration/i }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  it("replaces a redacted config without reading its saved contents", async () => {
+    const user = userEvent.setup();
+    const { onSave } = renderTab({ mcp_config: null, mcp_config_redacted: true });
+
+    await user.click(screen.getByRole("button", { name: /replace configuration/i }));
+    await user.type(screen.getByLabelText("Server name"), "replacement");
+    await user.type(screen.getByLabelText("Command"), "uvx");
+    await user.click(screen.getByRole("button", { name: "Replace configuration" }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      mcp_config: { mcpServers: { replacement: { command: "uvx" } } },
+    });
+    expect(document.body).not.toHaveTextContent("HERM1086_FAKE_HIDDEN_SECRET");
+  });
+
+  it("deletes a redacted config without reading its saved contents", async () => {
+    const user = userEvent.setup();
+    const { onSave } = renderTab({ mcp_config: null, mcp_config_redacted: true });
+
+    await user.click(screen.getByRole("button", { name: /delete server/i }));
+    await user.click(
+      screen.getAllByRole("button", { name: /delete server/i }).at(-1)!,
+    );
+
+    expect(onSave).toHaveBeenCalledWith({ mcp_config: null });
+    expect(document.body).not.toHaveTextContent("HERM1086_FAKE_HIDDEN_SECRET");
   });
 
   it("projects historical aggregate config into individually managed rows", () => {

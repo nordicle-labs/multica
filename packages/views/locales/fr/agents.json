@@ -620,7 +620,7 @@
       "invalid_json": "JSON invalide : {{error}}",
       "save_failed_toast": "Échec de l'enregistrement de la configuration MCP",
       "redacted_title": "Configuré — masqué pour vous",
-      "redacted_hint": "Seul le propriétaire de l'agent ou un administrateur de l'espace de travail peut lire cette configuration.",
+      "redacted_hint": "Les valeurs de configuration enregistrées ne sont jamais réaffichées.",
       "dialog_json_help": "Modifiez la configuration complète du serveur en JSON."
     },
     "composio_mcp": {
