@@ -251,7 +251,8 @@ export function McpServerDialog({
   const urlInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLTextAreaElement>(null);
   const formId = `${fieldId}-form`;
-  const nameHidden = replacementMode || (hideNameWhenEditing && server !== null);
+  const nameHidden =
+    (replacementMode && server !== null) || (hideNameWhenEditing && server !== null);
 
   useEffect(() => {
     if (!open) return;
@@ -377,10 +378,12 @@ export function McpServerDialog({
       <DialogContent className="flex max-h-[88vh] flex-col gap-0 overscroll-contain p-0 sm:max-w-2xl [&_[data-slot=dialog-close]]:top-5 [&_[data-slot=dialog-close]]:right-5">
             <DialogHeader className="shrink-0 border-b border-surface-border px-6 py-6 pr-14 sm:px-8 sm:pr-16">
               <DialogTitle>
-                {replacementMode
+                {replacementMode && server
                   ? t(($) => $.tab_body.mcp_config.dialog_replace_title, {
-                      name: server?.name ?? "",
+                      name: server.name,
                     })
+                  : replacementMode
+                    ? t(($) => $.tab_body.mcp_config.dialog_replace_action)
                   : server && hideNameWhenEditing
                     ? t(($) => $.tab_body.mcp_config.dialog_edit_title_named, {
                         name: server.name,

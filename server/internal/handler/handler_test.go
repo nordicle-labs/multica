@@ -1996,7 +1996,9 @@ func TestUpdateAgentMcpConfigAbsentPreservesValue(t *testing.T) {
 
 	var updated AgentResponse
 	w.JSON(&updated)
-	assertJSONEqual(t, updated.McpConfig, `{"preset":"keep"}`)
+	if updated.McpConfig != nil || !updated.McpConfigRedacted {
+		t.Fatalf("UpdateAgent: expected write-only configured response, got mcp_config=%s redacted=%v", updated.McpConfig, updated.McpConfigRedacted)
+	}
 	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), `{"preset":"keep"}`)
 }
 
@@ -2011,7 +2013,9 @@ func TestUpdateAgentMcpConfigNullClearsValue(t *testing.T) {
 
 	var updated AgentResponse
 	w.JSON(&updated)
-	assertJSONEqual(t, updated.McpConfig, `null`)
+	if updated.McpConfig != nil || updated.McpConfigRedacted {
+		t.Fatalf("UpdateAgent: expected write-only empty response, got mcp_config=%s redacted=%v", updated.McpConfig, updated.McpConfigRedacted)
+	}
 	if fetchAgentMcpConfig(t, agentID) != nil {
 		t.Fatalf("UpdateAgent: expected DB mcp_config to be SQL NULL")
 	}
@@ -2028,7 +2032,9 @@ func TestUpdateAgentMcpConfigObjectUpdatesValue(t *testing.T) {
 
 	var updated AgentResponse
 	w.JSON(&updated)
-	assertJSONEqual(t, updated.McpConfig, `{"preset":"new"}`)
+	if updated.McpConfig != nil || !updated.McpConfigRedacted {
+		t.Fatalf("UpdateAgent: expected write-only configured response, got mcp_config=%s redacted=%v", updated.McpConfig, updated.McpConfigRedacted)
+	}
 	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), `{"preset":"new"}`)
 }
 
@@ -2051,7 +2057,9 @@ func TestUpdateAgentMcpConfigPreservesBoundaryEmptyArguments(t *testing.T) {
 
 	var updated AgentResponse
 	w.JSON(&updated)
-	assertJSONEqual(t, updated.McpConfig, want)
+	if updated.McpConfig != nil || !updated.McpConfigRedacted {
+		t.Fatalf("UpdateAgent: expected write-only configured response, got mcp_config=%s redacted=%v", updated.McpConfig, updated.McpConfigRedacted)
+	}
 	assertJSONEqual(t, fetchAgentMcpConfig(t, agentID), want)
 }
 
@@ -2071,7 +2079,9 @@ func TestCreateAgentMcpConfigNullStoresSQLNull(t *testing.T) {
 		testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, created.ID)
 	})
 
-	assertJSONEqual(t, created.McpConfig, `null`)
+	if created.McpConfig != nil || created.McpConfigRedacted {
+		t.Fatalf("CreateAgent: expected write-only empty response, got mcp_config=%s redacted=%v", created.McpConfig, created.McpConfigRedacted)
+	}
 	if fetchAgentMcpConfig(t, created.ID) != nil {
 		t.Fatalf("CreateAgent: expected DB mcp_config to be SQL NULL")
 	}

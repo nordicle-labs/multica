@@ -620,7 +620,7 @@
       "invalid_json": "Invalid JSON: {{error}}",
       "save_failed_toast": "Failed to save MCP config",
       "redacted_title": "Configured — hidden from your view",
-      "redacted_hint": "Only the agent owner or a workspace admin can read this config.",
+      "redacted_hint": "Saved configuration values are never shown again.",
       "dialog_json_help": "Edit the full server configuration as JSON."
     },
     "composio_mcp": {

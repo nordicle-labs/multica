@@ -3,6 +3,8 @@ package handler
 import (
 	"encoding/json"
 	"testing"
+
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func TestMaskGatewayTokenReplacesNonEmpty(t *testing.T) {
@@ -126,5 +128,27 @@ func TestMaskGatewayTokenRoundTripsAsJSON(t *testing.T) {
 	}
 	if string(out) == string(raw) {
 		t.Errorf("mask should change the bytes, got %q", out)
+	}
+}
+
+func TestAgentToResponsePreservesGatewayMaskAfterGenericRedaction(t *testing.T) {
+	t.Parallel()
+
+	resp := (&Handler{}).agentToResponse(db.Agent{
+		RuntimeConfig: []byte(`{"mode":"gateway","gateway":{"token":"synthetic-secret","host":"gw.internal","port":18789}}`),
+	})
+	root, ok := resp.RuntimeConfig.(map[string]any)
+	if !ok {
+		t.Fatalf("runtime_config type = %T, want map[string]any", resp.RuntimeConfig)
+	}
+	gw, ok := root["gateway"].(map[string]any)
+	if !ok {
+		t.Fatalf("gateway type = %T, want map[string]any", root["gateway"])
+	}
+	if got := gw["token"]; got != runtimeConfigGatewayTokenMask {
+		t.Fatalf("gateway token = %#v, want mask sentinel", got)
+	}
+	if got := gw["host"]; got != "gw.internal" {
+		t.Fatalf("gateway host = %#v, want preserved host", got)
 	}
 }

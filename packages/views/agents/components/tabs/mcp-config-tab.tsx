@@ -143,6 +143,7 @@ export function McpConfigTab({
   const [renamePending, setRenamePending] = useState(false);
   const [deletingServer, setDeletingServer] =
     useState<ManagedMcpServer | null>(null);
+  const [deletingHiddenConfig, setDeletingHiddenConfig] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
   useEffect(() => onDirtyChange?.(false), [onDirtyChange]);
@@ -289,14 +290,17 @@ export function McpConfigTab({
     });
 
   const handleDelete = async () => {
-    if (!deletingServer) return;
+    if (!deletingServer && !deletingHiddenConfig) return;
     setDeleting(true);
     try {
       await onSave({
-        mcp_config: removeManagedMcpServer(agent.mcp_config, deletingServer),
+        mcp_config: deletingHiddenConfig
+          ? null
+          : removeManagedMcpServer(agent.mcp_config, deletingServer!),
       });
       toast.success(t(($) => $.tab_body.mcp_config.deleted_toast));
       setDeletingServer(null);
+      setDeletingHiddenConfig(false);
     } catch (error) {
       toast.error(
         error instanceof Error && error.message
@@ -318,7 +322,7 @@ export function McpConfigTab({
           <h3 className="text-body font-medium">
             {t(($) => $.tab_body.mcp_config.managed_title)}
           </h3>
-          {!redacted && canEdit && (
+          {canEdit && (
             <Button
               size="sm"
               variant="outline"
@@ -326,7 +330,9 @@ export function McpConfigTab({
               onClick={openAddDialog}
             >
               <Plus aria-hidden="true" />
-              {t(($) => $.tab_body.mcp_config.add_action)}
+              {redacted
+                ? t(($) => $.tab_body.mcp_config.dialog_replace_action)
+                : t(($) => $.tab_body.mcp_config.add_action)}
             </Button>
           )}
         </div>
@@ -344,6 +350,16 @@ export function McpConfigTab({
               <p className="mt-1 text-caption text-muted-foreground">
                 {t(($) => $.tab_body.mcp_config.redacted_hint)}
               </p>
+              {canEdit && (
+                <Button
+                  className="mt-3"
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => setDeletingHiddenConfig(true)}
+                >
+                  {t(($) => $.tab_body.mcp_config.delete_action)}
+                </Button>
+              )}
             </div>
           </div>
         ) : managedServers.length > 0 ? (
@@ -515,20 +531,24 @@ export function McpConfigTab({
         )}
       </section>
 
-      {!redacted && (
-        <McpServerDialog
-          open={editorOpen}
-          server={editingServer}
-          existingNames={managedNames}
-          hideNameWhenEditing
-          onOpenChange={setEditorOpen}
-          onSave={handleSaveServer}
-        />
-      )}
+      <McpServerDialog
+        open={editorOpen}
+        server={editingServer}
+        existingNames={managedNames}
+        replacementMode={redacted}
+        hideNameWhenEditing
+        onOpenChange={setEditorOpen}
+        onSave={handleSaveServer}
+      />
 
       <AlertDialog
-        open={deletingServer !== null}
-        onOpenChange={(open) => !open && !deleting && setDeletingServer(null)}
+        open={deletingServer !== null || deletingHiddenConfig}
+        onOpenChange={(open) => {
+          if (!open && !deleting) {
+            setDeletingServer(null);
+            setDeletingHiddenConfig(false);
+          }
+        }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -537,7 +557,9 @@ export function McpConfigTab({
             </AlertDialogTitle>
             <AlertDialogDescription>
               {t(($) => $.tab_body.mcp_config.delete_dialog_description, {
-                name: deletingServer?.name ?? "",
+                name:
+                  deletingServer?.name ??
+                  t(($) => $.tab_body.mcp_config.redacted_title),
               })}
             </AlertDialogDescription>
           </AlertDialogHeader>

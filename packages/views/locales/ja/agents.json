@@ -506,7 +506,7 @@
       "invalid_json": "無効な JSON: {{error}}",
       "save_failed_toast": "MCP config を保存できませんでした",
       "redacted_title": "設定済み — あなたには非表示",
-      "redacted_hint": "この config を読み取れるのは、エージェントのオーナーまたはワークスペースの admin のみです。",
+      "redacted_hint": "保存済みの設定値は再表示されません。",
       "dialog_json_help": "サーバー設定全体を JSON で編集します。"
     },
     "composio_mcp": {

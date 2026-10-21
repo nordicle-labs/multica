@@ -514,7 +514,7 @@
       "invalid_json": "잘못된 JSON: {{error}}",
       "save_failed_toast": "MCP config를 저장하지 못했습니다",
       "redacted_title": "설정됨 — 보기에서 숨김",
-      "redacted_hint": "에이전트 소유자 또는 워크스페이스 관리자만 이 config를 읽을 수 있습니다.",
+      "redacted_hint": "저장된 구성 값은 다시 표시되지 않습니다.",
       "dialog_json_help": "전체 서버 설정을 JSON으로 편집합니다."
     },
     "composio_mcp": {

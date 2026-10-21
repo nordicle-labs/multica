@@ -608,7 +608,7 @@
       "invalid_json": "JSON 无效：{{error}}",
       "save_failed_toast": "无法保存 MCP 配置",
       "redacted_title": "已配置，但当前不可见",
-      "redacted_hint": "只有智能体 owner 或工作区 admin 可以查看此配置。",
+      "redacted_hint": "已保存的配置值不会再次显示。",
       "dialog_json_help": "以 JSON 编辑完整的服务器配置。"
     },
     "composio_mcp": {
