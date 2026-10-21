@@ -34,6 +34,30 @@ func TestRedactSensitiveJSONNestedAndCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestRedactSensitiveJSONCommonSecretAliases(t *testing.T) {
+	const fakeSecret = "HERM1086_FAKE_ALIAS_SECRET"
+	input := map[string]any{
+		"safe":         "kept",
+		"auth":         fakeSecret,
+		"auth_token":   fakeSecret,
+		"api_secret":   fakeSecret,
+		"secret_key":   fakeSecret,
+		"database_url": fakeSecret,
+		"db_password":  fakeSecret,
+	}
+
+	out, err := json.Marshal(RedactSensitiveJSON(input))
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	if bytes.Contains(out, []byte(fakeSecret)) {
+		t.Fatalf("common secret alias survived redaction: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`"safe":"kept"`)) {
+		t.Fatalf("safe value removed: %s", out)
+	}
+}
+
 func TestRedactSensitiveJSONAcceptedContainers(t *testing.T) {
 	const fakeSecret = "HERM1086_FAKE_TYPED_SECRET"
 	tests := []struct {

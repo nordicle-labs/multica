@@ -108,10 +108,11 @@ func sensitiveJSONKey(key string) bool {
 		return -1
 	}, key)
 	switch normalized {
-	case "accesstoken", "apikey", "authorization", "clientsecret", "cookie",
-		"credential", "credentials", "customenv", "env", "environment",
-		"headers", "mcpconfig", "password", "privatekey", "refreshtoken",
-		"secret", "token":
+	case "accesskey", "accesstoken", "apikey", "apisecret", "auth",
+		"authorization", "authtoken", "clientsecret", "cookie", "credential",
+		"credentials", "customenv", "databaseurl", "dbpassword", "dburl", "env",
+		"environment", "headers", "mcpconfig", "password", "privatekey",
+		"refreshtoken", "secret", "secretkey", "token":
 		return true
 	default:
 		return false

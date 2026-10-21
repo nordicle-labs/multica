@@ -162,7 +162,7 @@ func (h *Handler) agentToResponse(a db.Agent) AgentResponse {
 	if rc == nil {
 		rc = map[string]any{}
 	}
-	rc = util.RedactSensitiveJSON(rc)
+	rc = redactRuntimeConfig(rc)
 
 	// Compute env metadata WITHOUT exposing the values. We unmarshal here
 	// only to count keys; the map never reaches the response. A coarse
@@ -256,6 +256,43 @@ func maskGatewayToken(rc any) {
 	}
 	tok, _ := gw["token"].(string)
 	if tok == "" {
+		return
+	}
+	gw["token"] = runtimeConfigGatewayTokenMask
+}
+
+// redactRuntimeConfig applies the shared recursive redactor while retaining
+// only the non-secret sentinel required by the OpenClaw read-modify-write
+// contract. All real token material is removed before the sentinel is restored.
+func redactRuntimeConfig(rc any) any {
+	gatewayTokenConfigured := hasGatewayToken(rc)
+	redacted := util.RedactSensitiveJSON(rc)
+	if gatewayTokenConfigured {
+		setGatewayTokenMask(redacted)
+	}
+	return redacted
+}
+
+func hasGatewayToken(rc any) bool {
+	root, ok := rc.(map[string]any)
+	if !ok {
+		return false
+	}
+	gw, ok := root["gateway"].(map[string]any)
+	if !ok {
+		return false
+	}
+	tok, _ := gw["token"].(string)
+	return tok != ""
+}
+
+func setGatewayTokenMask(rc any) {
+	root, ok := rc.(map[string]any)
+	if !ok {
+		return
+	}
+	gw, ok := root["gateway"].(map[string]any)
+	if !ok {
 		return
 	}
 	gw["token"] = runtimeConfigGatewayTokenMask
@@ -1778,7 +1815,7 @@ func broadcastAgentResponse(resp AgentResponse) AgentResponse {
 	// Belt-and-suspenders: agentToResponse already sanitizes runtime_config.
 	// Reapply the shared boundary so future direct AgentResponse construction
 	// cannot leak any secret-bearing container to workspace subscribers.
-	out.RuntimeConfig = util.RedactSensitiveJSON(out.RuntimeConfig)
+	out.RuntimeConfig = redactRuntimeConfig(out.RuntimeConfig)
 	return out
 }
 
