@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1391,24 +1390,17 @@ func TestUpdateAgent_RedactsMcpConfigForAgentActor(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	// The response contract keeps `mcp_config` always-present so clients
-	// can distinguish "no config" vs "redacted" via the companion flag.
-	// `json.RawMessage` of a JSON null decodes to the literal bytes
-	// `null`, not Go nil — so check for "no secret-bearing content"
-	// rather than `!= nil`.
-	if len(resp.McpConfig) > 0 && !bytes.Equal(bytes.TrimSpace(resp.McpConfig), []byte("null")) {
-		t.Errorf("UpdateAgent response leaked mcp_config to agent actor: %s", string(resp.McpConfig))
+	if resp.McpConfig != nil {
+		t.Errorf("UpdateAgent response leaked mcp_config to agent actor: %s", resp.McpConfig)
 	}
 	if !resp.McpConfigRedacted {
 		t.Errorf("UpdateAgent response should set mcp_config_redacted=true for agent actor")
 	}
 }
 
-// TestUpdateAgent_KeepsMcpConfigForMemberActor is the matching positive
-// test — a normal member request (owner/admin) still receives the full
-// mcp_config in the mutation response, so the redaction does not
-// accidentally regress the legitimate Web admin flow.
-func TestUpdateAgent_KeepsMcpConfigForMemberActor(t *testing.T) {
+// Agent resource responses are secret-free for every actor, including the
+// owner. The persisted value remains available to the runtime claim path.
+func TestUpdateAgent_RedactsMcpConfigForMemberActor(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -1428,11 +1420,11 @@ func TestUpdateAgent_KeepsMcpConfigForMemberActor(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp.McpConfig == nil {
-		t.Errorf("UpdateAgent response should keep mcp_config for member actor; got nil")
+	if resp.McpConfig != nil {
+		t.Errorf("UpdateAgent response leaked mcp_config to member actor: %s", resp.McpConfig)
 	}
-	if resp.McpConfigRedacted {
-		t.Errorf("UpdateAgent response should NOT mark mcp_config redacted for member actor")
+	if !resp.McpConfigRedacted {
+		t.Error("UpdateAgent response should set mcp_config_redacted=true for member actor")
 	}
 }
 

@@ -84,12 +84,15 @@ type AgentResponse struct {
 	SystemKey string `json:"system_key,omitempty"`
 	// SystemInstructions is the read-only product half of a system agent's
 	// prompt, filled from the server binary. Empty for ordinary agents.
-	SystemInstructions string          `json:"system_instructions,omitempty"`
-	AvatarURL          *string         `json:"avatar_url"`
-	RuntimeMode        string          `json:"runtime_mode"`
-	RuntimeConfig      any             `json:"runtime_config"`
-	CustomArgs         []string        `json:"custom_args"`
-	McpConfig          json.RawMessage `json:"mcp_config"`
+	SystemInstructions string   `json:"system_instructions,omitempty"`
+	AvatarURL          *string  `json:"avatar_url"`
+	RuntimeMode        string   `json:"runtime_mode"`
+	RuntimeConfig      any      `json:"runtime_config"`
+	CustomArgs         []string `json:"custom_args"`
+	// McpConfig remains on the internal DTO for compatibility with helper code,
+	// but is write-only at the public boundary: MCP documents commonly contain
+	// headers, env maps and credentials. Clients receive only the boolean below.
+	McpConfig json.RawMessage `json:"-"`
 	// custom_env is intentionally NOT serialized on agent resources. The
 	// agent_list/get/create/update/archive/restore responses and WS events
 	// only expose coarse metadata (has_custom_env, custom_env_key_count) so
@@ -159,7 +162,7 @@ func (h *Handler) agentToResponse(a db.Agent) AgentResponse {
 	if rc == nil {
 		rc = map[string]any{}
 	}
-	maskGatewayToken(rc)
+	rc = util.RedactSensitiveJSON(rc)
 
 	// Compute env metadata WITHOUT exposing the values. We unmarshal here
 	// only to count keys; the map never reaches the response. A coarse
@@ -183,11 +186,6 @@ func (h *Handler) agentToResponse(a db.Agent) AgentResponse {
 	}
 	if customArgs == nil {
 		customArgs = []string{}
-	}
-
-	var mcpConfig json.RawMessage
-	if a.McpConfig != nil {
-		mcpConfig = json.RawMessage(a.McpConfig)
 	}
 
 	conversationStarters := []AgentConversationStarter{}
@@ -222,9 +220,9 @@ func (h *Handler) agentToResponse(a db.Agent) AgentResponse {
 		RuntimeMode:              a.RuntimeMode,
 		RuntimeConfig:            rc,
 		CustomArgs:               customArgs,
-		McpConfig:                mcpConfig,
 		HasCustomEnv:             envKeyCount > 0,
 		CustomEnvKeyCount:        envKeyCount,
+		McpConfigRedacted:        hasManagedJSON(a.McpConfig),
 		Visibility:               a.Visibility,
 		PermissionMode:           a.PermissionMode,
 		InvocationTargets:        []AgentInvocationTargetDTO{},

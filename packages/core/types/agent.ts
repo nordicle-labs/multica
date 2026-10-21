@@ -542,24 +542,15 @@ export interface Agent {
   custom_env_key_count?: number;
   /**
    * MCP server configuration forwarded to runtimes that consume
-   * `agent.mcp_config` (see providerSupportsMcpConfig). Each backend
-   * materialises it in the runtime-native place: Claude flags, Codex
-   * config.toml, ACP session params, OpenCode env config, OpenClaw
-   * wrapper config, etc. `null` (or the field omitted on legacy backends)
-   * means no managed config; the daemon falls back to the CLI's own
-   * default. MUL-2764.
-   *
-   * When the caller can't see secrets (an agent actor, or a non-owner
-   * non-admin), the server replaces the value with `null` and sets
-   * `mcp_config_redacted` to true so the UI can render a "configured
-   * but hidden" state without exposing potentially sensitive fields.
+   * `agent.mcp_config` (see providerSupportsMcpConfig). Agent resource
+   * responses omit this write-only field because MCP documents commonly
+   * contain headers, env maps and credentials. The daemon receives the
+   * persisted config only through its authenticated claim path.
    */
   mcp_config?: unknown | null;
   /**
-   * True when the server stripped `mcp_config` from this response
-   * because the caller lacks permission to see secrets. The UI uses
-   * this to distinguish "no config" (`mcp_config === null &&
-   * !mcp_config_redacted`) from "config exists but you can't see it".
+   * True when a managed MCP config exists but was omitted from this response.
+   * The UI uses this to distinguish "no config" from "configured but hidden".
    * Older backends omit this field; treat `undefined` as false.
    */
   mcp_config_redacted?: boolean;

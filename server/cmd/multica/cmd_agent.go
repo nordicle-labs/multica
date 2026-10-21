@@ -16,6 +16,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
+	"github.com/multica-ai/multica/server/internal/util"
 )
 
 var agentCmd = &cobra.Command{
@@ -542,6 +543,9 @@ func runAgentList(cmd *cobra.Command, _ []string) error {
 	if err := client.GetJSON(ctx, path, &agents); err != nil {
 		return fmt.Errorf("list agents: %w", err)
 	}
+	for _, agent := range agents {
+		util.RedactSensitiveJSON(agent)
+	}
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -580,6 +584,7 @@ func runAgentGet(cmd *cobra.Command, args []string) error {
 	if err := client.GetJSON(ctx, "/api/agents/"+args[0], &agent); err != nil {
 		return fmt.Errorf("get agent: %w", err)
 	}
+	util.RedactSensitiveJSON(agent)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
